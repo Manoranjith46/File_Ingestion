@@ -1,23 +1,54 @@
+"""Database helpers for the FastAPI application."""
+
+from functools import lru_cache
+from typing import Generator
+
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from helpers.getenv import get_env
+from sqlalchemy.orm import Session, sessionmaker
+
+from helpers.GetEnv import get_env
+
+
+@lru_cache(maxsize=1)
+def get_engine():
+    """
+        Create and cache the SQLAlchemy engine.
+        it returns the engine from cache instead of creating a new one each time it's called.
+        This is useful for performance optimization, especially in applications that make frequent database queries.
+    """
+    return create_engine(get_env("Connection_String", required=True), pool_pre_ping=True)
+
+
+@lru_cache(maxsize=1)
+def get_session_local():
+    """
+        Create and cache the SQLAlchemy session factory.
+        it returns the session factory from cache instead of creating a new one each time it's called.
+    """
+    return sessionmaker(autocommit=False, autoflush=False, bind=get_engine())
+
+
+def get_db() -> Generator[Session, None, None]:
+    """
+        Yield a database session for request-scoped dependencies.
+        This function is used as a dependency in FastAPI routes to provide a database session for each request.
+        It ensures that the session is properly closed after the request is processed, preventing resource leaks.
+    """
+    db = get_session_local()()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 def Check_db_Connection():
     """
-    Connects to the Database and returns a session object.
-
-    Returns:
-        Session: A SQLAlchemy session object for interacting with the database.
+        Connect to the database and verify the configured connection string.
     """
     try:
-        engine  = create_engine(get_env("Connection_String", required = True))
-        Local_Session = sessionmaker(autocommit = False, autoflush = False, bind = engine)
-        if(engine.connect()):
+        engine = get_engine()
+        with engine.connect():
             print("✅ Database Connected Successfully")
-            return Local_Session()
     except Exception as e:
         print(f"❌ Failed to Connect to Database: {e}")
         return None
-    finally:
-        engine.dispose()  # Close the engine connection after use

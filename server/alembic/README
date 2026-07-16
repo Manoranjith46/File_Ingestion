@@ -1,0 +1,62 @@
+Alembic usage guide for this project
+
+Prerequisites:
+- Ensure the project's `.env` (at the repository root) contains `Connection_String` pointing to your database. The project's env loader (`src/helpers/GetEnv.py`) must be able to load it before running migrations.
+- Run commands from the project root (the `server/` folder).
+
+Quick commands
+
+- Initialize Alembic (only needed once):
+	- `alembic init alembic`
+
+- Create a new revision (autogenerate models -> migration):
+	- `alembic revision --autogenerate -m "create initial schema"`
+	- or explicitly using python module: `python -m alembic revision --autogenerate -m "msg"`
+
+- Apply migrations (upgrade to head):
+	- `alembic upgrade head`
+	- `python -m alembic upgrade head`
+
+- Downgrade (step back by one revision):
+	- `alembic downgrade -1`
+	- To a specific revision: `alembic downgrade <revision_id>`
+
+- Stamp the DB without running migrations (useful to mark baseline):
+	- `alembic stamp head`
+
+- See current revision(s) in the DB:
+	- `alembic current`
+
+- View revision history:
+	- `alembic history --verbose`
+
+- Merge divergent heads:
+	- `alembic merge -m "merge heads" <rev1> <rev2>`
+
+Notes for this repository
+
+- The Alembic `env.py` in this project reads the DB URL from `Connection_String` via `src.helpers.GetEnv.get_env()` and will call `load_environment_variables()` to load the `.env` file. Make sure the `.env` exists and is valid before running commands that import `env.py` (for example, `revision --autogenerate` and `upgrade`).
+
+- If you prefer not to rely on the `.env` loader, you can set the `sqlalchemy.url` in `alembic.ini` or export an environment variable `Connection_String` in your shell before running Alembic.
+
+- Example (PowerShell) to export for the current session:
+	- `$env:Connection_String = "postgresql://user:pass@localhost:5432/dbname"`
+
+- Example invocation using the project's `uv` runner (if configured):
+	- `uv run alembic revision --autogenerate -m "initial"`
+	- `uv run alembic upgrade head`
+
+Troubleshooting
+
+- If you get errors about missing `.env` or `Connection_String`, verify the file exists at the project root and contains `Connection_String`. `src/helpers/GetEnv.py` will raise a `FileNotFoundError` if the `.env` file cannot be found.
+
+- For offline migrations the `env.py` supports configuring a URL directly; read the top of `alembic/env.py` for details.
+
+Common workflow
+
+1. Ensure `.env` has `Connection_String` and models are importable.
+2. Create a revision with `alembic revision --autogenerate -m "message"`.
+3. Review the generated migration script under `alembic/versions/` and adjust if needed.
+4. Apply the migration with `alembic upgrade head`.
+
+Refer to Alembic docs for advanced scenarios: https://alembic.sqlalchemy.org/
