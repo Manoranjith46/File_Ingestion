@@ -1,7 +1,9 @@
 fastapi
+google-auth
 sqlalchemy
-pydantic
+pydantic[email]
 redis
 uvicorn
 python-dotenv
 psycopg2
+alembic
