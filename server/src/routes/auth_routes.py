@@ -1,11 +1,11 @@
 """Authentication routes for registration, verification, session, and identity flows."""
 
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response, status
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
-from config.DataBase import get_db
+from config.database import get_db
 from schemas.auth_schema import (
-    GoogleSignInRequest,
     LoginRequest,
     MessageResponse,
     OtpChallengeResponse,
@@ -23,6 +23,8 @@ from services.auth_services import (
     authenticate_user,
     create_public_user,
     create_refresh_token,
+    build_google_frontend_redirect_url,
+    build_google_login_url,
     continue_with_google,
     create_user,
     get_current_user,
@@ -44,9 +46,13 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     """
         Register a new local user and create the first OTP challenge.
     """
-
     user = create_user(db, payload)
-    user, otp_code, otp_expires_at = request_otp(db, OtpRequest(email=user.email))
+    try:
+        user, otp_code, otp_expires_at = request_otp(db, OtpRequest(email=user.email))
+    except HTTPException:
+        db.delete(user)
+        db.commit()
+        raise
     return RegistrationResponse(user=create_public_user(user), otp_code=otp_code, otp_expires_at=otp_expires_at)
 
 
@@ -165,14 +171,54 @@ def reset_password_endpoint(payload: PasswordResetConfirmRequest, db: Session = 
     return MessageResponse(message="Password updated successfully")
 
 
-@auth_router.post("/google", response_model=TokenPairResponse)
-def google_sign_in(payload: GoogleSignInRequest, response: Response, db: Session = Depends(get_db)):
-    """
-        Exchange a Google identity token for a local application session.
-    """
-    user = continue_with_google(db, payload)
-    session = issue_token_pair(db, user)
+
+
+
+
+
+
+
+
+
+
+@auth_router.get("/google")
+@auth_router.get("/google/login")
+def google_login():
+    """Redirect the browser to Google's OAuth consent screen."""
+    authorization_url, state = build_google_login_url()
+    response = RedirectResponse(url=authorization_url, status_code=status.HTTP_302_FOUND)
     response.set_cookie(
+        "google_oauth_state",
+        state,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        path="/auth/google",
+    )
+    return response
+
+
+@auth_router.get("/google/callback", response_model=None)
+def google_callback(
+    code: str | None = None,
+    state: str | None = None,
+    oauth_state: str | None = Cookie(default=None, alias="google_oauth_state"),
+    db: Session = Depends(get_db),
+):
+    """Handle Google's callback, create the local session, and redirect to the frontend."""
+    if code is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing code parameter")
+    if state is None or oauth_state is None or state != oauth_state:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth state")
+
+    user, is_new_user = continue_with_google(db, code)
+    session = issue_token_pair(db, user)
+
+    redirect_response = RedirectResponse(
+        url=build_google_frontend_redirect_url(session.access_token, is_new_user),
+        status_code=status.HTTP_302_FOUND,
+    )
+    redirect_response.set_cookie(
         "refresh_token",
         create_refresh_token(user),
         httponly=True,
@@ -180,4 +226,5 @@ def google_sign_in(payload: GoogleSignInRequest, response: Response, db: Session
         samesite="lax",
         path="/auth",
     )
-    return session
+    redirect_response.delete_cookie("google_oauth_state", path="/auth/google")
+    return redirect_response

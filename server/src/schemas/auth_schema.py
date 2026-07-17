@@ -4,7 +4,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, EmailStr, field_validator
 from email_validator import validate_email, EmailNotValidError
-from helpers.GetEnv import get_env
+from helpers.get_env import get_env
 
 
 class PublicUserSchema(BaseModel):
@@ -90,18 +90,6 @@ class OtpRequest(BaseModel):
         if isinstance(v, str):
             return v.strip()
         return v
-
-    @field_validator("email", mode="after")
-    def _validate_email_format(cls, v):
-        try:
-            check_deliver = get_env("EMAIL_CHECK_DELIVERABILITY", default="false", required=False).lower() in ("1", "true", "yes")
-        except Exception:
-            check_deliver = False
-        try:
-            info = validate_email(str(v), check_deliverability=check_deliver)
-            return info.email
-        except EmailNotValidError as e:
-            raise ValueError(str(e))
 
     @field_validator("email", mode="after")
     def _validate_email_format(cls, v):

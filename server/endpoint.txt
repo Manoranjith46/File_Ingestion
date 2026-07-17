@@ -1,0 +1,192 @@
+API Architecture - Current Project Status
+
+Base server
+- FastAPI app with CORS enabled.
+- Frontend origin comes from FRONTEND_URL, defaulting to http://localhost:5173.
+- Auth uses Bearer access tokens plus an httpOnly refresh_token cookie.
+- Google login redirects back to the frontend with tokens in the URL fragment.
+
+Common auth rules
+- Protected endpoints require Authorization: Bearer <access_token>.
+- refresh_token is stored in an httpOnly cookie at path /auth.
+- For browser calls that rely on refresh, use credentials: include.
+
+Auth endpoints
+- GET /
+	- Health check.
+	- Response: {"status": "Application is running successfully :)"}
+
+- POST /auth/register
+	- Body:
+		- email: string
+		- username?: string
+		- full_name?: string
+		- password: string
+	- Response:
+		- user: PublicUserSchema
+		- otp_code: string
+		- otp_expires_at: datetime
+
+- POST /auth/login
+	- Body:
+		- identifier: string
+		- password: string
+	- Response:
+		- access_token: string
+		- token_type: "bearer"
+		- refresh_expires_at: datetime
+		- user: PublicUserSchema
+	- Side effect: sets refresh_token cookie.
+
+- POST /auth/logout
+	- Header: Authorization: Bearer <access_token>
+	- Response:
+		- message: string
+	- Side effect: invalidates session and clears refresh cookie.
+
+- POST /auth/refresh
+	- Uses refresh_token cookie.
+	- Response:
+		- access_token: string
+		- token_type: "bearer"
+		- refresh_expires_at: datetime
+		- user: PublicUserSchema
+	- Side effect: rotates refresh cookie.
+
+- GET /auth/me
+	- Header: Authorization: Bearer <access_token>
+	- Response: PublicUserSchema
+
+- POST /auth/request-otp
+	- Body:
+		- email: string
+	- Response:
+		- email: string
+		- otp_code: string
+		- otp_expires_at: datetime
+	- Note: OTP is currently console-only, not emailed.
+
+- POST /auth/verify-otp
+	- Body:
+		- email: string
+		- otp_code: string
+	- Response:
+		- access_token: string
+		- token_type: "bearer"
+		- refresh_expires_at: datetime
+		- user: PublicUserSchema
+	- Side effect: sets refresh_token cookie.
+
+- POST /auth/request-password-reset
+	- Body:
+		- email: string
+	- Response:
+		- email: string
+		- reset_token: string
+		- reset_expires_at: datetime
+
+- POST /auth/reset-password
+	- Body:
+		- email: string
+		- reset_token: string
+		- new_password: string
+	- Response:
+		- message: string
+
+- GET /auth/google
+- GET /auth/google/login
+	- Redirects to Google OAuth consent screen.
+
+- GET /auth/google/callback?code=...&state=...
+	- Browser redirect back to frontend.
+	- Fragment format:
+		- access_token
+		- token_type=bearer
+		- is_new_user=true|false
+	- Side effect: sets refresh_token cookie.
+
+File ingestion endpoints
+- POST /v1/upload/init
+	- Header: Authorization: Bearer <access_token>
+	- Body:
+		- filename: string
+		- filesize: integer
+	- Response:
+		- upload_id: string
+		- filename: string
+		- filesize: integer
+		- chunk_size: 5242880
+		- total_chunks: integer
+	- Note: send the original filename including extension; the backend stores the merged file using that name when the merged file is newly created. Chunks are stored under D:/Zenteiq/Tasks/uploads/.parts and merged files are stored directly under D:/Zenteiq/Tasks/uploads.
+
+- POST /v1/upload/chunk
+	- Header: Authorization: Bearer <access_token>
+	- Required header: Range
+	- Multipart form-data:
+		- upload_id: string
+		- chunk_index: integer
+		- chunk_hash: string (64 hex chars)
+		- chunk_file: file
+	- Response:
+		- status: string
+		- upload_id: string
+		- chunk_index: integer
+		- bytes_received: integer
+		- received_chunks: integer
+		- total_chunks: integer
+		- chunk_size: 5242880
+		- complete: boolean
+
+- POST /v1/upload/finalize
+	- Header: Authorization: Bearer <access_token>
+	- Body:
+		- upload_id: string
+	- Response:
+		- status: string
+		- upload_id: string
+		- physical_file_id: integer
+		- file_path: string
+		- master_hash: string
+		- complete: true
+
+- GET /v1/uploads?page=1&limit=10
+	- Header: Authorization: Bearer <access_token>
+	- Response:
+		- page: integer
+		- limit: integer
+		- total_files: integer
+		- files:
+			- filename: string
+			- filesize: integer
+
+Frontend needs
+- Auth screens:
+	- register
+	- login
+	- OTP verification
+	- forgot password
+	- reset password
+	- Google sign-in callback handling
+
+- Auth state handling:
+	- store access token client-side
+	- attach Authorization header for protected calls
+	- call /auth/refresh when access token expires
+	- keep refresh cookie support enabled in browser requests
+
+- Upload UI:
+	- file picker
+	- chunk splitter with 5 MiB chunks
+	- sequential upload progress indicator
+	- retry/error handling for chunk failures
+	- finalize button/state
+
+- Upload history UI:
+	- paginated file list
+	- filename and filesize display
+
+Important notes
+- There are no download, delete, update, or file detail endpoints yet.
+- Upload chunks must be sent sequentially.
+- OTP delivery is console-only in the current implementation.
+- If a different file already exists with the same final name, the backend returns a conflict instead of overwriting it.

@@ -6,7 +6,7 @@ from typing import Generator
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from helpers.GetEnv import get_env
+from helpers.get_env import get_env
 
 
 @lru_cache(maxsize=1)
