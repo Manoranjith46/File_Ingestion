@@ -1,0 +1,725 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  width: 100%;
+}
+
+body {
+  background: #050b18;
+  font-family:
+    Inter,
+    Arial,
+    Helvetica,
+    sans-serif;
+}
+
+/* =========================================
+   PAGE
+========================================= */
+
+.auth-page {
+  min-height: 100vh;
+  width: 100%;
+
+  position: relative;
+  overflow: hidden;
+
+  display: flex;
+  justify-content: center;
+  align-items: center;
+
+  padding: 50px 20px;
+
+  background:
+    radial-gradient(
+      circle at 8% 0%,
+      rgba(37, 99, 235, 0.34),
+      transparent 26%
+    ),
+    radial-gradient(
+      circle at 100% 100%,
+      rgba(79, 70, 229, 0.24),
+      transparent 28%
+    ),
+    #050b18;
+
+  color: #ffffff;
+}
+
+/* =========================================
+   BACKGROUND GRID
+========================================= */
+
+.background-grid {
+  position: absolute;
+  inset: 0;
+
+  opacity: 0.1;
+
+  background-image:
+    linear-gradient(
+      rgba(96, 165, 250, 0.2) 1px,
+      transparent 1px
+    ),
+    linear-gradient(
+      90deg,
+      rgba(96, 165, 250, 0.2) 1px,
+      transparent 1px
+    );
+
+  background-size: 70px 70px;
+
+  animation: gridMove 20s linear infinite;
+
+  pointer-events: none;
+}
+
+@keyframes gridMove {
+  from {
+    transform: translate(0, 0);
+  }
+
+  to {
+    transform: translate(70px, 70px);
+  }
+}
+
+/* =========================================
+   GLOW
+========================================= */
+
+.glow {
+  position: absolute;
+
+  border-radius: 50%;
+
+  filter: blur(110px);
+
+  pointer-events: none;
+}
+
+.glow-one {
+  width: 430px;
+  height: 430px;
+
+  top: -250px;
+  left: -180px;
+
+  background: #2563eb;
+
+  opacity: 0.28;
+}
+
+.glow-two {
+  width: 390px;
+  height: 390px;
+
+  right: -220px;
+  bottom: -220px;
+
+  background: #4f46e5;
+
+  opacity: 0.22;
+}
+
+/* =========================================
+   DATA FLOW
+========================================= */
+
+.data-flow {
+  position: absolute;
+
+  display: flex;
+  gap: 80px;
+
+  opacity: 0.8;
+
+  pointer-events: none;
+}
+
+.data-flow span {
+  width: 7px;
+  height: 7px;
+
+  border-radius: 50%;
+
+  background: #60a5fa;
+
+  box-shadow: 0 0 18px #3b82f6;
+
+  animation: dataPulse 2.5s ease-in-out infinite;
+}
+
+.data-flow span:nth-child(2) {
+  animation-delay: 0.6s;
+}
+
+.data-flow span:nth-child(3) {
+  animation-delay: 1.2s;
+}
+
+.flow-one {
+  top: 28%;
+  left: 4%;
+
+  transform: rotate(20deg);
+}
+
+.flow-two {
+  right: 4%;
+  bottom: 24%;
+
+  transform: rotate(-20deg);
+}
+
+@keyframes dataPulse {
+  0%,
+  100% {
+    opacity: 0.2;
+    transform: scale(0.7);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1.4);
+  }
+}
+
+/* =========================================
+   MAIN CONTAINER
+========================================= */
+
+.auth-container {
+  position: relative;
+  z-index: 2;
+
+  width: 100%;
+  max-width: 560px;
+
+  text-align: center;
+}
+
+/* =========================================
+   BRAND
+========================================= */
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 13px;
+
+  margin-bottom: 42px;
+
+  font-size: 28px;
+  font-weight: 700;
+
+  letter-spacing: -0.8px;
+}
+
+.brand-logo {
+  width: 46px;
+  height: 46px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  border-radius: 13px;
+
+  background: linear-gradient(
+    135deg,
+    #2563eb,
+    #4f46e5
+  );
+
+  box-shadow:
+    0 0 30px rgba(37, 99, 235, 0.55);
+
+  font-size: 22px;
+}
+
+/* =========================================
+   HEADER
+========================================= */
+
+.auth-header {
+  margin-bottom: 30px;
+}
+
+.eyebrow {
+  margin-bottom: 16px;
+
+  color: #667cff;
+
+  font-size: 13px;
+  font-weight: 700;
+
+  letter-spacing: 2.5px;
+}
+
+.auth-header h1 {
+  color: #f8fafc;
+
+  font-size: 52px;
+  font-weight: 700;
+
+  line-height: 1.12;
+
+  letter-spacing: -1.8px;
+}
+
+.auth-header h1 span {
+  color: #60a5fa;
+}
+
+.subtitle {
+  margin-top: 16px;
+
+  color: #9aa8bc;
+
+  font-size: 17px;
+}
+
+/* =========================================
+   AUTH CARD
+========================================= */
+
+.auth-card {
+  width: 100%;
+
+  padding: 34px;
+
+  border: 1px solid rgba(96, 122, 163, 0.4);
+
+  border-radius: 19px;
+
+  background:
+    linear-gradient(
+      145deg,
+      rgba(15, 27, 48, 0.88),
+      rgba(8, 16, 31, 0.92)
+    );
+
+  box-shadow:
+    0 30px 80px rgba(0, 0, 0, 0.38),
+    inset 0 1px rgba(255, 255, 255, 0.04);
+
+  text-align: left;
+}
+
+/* =========================================
+   FORM
+========================================= */
+
+.auth-form {
+  width: 100%;
+}
+
+.input-group {
+  margin-bottom: 22px;
+}
+
+.input-group label {
+  display: block;
+
+  margin-bottom: 9px;
+
+  color: #e2e8f0;
+
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.input-wrapper {
+  position: relative;
+}
+
+.input-wrapper input {
+  width: 100%;
+  height: 54px;
+
+  padding: 0 48px;
+
+  border: 1px solid #30415e;
+
+  border-radius: 11px;
+
+  outline: none;
+
+  background: rgba(14, 25, 44, 0.85);
+
+  color: #ffffff;
+
+  font-size: 16px;
+
+  transition: 0.25s ease;
+}
+
+.input-wrapper input::placeholder {
+  color: #8490a5;
+}
+
+.input-wrapper input:hover {
+  border-color: #405575;
+}
+
+.input-wrapper input:focus {
+  border-color: #4f7cff;
+
+  box-shadow:
+    0 0 0 3px rgba(79, 124, 255, 0.12);
+}
+
+.input-icon {
+  position: absolute;
+
+  top: 50%;
+  left: 16px;
+
+  color: #94a3b8;
+
+  font-size: 18px;
+
+  transform: translateY(-50%);
+
+  pointer-events: none;
+}
+
+/* =========================================
+   PASSWORD EYE
+========================================= */
+
+.password-icon {
+  position: absolute;
+
+  top: 50%;
+  right: 15px;
+
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  padding: 4px;
+
+  border: none;
+
+  background: transparent;
+
+  color: #8492aa;
+
+  cursor: pointer;
+
+  transform: translateY(-50%);
+
+  transition: 0.2s ease;
+}
+
+.password-icon:hover {
+  color: #60a5fa;
+}
+
+/* =========================================
+   PASSWORD STRENGTH
+========================================= */
+
+.password-strength {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+
+  margin-top: 9px;
+}
+
+.password-strength span {
+  height: 4px;
+
+  flex: 1;
+
+  border-radius: 5px;
+
+  background: #30415e;
+
+  transition: 0.25s ease;
+}
+
+.password-strength span.strength-active {
+  background: #3b82f6;
+
+  box-shadow:
+    0 0 8px rgba(59, 130, 246, 0.55);
+}
+
+.password-strength p {
+  min-width: 135px;
+
+  margin-left: 8px;
+
+  color: #8490a5;
+
+  font-size: 12px;
+
+  white-space: nowrap;
+}
+
+/* =========================================
+   TERMS
+========================================= */
+
+.terms {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+
+  margin: 8px 0 24px;
+
+  color: #8794a8;
+
+  font-size: 13px;
+
+  line-height: 1.5;
+
+  cursor: pointer;
+}
+
+.terms input {
+  width: 16px;
+  height: 16px;
+
+  margin-top: 1px;
+
+  accent-color: #3b82f6;
+
+  cursor: pointer;
+}
+
+.terms b {
+  color: #3b82f6;
+}
+
+/* =========================================
+   CREATE BUTTON
+========================================= */
+
+.create-btn {
+  width: 100%;
+  height: 55px;
+
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+
+  padding: 0 20px;
+
+  border: none;
+
+  border-radius: 10px;
+
+  background: linear-gradient(
+    135deg,
+    #2563eb,
+    #4f46e5
+  );
+
+  color: #ffffff;
+
+  font-size: 16px;
+  font-weight: 700;
+
+  cursor: pointer;
+
+  transition: 0.25s ease;
+}
+
+.create-btn:hover {
+  transform: translateY(-2px);
+
+  box-shadow:
+    0 14px 32px rgba(37, 99, 235, 0.38);
+}
+
+.create-btn:active {
+  transform: translateY(0);
+}
+
+.create-btn:disabled {
+  opacity: 0.65;
+
+  cursor: not-allowed;
+
+  transform: none;
+}
+
+.arrow {
+  font-size: 22px;
+}
+
+/* =========================================
+   VALIDATION
+========================================= */
+
+.error-message {
+  margin-top: 7px;
+
+  color: #f87171;
+
+  font-size: 13px;
+
+  line-height: 1.4;
+}
+
+.input-error input {
+  border-color: #ef4444;
+}
+
+.terms-error {
+  margin-top: -15px;
+  margin-bottom: 15px;
+}
+
+/* =========================================
+   SIGN IN
+========================================= */
+
+.signin-text {
+  margin-top: 27px;
+
+  color: #94a3b8;
+
+  font-size: 15px;
+}
+
+.signin-link {
+  margin-left: 5px;
+
+  border: none;
+
+  background: transparent;
+
+  color: #60a5fa;
+
+  font-size: 15px;
+  font-weight: 600;
+
+  cursor: pointer;
+}
+
+.signin-link:hover {
+  color: #93c5fd;
+}
+
+/* =========================================
+   FOOTER
+========================================= */
+
+.footer-text {
+  margin-top: 35px;
+
+  color: #64748b;
+
+  font-size: 13px;
+}
+
+/* =========================================
+   RESPONSIVE
+========================================= */
+
+@media (max-width: 600px) {
+  .auth-page {
+    align-items: flex-start;
+
+    padding: 30px 16px;
+  }
+
+  .auth-container {
+    margin-top: 25px;
+  }
+
+  .brand {
+    margin-bottom: 30px;
+
+    font-size: 22px;
+  }
+
+  .auth-header h1 {
+    font-size: 36px;
+  }
+
+  .auth-card {
+    padding: 24px;
+  }
+
+  .password-strength p {
+    min-width: 110px;
+
+    font-size: 10px;
+  }
+}/* =========================================
+   FORCE TEXT SIZE
+========================================= */
+
+.brand {
+  font-size: 32px !important;
+}
+
+.auth-header .eyebrow {
+  font-size: 20px !important;
+}
+
+.auth-header h1 {
+  font-size: 45px !important;
+}
+
+.auth-header .subtitle {
+  font-size: 20px !important;
+}
+
+.input-group label {
+  font-size: 20px !important;
+}
+
+.input-wrapper input {
+  font-size: 20px !important;
+}
+
+.input-wrapper input::placeholder {
+  font-size: 20px !important;
+}
+
+.input-icon {
+  font-size: 20px !important;
+}
+
+.password-strength p {
+  font-size: 14px !important;
+}
+
+.terms {
+  font-size: 15px !important;
+}
+
+.create-btn {
+  font-size: 18px !important;
+}
+
+.signin-text {
+  font-size: 17px !important;
+}
+
+.signin-link {
+  font-size: 17px !important;
+}
+
+.footer-text {
+  font-size: 14px !important;
+}
+
+.error-message {
+  font-size: 14px !important;
+}
