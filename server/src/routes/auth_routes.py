@@ -40,7 +40,7 @@ from services.auth_services import (
 auth_router = APIRouter()
 
 
-@auth_router.post("/register", response_model=RegistrationResponse)
+@auth_router.post("/signup/init", response_model=RegistrationResponse)
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     """
         Register a new local user and create the first OTP challenge.
@@ -152,17 +152,27 @@ def me(authorization: str | None = Header(default=None), db: Session = Depends(g
     return create_public_user(user)
 
 
-@auth_router.post("/request-otp", response_model=OtpChallengeResponse)
-def request_otp_endpoint(payload: OtpRequest, db: Session = Depends(get_db)):
+@auth_router.post("/signup/verify", response_model=TokenPairResponse)
+def verify_signup_endpoint(payload: OtpVerifyRequest, response: Response, db: Session = Depends(get_db)):
     """
-        Create a new OTP challenge for the supplied email address.
+    Verify the submitted OTP and establish a verified login session.
     """
-    user, _, _ = request_otp(db, payload)
-    return OtpChallengeResponse(email=user.email, message="OTP challenge created")
+    user = verify_otp(db, payload)
+    session, access_token, refresh_token = issue_token_pair(db, user)
+    response.set_cookie(
+        "refresh_token",
+        refresh_token,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        path="/auth",
+    )
+    response.headers["Authorization"] = f"Bearer {access_token}"
+    return session
 
 
-@auth_router.post("/verify-otp", response_model=TokenPairResponse)
-def verify_otp_endpoint(payload: OtpVerifyRequest, response: Response, db: Session = Depends(get_db)):
+@auth_router.post("/login", response_model=TokenPairResponse)
+def login(payload: LoginRequest, response: Response, db: Session = Depends(get_db)):
     """
     Verify the submitted OTP and establish a verified login session.
 
@@ -188,7 +198,7 @@ def verify_otp_endpoint(payload: OtpVerifyRequest, response: Response, db: Sessi
     return session
 
 
-@auth_router.post("/request-password-reset", response_model=PasswordResetChallengeResponse)
+@auth_router.post("/password-reset/request", response_model=PasswordResetChallengeResponse)
 def request_password_reset_endpoint(payload: PasswordResetRequest, db: Session = Depends(get_db)):
     """
         Create a password reset challenge for the supplied email address.
@@ -197,7 +207,7 @@ def request_password_reset_endpoint(payload: PasswordResetRequest, db: Session =
     return PasswordResetChallengeResponse(email=user.email, message="Password reset challenge created")
 
 
-@auth_router.post("/reset-password", response_model=MessageResponse)
+@auth_router.post("/password-reset/verify", response_model=MessageResponse)
 def reset_password_endpoint(payload: PasswordResetConfirmRequest, db: Session = Depends(get_db)):
     """
         Update a user's password after verifying the reset token.

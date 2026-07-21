@@ -29,6 +29,7 @@ from services.file_services import (
     list_user_uploads,
     process_upload_chunk,
     create_dataset,
+    get_dataset_by_id,
     get_datasets,
     update_dataset,
     delete_dataset,
@@ -36,7 +37,7 @@ from services.file_services import (
 )
 
 
-file_router = APIRouter(prefix="/v1")
+file_router = APIRouter()
 
 
 def _resolve_current_user(authorization: str | None, db: Session) -> User:
@@ -149,6 +150,17 @@ def list_datasets(
     """
     user = _resolve_current_user(authorization, db)
     return get_datasets(db, user, page=page, limit=limit)
+
+
+@file_router.get("/datasets/{dataset_id}", response_model=DatasetResponse)
+def get_dataset_by_id_route(
+    dataset_id: str,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    """Return a single dataset by ID for the authenticated user."""
+    user = _resolve_current_user(authorization, db)
+    return get_dataset_by_id(db, user, dataset_id)
 
 
 @file_router.patch("/datasets/{dataset_id}", response_model=DatasetResponse)

@@ -2,6 +2,7 @@
 """Application entrypoint for the FastAPI server."""
 
 from contextlib import asynccontextmanager
+from sys import prefix
 
 import uvicorn
 from fastapi import FastAPI
@@ -52,10 +53,10 @@ app.add_middleware(
 )
 
 app.include_router(auth_router, prefix="/auth", tags=["Authentication"])
-app.include_router(file_router, tags=["File Ingestion"])
+app.include_router(file_router, prefix="/v1", tags=["File Ingestion"])
 
 
-@app.get("/")
+@app.get("/v1/health")
 def health_check():
     """
         Return a lightweight health payload for uptime checks.\
