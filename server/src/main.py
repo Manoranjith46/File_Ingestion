@@ -1,37 +1,70 @@
 
-import uvicorn
-from config.database import Check_db_Connection
-from helpers.getenv import load_environment_variables
-from config.redis_server import redis_server_status
-from fastapi import FastAPI
+"""Application entrypoint for the FastAPI server."""
 
-app = FastAPI()
+from contextlib import asynccontextmanager
+
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from config.database import Check_db_Connection, get_engine
+from config.redis_server import redis_server_status
+from helpers.get_env import get_env
+from helpers.get_env import load_environment_variables
+from models.auth_model import Base
+from models import file_model  # noqa: F401
+from services.cleanup_scheduler import start_cleanup_scheduler
+from routes.file_routes import file_router
+from routes.auth_routes import auth_router
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+        Load environment settings,Create Redis-Server and prepare the database during application startup.
+    """
+    load_environment_variables()
+    redis_server_status()
+    Check_db_Connection()
+    start_cleanup_scheduler()
+    Base.metadata.create_all(bind=get_engine())
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+frontend_url = get_env("FRONTEND_URL", "http://localhost:5173", required=False)
+allowed_origins = [origin.strip() for origin in str(frontend_url).split(",") if origin.strip()]
+
+if "http://localhost:5173" not in allowed_origins:
+    allowed_origins.append("http://localhost:5173")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(auth_router, prefix="/auth", tags=["Authentication"])
+app.include_router(file_router, tags=["File Ingestion"])
+
 
 @app.get("/")
-def Health_Check():
+def health_check():
     """
-    Health check endpoint to verify the status of the application.
-
-    Returns:
-        dict: A dictionary containing the status of the application.
+        Return a lightweight health payload for uptime checks.\
     """
-    return {"status": "Application is running successfully!"}
+    return {"status": "Application is running successfully :)"}
 
 
 def main():
-
-    # Checking the DOTENV File Status
-    load_environment_variables()
-
-    # Checking the Redis Server Status
-    redis_server_status()
-
-    # Checking the Database Connection Status
-    Check_db_Connection()
-
-    # Start the Uvicorn server with the specified host, port, and reload options
+    """
+        Start the Uvicorn development server.
+    """
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True, log_level="info")
 
 
 if __name__ == "__main__":
-    main() # Call the startup event function to perform checks on application startup
+    main()

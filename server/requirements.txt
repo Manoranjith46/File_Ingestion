@@ -1,7 +1,13 @@
 fastapi
+google-api-python-client<=2.198.0
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
 sqlalchemy
-pydantic
+pydantic[email]
 redis
 uvicorn
 python-dotenv
 psycopg2
+alembic
+python-multipart

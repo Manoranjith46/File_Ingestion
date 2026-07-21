@@ -1,0 +1,404 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+.signin-page {
+  min-height: 100vh;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 30px 20px;
+  background: #050b18;
+  color: #ffffff;
+}
+
+/* =========================================
+   ANIMATED GRID
+========================================= */
+
+.background-grid {
+  position: absolute;
+  inset: 0;
+  opacity: 0.18;
+  background-image:
+    linear-gradient(
+      rgba(73, 117, 255, 0.18) 1px,
+      transparent 1px
+    ),
+    linear-gradient(
+      90deg,
+      rgba(73, 117, 255, 0.18) 1px,
+      transparent 1px
+    );
+  background-size: 70px 70px;
+  animation: gridMove 18s linear infinite;
+}
+
+@keyframes gridMove {
+  from {
+    transform: translate(0, 0);
+  }
+
+  to {
+    transform: translate(70px, 70px);
+  }
+}
+
+/* =========================================
+   BACKGROUND GLOW
+========================================= */
+
+.glow {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(100px);
+  opacity: 0.25;
+  pointer-events: none;
+}
+
+.glow-one {
+  width: 420px;
+  height: 420px;
+  background: #2563eb;
+  top: -180px;
+  left: -140px;
+  animation: floatOne 8s ease-in-out infinite;
+}
+
+.glow-two {
+  width: 360px;
+  height: 360px;
+  background: #7c3aed;
+  right: -140px;
+  bottom: -150px;
+  animation: floatTwo 10s ease-in-out infinite;
+}
+
+@keyframes floatOne {
+  0%,
+  100% {
+    transform: translate(0, 0);
+  }
+
+  50% {
+    transform: translate(70px, 60px);
+  }
+}
+
+@keyframes floatTwo {
+  0%,
+  100% {
+    transform: translate(0, 0);
+  }
+
+  50% {
+    transform: translate(-60px, -50px);
+  }
+}
+
+/* =========================================
+   SIGN IN CARD
+========================================= */
+
+.signin-card {
+  position: relative;
+  z-index: 2;
+  width: 100%;
+  max-width: 450px;
+  padding: 42px 38px;
+  border: 1px solid rgba(148, 163, 184, 0.15);
+  border-radius: 22px;
+  background: rgba(15, 23, 42, 0.72);
+  backdrop-filter: blur(22px);
+  box-shadow:
+    0 30px 80px rgba(0, 0, 0, 0.35),
+    inset 0 1px rgba(255, 255, 255, 0.05);
+}
+
+/* =========================================
+   BRAND
+========================================= */
+
+.signin-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 36px;
+  font-size: 23px;
+  font-weight: 700;
+}
+
+.signin-logo {
+  width: 42px;
+  height: 42px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 13px;
+  background: linear-gradient(
+    135deg,
+    #2563eb,
+    #4f46e5
+  );
+  box-shadow:
+    0 0 30px rgba(37, 99, 235, 0.5);
+  font-size: 21px;
+}
+
+/* =========================================
+   HEADER
+========================================= */
+
+.signin-header {
+  margin-bottom: 30px;
+}
+
+.eyebrow {
+  margin-bottom: 12px;
+  color: #60a5fa;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 2px;
+}
+
+.signin-header h1 {
+  color: #ffffff;
+  font-size: 36px;
+  line-height: 1.1;
+  letter-spacing: -1.5px;
+}
+
+.signin-header h1 span {
+  color: #60a5fa;
+}
+
+.signin-header p:last-child {
+  margin-top: 14px;
+  color: #94a3b8;
+  font-size: 14px;
+}
+
+/* =========================================
+   FORM
+========================================= */
+
+.signin-form {
+  width: 100%;
+}
+
+.signin-input-group {
+  margin-bottom: 22px;
+}
+
+.signin-input-group label {
+  display: block;
+  margin-bottom: 8px;
+  color: #cbd5e1;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* =========================================
+   PASSWORD LABEL ROW
+========================================= */
+
+.password-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.password-label-row label {
+  margin-bottom: 8px;
+}
+
+.forgot-password {
+  border: none;
+  background: transparent;
+  color: #60a5fa;
+  font-size: 11px;
+  cursor: pointer;
+  transition: 0.3s ease;
+}
+
+.forgot-password:hover {
+  color: #93c5fd;
+}
+
+/* =========================================
+   INPUT
+========================================= */
+
+.signin-input-wrapper {
+  position: relative;
+}
+
+.signin-input-icon {
+  position: absolute;
+  left: 15px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: #64748b;
+  font-size: 16px;
+  pointer-events: none;
+}
+
+.signin-input-wrapper input {
+  width: 100%;
+  height: 52px;
+  padding: 0 46px;
+  border: 1px solid #26344d;
+  border-radius: 10px;
+  outline: none;
+  background: rgba(15, 23, 42, 0.8);
+  color: #ffffff;
+  font-size: 14px;
+  transition: 0.3s ease;
+}
+
+.signin-input-wrapper input::placeholder {
+  color: #64748b;
+}
+
+.signin-input-wrapper input:focus {
+  border-color: #3b82f6;
+  box-shadow:
+    0 0 0 4px rgba(59, 130, 246, 0.1);
+}
+
+/* =========================================
+   PASSWORD ICON
+========================================= */
+
+.password-icon {
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transform: translateY(-50%);
+  border: none;
+  background: transparent;
+  color: #64748b;
+  cursor: pointer;
+  padding: 4px;
+  transition: all 0.25s ease;
+}
+
+.password-icon:hover {
+  color: #60a5fa;
+  transform: translateY(-50%) scale(1.08);
+}
+
+.password-icon:focus-visible {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+  border-radius: 5px;
+}
+
+/* =========================================
+   ERROR
+========================================= */
+
+.signin-error {
+  margin: -8px 0 14px;
+  color: #f87171;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+/* =========================================
+   SIGN IN BUTTON
+========================================= */
+
+.signin-btn {
+  width: 100%;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 18px;
+  border: none;
+  border-radius: 10px;
+  background: linear-gradient(
+    135deg,
+    #2563eb,
+    #4f46e5
+  );
+  color: #ffffff;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.signin-btn:hover {
+  transform: translateY(-2px);
+  box-shadow:
+    0 12px 30px rgba(37, 99, 235, 0.35);
+}
+
+.signin-btn .arrow {
+  font-size: 20px;
+  transition: transform 0.3s ease;
+}
+
+.signin-btn:hover .arrow {
+  transform: translateX(5px);
+}
+
+/* =========================================
+   CREATE ACCOUNT
+========================================= */
+
+.create-account-text {
+  margin-top: 24px;
+  color: #64748b;
+  text-align: center;
+  font-size: 13px;
+}
+
+.create-account-text span {
+  margin-left: 4px;
+  color: #60a5fa;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.create-account-text span:hover {
+  color: #93c5fd;
+}
+
+/* =========================================
+   FOOTER
+========================================= */
+
+.signin-footer {
+  margin-top: 32px;
+  color: #475569;
+  text-align: center;
+  font-size: 11px;
+}
+
+/* =========================================
+   RESPONSIVE
+========================================= */
+
+@media (max-width: 600px) {
+  .signin-page {
+    padding: 20px 16px;
+  }
+
+  .signin-card {
+    padding: 32px 22px;
+  }
+
+  .signin-header h1 {
+    font-size: 30px;
+  }
+}
