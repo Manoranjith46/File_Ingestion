@@ -3,13 +3,14 @@ API Architecture - Current Project Status
 Base server
 - FastAPI app with CORS enabled.
 - Frontend origin comes from FRONTEND_URL, defaulting to http://localhost:5173.
-- Auth uses Bearer access tokens plus an httpOnly refresh_token cookie.
-- Google login redirects back to the frontend with tokens in the URL fragment.
+- Auth uses Bearer access tokens in the Authorization header plus an httpOnly refresh_token cookie.
+- Google login redirects back to the frontend without exposing tokens in the URL.
 
 Common auth rules
 - Protected endpoints require Authorization: Bearer <access_token>.
 - refresh_token is stored in an httpOnly cookie at path /auth.
 - For browser calls that rely on refresh, use credentials: include.
+- Access tokens are not returned in response bodies anymore.
 
 Auth endpoints
 - GET /
@@ -24,19 +25,16 @@ Auth endpoints
 		- password: string
 	- Response:
 		- user: PublicUserSchema
-		- otp_code: string
-		- otp_expires_at: datetime
+		- message: string
 
 - POST /auth/login
 	- Body:
 		- identifier: string
 		- password: string
 	- Response:
-		- access_token: string
-		- token_type: "bearer"
-		- refresh_expires_at: datetime
+		- message: string
 		- user: PublicUserSchema
-	- Side effect: sets refresh_token cookie.
+	- Side effect: sets refresh_token cookie and returns access token in the Authorization response header.
 
 - POST /auth/logout
 	- Header: Authorization: Bearer <access_token>
@@ -47,11 +45,9 @@ Auth endpoints
 - POST /auth/refresh
 	- Uses refresh_token cookie.
 	- Response:
-		- access_token: string
-		- token_type: "bearer"
-		- refresh_expires_at: datetime
+		- message: string
 		- user: PublicUserSchema
-	- Side effect: rotates refresh cookie.
+	- Side effect: rotates refresh cookie and returns a new access token in the Authorization response header.
 
 - GET /auth/me
 	- Header: Authorization: Bearer <access_token>
@@ -62,8 +58,7 @@ Auth endpoints
 		- email: string
 	- Response:
 		- email: string
-		- otp_code: string
-		- otp_expires_at: datetime
+		- message: string
 	- Note: OTP is currently console-only, not emailed.
 
 - POST /auth/verify-otp
@@ -71,19 +66,16 @@ Auth endpoints
 		- email: string
 		- otp_code: string
 	- Response:
-		- access_token: string
-		- token_type: "bearer"
-		- refresh_expires_at: datetime
+		- message: string
 		- user: PublicUserSchema
-	- Side effect: sets refresh_token cookie.
+	- Side effect: sets refresh_token cookie and returns access token in the Authorization response header.
 
 - POST /auth/request-password-reset
 	- Body:
 		- email: string
 	- Response:
 		- email: string
-		- reset_token: string
-		- reset_expires_at: datetime
+		- message: string
 
 - POST /auth/reset-password
 	- Body:
@@ -99,11 +91,10 @@ Auth endpoints
 
 - GET /auth/google/callback?code=...&state=...
 	- Browser redirect back to frontend.
-	- Fragment format:
-		- access_token
-		- token_type=bearer
+	- Query parameters:
+		- status=success
 		- is_new_user=true|false
-	- Side effect: sets refresh_token cookie.
+	- Side effect: sets refresh_token cookie and does not expose tokens in the URL.
 
 File ingestion endpoints
 - POST /v1/upload/init
@@ -111,6 +102,7 @@ File ingestion endpoints
 	- Body:
 		- filename: string
 		- filesize: integer
+		- file_fingerprint: string (64 hex chars) (optional)
 	- Response:
 		- upload_id: string
 		- filename: string
@@ -136,18 +128,19 @@ File ingestion endpoints
 		- total_chunks: integer
 		- chunk_size: 5242880
 		- complete: boolean
+	- Note: each chunk is validated and stored; finalization is performed separately by calling `/v1/upload/finalize`.
 
 - POST /v1/upload/finalize
 	- Header: Authorization: Bearer <access_token>
 	- Body:
 		- upload_id: string
 	- Response:
-		- status: string
+		- status: "completed" | "incomplete"
 		- upload_id: string
-		- physical_file_id: integer
-		- file_path: string
-		- master_hash: string
-		- complete: true
+		- complete: boolean
+		- queued: boolean
+		- missing_indices?: list of integers
+	- Note: the backend checks Redis completion first. If some chunks are still missing, it returns the missing chunk indices so the client can resend them. When all chunks are present, it queues merge/cleanup work and returns a queued ack.
 
 - GET /v1/uploads?page=1&limit=10
 	- Header: Authorization: Bearer <access_token>
@@ -156,8 +149,20 @@ File ingestion endpoints
 		- limit: integer
 		- total_files: integer
 		- files:
+			- mapping_id: integer
 			- filename: string
 			- filesize: integer
+	- Note: the list only includes uploads owned by the authenticated user.
+
+- POST /v1/uploads/delete
+	- Header: Authorization: Bearer <access_token>
+	- Body:
+		- mapping_id: integer
+	- Response:
+		- status: string
+		- mapping_id: integer
+		- deleted: boolean
+		- message: string
 
 Frontend needs
 - Auth screens:
@@ -186,7 +191,109 @@ Frontend needs
 	- filename and filesize display
 
 Important notes
-- There are no download, delete, update, or file detail endpoints yet.
+- There are no download, update, or file detail endpoints yet.
+- Uploads are segregated per user and users can only see their own uploaded files.
 - Upload chunks must be sent sequentially.
 - OTP delivery is console-only in the current implementation.
 - If a different file already exists with the same final name, the backend returns a conflict instead of overwriting it.
+
+
+
+
+# Frontend integration notes:
+#
+# Endpoints exposed by the current backend:
+#   POST /v1/upload/init
+#     - Request body JSON:
+#         {
+#           "filename": "string",
+#           "filesize": integer,
+#           "master_hash": "64-char hex string",
+#           "relative_path": "optional relative path string"
+#         }
+#     - Response JSON:
+#         {
+#           "upload_id": "uuid string",
+#           "chunk_size": 5242880,
+#           "total_chunks": integer,
+#           "status": "created" | "duplicate_short_circuit"
+#         }
+#     - Flow: frontend calls this first to create an upload session. It receives upload_id and total_chunks.
+#
+#   POST /v1/upload/chunk
+#     - Request type: multipart/form-data
+#     - Form fields:
+#         upload_id: string
+#         chunk_index: integer
+#         chunk_hash: string (SHA-256 hex of the chunk bytes)
+#         chunk_file: file (binary chunk content)
+#     - Response JSON:
+#         {
+#           "status": "success",
+#           "upload_id": "string",
+#           "chunk_index": integer,
+#           "bytes_received": integer,
+#           "received_chunks": integer,
+#           "total_chunks": integer,
+#           "chunk_size": 5242880,
+#           "complete": boolean
+#         }
+#     - Flow: frontend uploads chunks sequentially (or in parallel) and can track progress via received_chunks/total_chunks.
+#
+#   POST /v1/upload/finalize
+#     - Request body JSON:
+#         {
+#           "upload_id": "string",
+#           "master_hash": "64-char hex string"
+#         }
+#     - Response JSON:
+#         {
+#           "status": "success",
+#           "file_id": "uuid string",
+#           "folder_id": "string|null"
+#         }
+#     - Flow: frontend calls this once all chunks are uploaded. Backend validates chunk completion, merges the chunks, and persists the file metadata.
+#
+#   POST /v1/uploads/delete
+#     - Request body JSON:
+#         {
+#           "upload_id": "string"
+#         }
+#     - Response JSON:
+#         {
+#           "status": "deleted",
+#           "file_id": "string"
+#         }
+#     - Flow: frontend calls to delete an uploaded file by its file_id.
+#
+#   GET /v1/uploads
+#     - Response JSON:
+#         {
+#           "id": "root folder id",
+#           "type": "folder",
+#           "name": "root",
+#           "children": [ ... nested folders and files ... ]
+#         }
+#     - Flow: frontend calls to retrieve the user's nested upload tree. Files have type "file" and include name/size.
+#
+# Authentication:
+#   - All endpoints require Authorization header: "Bearer <token>"
+#   - The backend resolves the current user from the bearer token before processing.
+#
+# Frontend implementation details:
+#   - Compute SHA-256 master_hash for the entire file before init.
+#   - Split the file into chunks of 5,242,880 bytes (5 MB).
+#   - For each chunk, compute SHA-256 chunk_hash and send with the chunk payload.
+#   - Track upload_id, chunk_index, and progress from upload_chunk responses.
+#   - After all chunks are uploaded, call finalize_upload to complete the file ingestion.
+#   - Use GET /v1/uploads to display the virtual folder/file tree.
+#
+# Error handling:
+#   - 404 if upload session not found
+#   - 400 for invalid request data or hash mismatch
+#   - 403 for authorization/user mismatch
+#   - 409 if finalize is called before all chunks uploaded
+#
+# Important note:
+#   - relative_path is user-scoped and creates nested folders in the virtual tree.
+#   - physical files are stored flat under uploads/files/ by generated UUID.

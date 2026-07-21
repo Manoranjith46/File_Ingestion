@@ -11,6 +11,10 @@ from config.database import Check_db_Connection, get_engine
 from config.redis_server import redis_server_status
 from helpers.get_env import get_env
 from helpers.get_env import load_environment_variables
+
+# Load environment variables before importing modules that depend on them.
+load_environment_variables()
+
 from models.auth_model import Base
 from models import file_model  # noqa: F401
 from services.cleanup_scheduler import start_cleanup_scheduler
@@ -21,9 +25,8 @@ from routes.auth_routes import auth_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-        Load environment settings,Create Redis-Server and prepare the database during application startup.
+        Create Redis-Server and prepare the database during application startup.
     """
-    load_environment_variables()
     redis_server_status()
     Check_db_Connection()
     start_cleanup_scheduler()
@@ -45,6 +48,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Authorization"],
 )
 
 app.include_router(auth_router, prefix="/auth", tags=["Authentication"])

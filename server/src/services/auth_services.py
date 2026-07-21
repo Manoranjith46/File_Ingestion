@@ -26,6 +26,7 @@ from helpers.jwt import (
     verify_secret,
 )
 from models.auth_model import User
+from config.redis_server import server as redis_server, active_session_limiter
 from schemas.auth_schema import (
     LoginRequest,
     OtpRequest,
@@ -271,39 +272,49 @@ def authenticate_user(db: Session, payload: LoginRequest) -> User:
     return user
 
 
-def issue_token_pair(db: Session, user: User) -> TokenPairResponse:
-    """Rotate the token version and return a fresh access token response.
+def issue_token_pair(db: Session, user: User) -> tuple[TokenPairResponse, str, str]:
+    """
+    Rotate the token version and return a safe auth payload, access token, and refresh token.
 
     Args:
-        db: The active database session.
-        user: The authenticated user.
+        db (Session): The active database session.
+        user (User): The user object to issue tokens for.
 
     Returns:
-        TokenPairResponse: The new access token payload and refresh expiry.
+        tuple[TokenPairResponse, str, str]: A tuple containing TokenPairResponse, access_token, and refresh_token.
     """
     user.token_version += 1
     user.last_login_at = _now()
     db.commit()
     db.refresh(user)
-    return TokenPairResponse(
-        access_token=create_access_token(user),
-        refresh_expires_at=_now() + _refresh_token_ttl(),
-        user=create_public_user(user),
-    )
+    access_token = create_access_token(user)
+
+    # Enforce active session limit using Redis Lua script
+    sid = secrets.token_hex(16)
+    zset_key = f"user:sessions:{user.id}"
+    now_timestamp = int(_now().timestamp())
+    ttl_seconds = int(_refresh_token_ttl().total_seconds())
+    max_sessions = int(get_env("MAX_ACTIVE_SESSIONS", default="5", required=False))
+
+    active_session_limiter(keys=[zset_key], args=[now_timestamp, sid, max_sessions, ttl_seconds])
+
+    refresh_token = create_refresh_token(user, sid)
+    return TokenPairResponse(user=create_public_user(user)), access_token, refresh_token
 
 
 def resolve_refresh_user(db: Session, refresh_token: str) -> User:
-    """Resolve the current user from a refresh token.
+    """
+    Resolve the current user from a refresh token and check session state.
 
     Args:
-        db: The active database session.
-        refresh_token: The refresh token to verify.
+        db (Session): The active database session.
+        refresh_token (str): The refresh token to verify.
 
     Returns:
         User: The user represented by the token.
 
     Raises:
-        HTTPException: If the token is invalid, revoked, or the user is missing.
+        HTTPException: If the token is invalid, revoked, or the session was evicted.
     """
     payload = decode_refresh_token(refresh_token)
     user = db.query(User).filter(User.id == payload["sub"]).one_or_none()
@@ -311,6 +322,15 @@ def resolve_refresh_user(db: Session, refresh_token: str) -> User:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
     if user.token_version != payload.get("token_version"):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token has been revoked")
+
+    # Validate session ID (sid) in Redis ZSET
+    sid = payload.get("sid")
+    if sid:
+        zset_key = f"user:sessions:{user.id}"
+        score = redis_server.zscore(zset_key, sid)
+        if score is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session has been evicted or invalidated")
+
     return user
 
 
@@ -336,29 +356,47 @@ def get_current_user(db: Session, access_token: str) -> User:
     return user
 
 
-def refresh_session(db: Session, refresh_token: str) -> TokenPairResponse:
-    """Validate a refresh token and issue a new token pair.
+def refresh_session(db: Session, refresh_token: str) -> tuple[TokenPairResponse, str, str]:
+    """
+    Validate a refresh token and issue a new token pair.
 
     Args:
-        db: The active database session.
-        refresh_token: The refresh token to verify.
+        db (Session): The active database session.
+        refresh_token (str): The refresh token to verify.
 
     Returns:
-        TokenPairResponse: The refreshed token response.
+        tuple[TokenPairResponse, str, str]: A tuple containing TokenPairResponse, access_token, and refresh_token.
     """
     user = resolve_refresh_user(db, refresh_token)
     return issue_token_pair(db, user)
 
 
-def revoke_session(db: Session, user: User) -> None:
-    """Invalidate all active tokens for a user.
+def revoke_session(db: Session, user: User, refresh_token: str | None = None) -> None:
+    """
+    Invalidate active tokens for a user, clearing Redis session list.
 
     Args:
-        db: The active database session.
-        user: The user whose sessions should be revoked.
+        db (Session): The active database session.
+        user (User): The user whose sessions should be revoked.
+        refresh_token (str | None): Optional specific refresh token to revoke.
+
+    Returns:
+        None
     """
     user.token_version += 1
     db.commit()
+
+    zset_key = f"user:sessions:{user.id}"
+    if refresh_token:
+        try:
+            payload = decode_refresh_token(refresh_token)
+            sid = payload.get("sid")
+            if sid:
+                redis_server.zrem(zset_key, sid)
+        except Exception:
+            redis_server.delete(zset_key)
+    else:
+        redis_server.delete(zset_key)
 
 
 def request_otp(db: Session, payload: OtpRequest) -> tuple[User, str, datetime]:
@@ -547,21 +585,7 @@ def continue_with_google(db: Session, code: str) -> tuple[User, bool]:
     return user, is_new_user
 
 
-def build_google_frontend_redirect_url(access_token: str, is_new_user: bool) -> str:
-    """Build the frontend redirect URL after Google login.
-
-    Args:
-        access_token: The application access token.
-        is_new_user: Whether the Google account created a new local user.
-
-    Returns:
-        str: The frontend redirect URL with a URL fragment payload.
-    """
-    fragment = urlencode(
-        {
-            "access_token": access_token,
-            "token_type": "bearer",
-            "is_new_user": str(is_new_user).lower(),
-        }
-    )
-    return f"{_frontend_url().rstrip('/')}/auth/google/callback#{fragment}"
+def build_google_frontend_redirect_url(is_new_user: bool) -> str:
+    """Build the frontend redirect URL after Google login."""
+    query = urlencode({"status": "success", "is_new_user": str(is_new_user).lower()})
+    return f"{_frontend_url().rstrip('/')}/auth/google/callback?{query}"

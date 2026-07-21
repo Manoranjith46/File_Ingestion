@@ -174,36 +174,31 @@ class GoogleSignInRequest(BaseModel):
 
 
 class TokenPairResponse(BaseModel):
-    """Return access and refresh token details to the client."""
+    """Return a safe authentication success payload to the client."""
 
-    access_token: str
-    token_type: str = "bearer"
-    refresh_expires_at: datetime
+    message: str = "Authentication successful"
     user: PublicUserSchema
 
 
 class RegistrationResponse(BaseModel):
-    """Return registration details together with the OTP challenge."""
+    """Return registration details without exposing OTP secrets."""
 
     user: PublicUserSchema
-    otp_code: str
-    otp_expires_at: datetime
+    message: str = "Registration successful"
 
 
 class OtpChallengeResponse(BaseModel):
-    """Return OTP challenge metadata for testing and development."""
+    """Return a safe OTP challenge acknowledgment."""
 
     email: str
-    otp_code: str
-    otp_expires_at: datetime
+    message: str = "OTP challenge created"
 
 
 class PasswordResetChallengeResponse(BaseModel):
-    """Return password-reset challenge metadata for testing and development."""
+    """Return a safe password-reset acknowledgment."""
 
     email: str
-    reset_token: str
-    reset_expires_at: datetime
+    message: str = "Password reset challenge created"
 
 
 class MessageResponse(BaseModel):

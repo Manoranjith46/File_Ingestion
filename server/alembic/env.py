@@ -14,12 +14,17 @@ from alembic import context
 config = context.config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+
+# Add both PROJECT_ROOT and SRC_ROOT to sys.path to allow relative imports
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
-from src.helpers.get_env import get_env, load_environment_variables
-from src.models.auth_model import Base
-from src.models import file_model  # noqa: F401
+from helpers.get_env import get_env, load_environment_variables
+from models.auth_model import Base
+from models import file_model  # noqa: F401
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
