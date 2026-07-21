@@ -98,6 +98,10 @@ class DatasetCreate(BaseModel):
 
     name: str = Field(min_length=1, max_length=255)
     description: str | None = Field(default=None, max_length=500)
+    source_type: str | None = Field(default=None, max_length=255)
+    content_type: str | None = Field(default=None, max_length=255)
+    format: str | None = Field(default=None, max_length=255)
+    language: str | None = Field(default=None, max_length=255)
 
 
 class DatasetUpdate(BaseModel):
@@ -105,6 +109,10 @@ class DatasetUpdate(BaseModel):
 
     name: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = Field(default=None, max_length=500)
+    source_type: str | None = Field(default=None, max_length=255)
+    content_type: str | None = Field(default=None, max_length=255)
+    format: str | None = Field(default=None, max_length=255)
+    language: str | None = Field(default=None, max_length=255)
 
 
 class DatasetResponse(BaseModel):
@@ -114,6 +122,10 @@ class DatasetResponse(BaseModel):
     user_id: str
     name: str
     description: str | None = None
+    source_type: str | None = None
+    content_type: str | None = None
+    format: str | None = None
+    language: str | None = None
     created_at: datetime
     updated_at: datetime
 

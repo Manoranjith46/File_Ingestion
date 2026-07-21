@@ -18,7 +18,7 @@ def load_environment_variables():
     if not ENV_PATH.exists():
         raise FileNotFoundError(f".env file not found at {ENV_PATH}")
 
-    if load_dotenv(ENV_PATH):
+    if load_dotenv(ENV_PATH, override=True):
         print(f"✅ Environment Variables Loaded from its Path: {ENV_PATH}")
     else:
         print(f"❌ Failed to Load Environment Variables from its Path: {ENV_PATH}")

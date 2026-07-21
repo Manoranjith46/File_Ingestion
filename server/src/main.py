@@ -37,9 +37,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-frontend_url = get_env("FRONTEND_URL", "http://localhost:5173", required=False)
-allowed_origins = [origin.strip() for origin in str(frontend_url).split(",") if origin.strip()]
+# Support multiple frontend deployment URLs (comma-separated in env var)
+frontend_urls = get_env("FRONTEND_URL", "http://localhost:5173", required=False)
 
+# Split comma-separated URLs into a list and trim whitespace
+allowed_origins = [origin.strip() for origin in str(frontend_urls).split(",") if origin.strip()]
+
+# Ensure local dev origin is present
 if "http://localhost:5173" not in allowed_origins:
     allowed_origins.append("http://localhost:5173")
 

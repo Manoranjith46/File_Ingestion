@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+from datetime import datetime
 from math import ceil
 from pathlib import Path
 from uuid import uuid4
 
 from fastapi import HTTPException, status
+from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -70,6 +72,11 @@ def _file_path(file_id: str) -> Path:
     return FINAL_ROOT / f"{file_id}"
 
 
+def _uploaded_filename(filename: str) -> str:
+    """Return the storage filename derived from the client-supplied name."""
+    return Path(filename).name
+
+
 def _validate_relative_path(relative_path: str | None) -> list[str]:
     if relative_path is None or relative_path.strip() == "":
         return []
@@ -85,8 +92,29 @@ def _validate_relative_path(relative_path: str | None) -> list[str]:
     return parts
 
 
-def _get_folder_tree(db: Session, user: User, relative_path: str | None) -> Folder | None:
+def _resolve_folder_parts(relative_path: str | None, filename: str | None = None) -> list[str]:
+    """
+    Resolve the folder segments from an upload path.
+
+    Args:
+        relative_path (str | None): The client-supplied relative path.
+        filename (str | None): The original file name, used to strip a trailing file segment.
+
+    Returns:
+        list[str]: The folder path segments.
+    """
     parts = _validate_relative_path(relative_path)
+    if not parts:
+        return []
+
+    if filename is not None and parts[-1] == Path(filename).name:
+        return parts[:-1]
+
+    return parts
+
+
+def _get_folder_tree(db: Session, user: User, relative_path: str | None, filename: str | None = None) -> Folder | None:
+    parts = _resolve_folder_parts(relative_path, filename)
     if not parts:
         return None
 
@@ -106,6 +134,57 @@ def _get_folder_tree(db: Session, user: User, relative_path: str | None) -> Fold
     return folder
 
 
+def _get_folder_by_id(db: Session, user: User, folder_id: str) -> Folder:
+    """
+    Resolve a folder by ID for the current user.
+
+    Args:
+        db (Session): The active database session.
+        user (User): The authenticated user.
+        folder_id (str): The folder ID to resolve.
+
+    Returns:
+        Folder: The matching folder row.
+
+    Raises:
+        HTTPException: If the folder does not exist or does not belong to the user.
+    """
+    folder = db.query(Folder).filter(Folder.id == folder_id, Folder.user_id == user.id).one_or_none()
+    if folder is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Folder not found")
+    return folder
+
+
+def _collect_descendant_folder_ids(db: Session, user: User, folder_id: str) -> set[str]:
+    """
+    Collect a folder and all of its descendant folder IDs.
+
+    Args:
+        db (Session): The active database session.
+        user (User): The authenticated user.
+        folder_id (str): The root folder ID.
+
+    Returns:
+        set[str]: The folder ID set including descendants.
+    """
+    folder_ids: set[str] = {folder_id}
+    queue: list[str] = [folder_id]
+
+    while queue:
+        current_folder_id = queue.pop(0)
+        children = (
+            db.query(Folder.id)
+            .filter(Folder.user_id == user.id, Folder.parent_id == current_folder_id)
+            .all()
+        )
+        for child_id, in children:
+            if child_id not in folder_ids:
+                folder_ids.add(child_id)
+                queue.append(child_id)
+
+    return folder_ids
+
+
 def _build_tree(
     db: Session,
     user: User,
@@ -118,7 +197,13 @@ def _build_tree(
     if dataset_id:
         get_dataset_by_id(db, user, dataset_id)
 
-    root = UploadsTreeResponse(id=str(uuid4()), type="folder", name="root", children=[])
+    if folder_id:
+        root_folder = _get_folder_by_id(db, user, folder_id)
+        root = UploadsTreeResponse(id=root_folder.id, type="folder", name=root_folder.name, children=[])
+        scoped_folder_ids = _collect_descendant_folder_ids(db, user, root_folder.id)
+    else:
+        root = UploadsTreeResponse(id=str(uuid4()), type="folder", name="root", children=[])
+        scoped_folder_ids = set()
 
     mapping_query = (
         db.query(DatasetFolderFilesMapping)
@@ -127,21 +212,24 @@ def _build_tree(
     if dataset_id:
         mapping_query = mapping_query.filter(DatasetFolderFilesMapping.dataset_id == dataset_id)
     if folder_id:
-        mapping_query = mapping_query.filter(DatasetFolderFilesMapping.folder_id == folder_id)
+        mapping_query = mapping_query.filter(DatasetFolderFilesMapping.folder_id.in_(scoped_folder_ids))
 
     mappings = mapping_query.all()
 
-    folder_ids = {m.folder_id for m in mappings if m.folder_id is not None}
-    all_folder_ids = set(folder_ids)
-    for fid in list(folder_ids):
-        curr_id = fid
-        while curr_id:
-            f = db.query(Folder).filter(Folder.id == curr_id, Folder.user_id == user.id).first()
-            if f and f.parent_id:
-                all_folder_ids.add(f.parent_id)
-                curr_id = f.parent_id
-            else:
-                break
+    if folder_id:
+        all_folder_ids = scoped_folder_ids
+    else:
+        folder_ids = {m.folder_id for m in mappings if m.folder_id is not None}
+        all_folder_ids = set(folder_ids)
+        for fid in list(folder_ids):
+            curr_id = fid
+            while curr_id:
+                f = db.query(Folder).filter(Folder.id == curr_id, Folder.user_id == user.id).first()
+                if f and f.parent_id:
+                    all_folder_ids.add(f.parent_id)
+                    curr_id = f.parent_id
+                else:
+                    break
 
     folders = (
         db.query(Folder)
@@ -153,11 +241,17 @@ def _build_tree(
 
     folder_map: dict[str, UploadsTreeResponse] = {"root": root}
     for folder in folders:
+        if folder_id and folder.id == root.id:
+            folder_map[folder.id] = root
+            continue
         node = UploadsTreeResponse(id=folder.id, type="folder", name=folder.name, children=[])
         folder_map[folder.id] = node
 
     for folder in folders:
-        parent_id = folder.parent_id or "root"
+        if folder_id and folder.id == root.id:
+            continue
+
+        parent_id = folder.parent_id if folder_id else (folder.parent_id or "root")
         if parent_id in folder_map:
             folder_map[parent_id].children = folder_map[parent_id].children or []
             folder_map[parent_id].children.append(folder_map[folder.id])
@@ -209,7 +303,9 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
     # Enforce mandatory dataset ownership check
     get_dataset_by_id(db, user, payload.dataset_id)
 
-    folder = _get_folder_tree(db, user, payload.relative_path)
+    folder = _get_folder_tree(db, user, payload.relative_path, payload.filename)
+    if folder is not None:
+        db.commit()
 
     # 1. Check if exact mapping already exists (duplicate_short_circuit)
     exists_mapping = (
@@ -378,6 +474,15 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
     if folder_id == "":
         folder_id = None
 
+    if folder_id is not None:
+        folder = (
+            db.query(Folder)
+            .filter(Folder.id == folder_id, Folder.user_id == user.id)
+            .one_or_none()
+        )
+        if folder is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Folder not found")
+
     final_file_id = None
 
     # Check if this is a suspected duplicate fast-link session
@@ -425,7 +530,13 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
                             shutil.copyfileobj(source, destination)
 
                 final_file_id = str(uuid4())
-                final_path = _file_path(final_file_id)
+                final_filename = _uploaded_filename(meta["filename"])
+                final_path = FINAL_ROOT / final_filename
+                if final_path.exists():
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="A file with this name already exists.",
+                    )
                 staging_path.replace(final_path)
                 file_size_bytes = final_path.stat().st_size
 
@@ -547,6 +658,10 @@ def create_dataset(db: Session, user: User, payload: DatasetCreate) -> Dataset:
         user_id=user.id,
         name=payload.name.strip(),
         description=payload.description.strip() if payload.description else None,
+        source_type=payload.source_type.strip() if payload.source_type else None,
+        content_type=payload.content_type.strip() if payload.content_type else None,
+        format=payload.format.strip() if payload.format else None,
+        language=payload.language.strip() if payload.language else None,
     )
     db.add(dataset)
     db.commit()
@@ -656,6 +771,18 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
 
     if payload.description is not None:
         dataset.description = payload.description.strip()
+
+    if payload.source_type is not None:
+        dataset.source_type = payload.source_type.strip()
+
+    if payload.content_type is not None:
+        dataset.content_type = payload.content_type.strip()
+
+    if payload.format is not None:
+        dataset.format = payload.format.strip()
+
+    if payload.language is not None:
+        dataset.language = payload.language.strip()
 
     dataset.updated_at = datetime.now()
     db.commit()
