@@ -10,18 +10,18 @@ ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
 
 def load_environment_variables():
     """
-    Load environment variables from the project .env file.
+    Load environment variables from the project .env file when present.
 
-    Raises:
-        FileNotFoundError: If the .env file does not exist.
+    If no local .env file exists, the function leaves the process environment in place
+    so container-based deployments can provide variables directly.
     """
-    if not ENV_PATH.exists():
-        raise FileNotFoundError(f".env file not found at {ENV_PATH}")
-
-    if load_dotenv(ENV_PATH, override=True):
-        print(f"✅ Environment Variables Loaded from its Path: {ENV_PATH}")
+    if ENV_PATH.exists():
+        if load_dotenv(ENV_PATH, override=False):
+            print(f"✅ Environment Variables Loaded from its Path: {ENV_PATH}")
+        else:
+            print(f"❌ Failed to Load Environment Variables from its Path: {ENV_PATH}")
     else:
-        print(f"❌ Failed to Load Environment Variables from its Path: {ENV_PATH}")
+        print(f"ℹ️ No .env file found at {ENV_PATH}; using environment variables from the current process.")
 
 
 def get_env(key: str, default=None, required: bool = True):

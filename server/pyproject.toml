@@ -4,21 +4,6 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = [
-    "alembic>=1.18.5",
-    "dotenv>=0.9.9",
-    "fastapi>=0.139.0",
-    "google-api-python-client<=2.198.0",
-    "google-auth>=2.0.0",
-    "google-auth-httplib2>=0.2.0",
-    "google-auth-oauthlib>=1.2.0",
-    "pip>=26.1.2",
-    "psycopg2>=2.9.12",
-    "psycopg2-binary>=2.9.12",
-    "pydantic[email]>=2.13.4",
-    "python-dotenv>=1.2.2",
-    "python-multipart>=0.0.32",
-    "redis>=8.0.1",
-    "sqlalchemy>=2.0.51",
-    "uvicorn>=0.51.0",
-]
+[tool.pytest.ini_options]
+pythonpath = ["."]
+filterwarnings = ["ignore::ResourceWarning",]

@@ -8,6 +8,7 @@ pydantic[email]
 redis
 uvicorn
 python-dotenv
-psycopg2
+psycopg2-binary
 alembic
 python-multipart
+httpx

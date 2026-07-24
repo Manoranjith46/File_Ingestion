@@ -47,7 +47,7 @@ class RegisterRequest(BaseModel):
             check_deliver = False
         try:
             info = validate_email(str(v), check_deliverability=check_deliver)
-            return info.email
+            return info.normalized
         except EmailNotValidError as e:
             raise ValueError(str(e))
 
@@ -109,7 +109,7 @@ class OtpRequest(BaseModel):
             check_deliver = False
         try:
             info = validate_email(str(v), check_deliverability=check_deliver)
-            return info.email
+            return info.normalized
         except EmailNotValidError as e:
             raise ValueError(str(e))
 
@@ -134,7 +134,7 @@ class OtpVerifyRequest(BaseModel):
             check_deliver = False
         try:
             info = validate_email(str(v), check_deliverability=check_deliver)
-            return info.email
+            return info.normalized
         except EmailNotValidError as e:
             raise ValueError(str(e))
 
@@ -158,7 +158,7 @@ class PasswordResetRequest(BaseModel):
             check_deliver = False
         try:
             info = validate_email(str(v), check_deliverability=check_deliver)
-            return info.email
+            return info.normalized
         except EmailNotValidError as e:
             raise ValueError(str(e))
 

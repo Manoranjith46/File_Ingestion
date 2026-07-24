@@ -582,22 +582,27 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
 
 def delete_user_upload(db: Session, user: User, upload_id: str) -> UploadDeleteResponse:
     """Delete an uploaded file and its physical storage for the authenticated user."""
-    uploaded_file = (
-        db.query(UploadedFile)
-        .filter(UploadedFile.id == upload_id, UploadedFile.user_id == user.id)
-        .one_or_none()
-    )
+    uploaded_file = db.query(UploadedFile).filter(UploadedFile.id == upload_id).one_or_none()
     if uploaded_file is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload not found")
+
+    ownership_mapping = (
+        db.query(DatasetFolderFilesMapping)
+        .filter(DatasetFolderFilesMapping.file_id == upload_id, DatasetFolderFilesMapping.user_id == user.id)
+        .first()
+    )
+    if ownership_mapping is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload not found")
 
     file_path = Path(uploaded_file.physical_path)
     if file_path.exists():
-        try:
-            file_path.unlink()
-        except OSError:
-            pass
+        file_path.unlink()
 
+    db.query(DatasetFolderFilesMapping).filter(
+        DatasetFolderFilesMapping.file_id == upload_id
+    ).delete(synchronize_session=False)
     db.delete(uploaded_file)
+
     db.commit()
 
     return UploadDeleteResponse(status="deleted", file_id=upload_id)

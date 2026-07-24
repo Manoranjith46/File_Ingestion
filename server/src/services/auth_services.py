@@ -294,7 +294,7 @@ def issue_token_pair(db: Session, user: User) -> tuple[TokenPairResponse, str, s
     zset_key = f"user:sessions:{user.id}"
     now_timestamp = int(_now().timestamp())
     ttl_seconds = int(_refresh_token_ttl().total_seconds())
-    max_sessions = int(get_env("MAX_ACTIVE_SESSIONS", default="5", required=False))
+    max_sessions = int(get_env("MAX_ACTIVE_SESSIONS", default="3", required=False))
 
     active_session_limiter(keys=[zset_key], args=[now_timestamp, sid, max_sessions, ttl_seconds])
 

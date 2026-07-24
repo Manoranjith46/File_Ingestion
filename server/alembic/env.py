@@ -22,9 +22,9 @@ if str(PROJECT_ROOT) not in sys.path:
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from helpers.get_env import get_env, load_environment_variables
-from models.auth_model import Base
-from models import file_model  # noqa: F401
+from src.helpers.get_env import get_env, load_environment_variables
+from src.models.auth_model import Base
+from src.models import file_model  # noqa: F401
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.

@@ -1,0 +1,64 @@
+services:
+  api:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: file-ingestion-api
+    env_file:
+      - ./server/.env
+    environment:
+      Connection_String: postgresql+psycopg2://postgres:postgres@postgres:5432/file_ingestion
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      FRONTEND_URL: http://localhost:5173
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-access-secret}
+      JWT_REFRESH_SECRET_KEY: ${JWT_REFRESH_SECRET_KEY:-dev-refresh-secret}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-15}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-7}
+      OTP_EXPIRE_MINUTES: ${OTP_EXPIRE_MINUTES:-10}
+      PASSWORD_RESET_EXPIRE_MINUTES: ${PASSWORD_RESET_EXPIRE_MINUTES:-15}
+      UPLOAD_STORAGE_DIR: /app/uploads
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - ./server:/app
+      - uploads-data:/app/uploads
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: file-ingestion-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: file_ingestion
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d file_ingestion"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: file-ingestion-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  uploads-data:
