@@ -8,18 +8,6 @@ services:
     image: file-ingestion-api:latest
     env_file:
       - .env
-    environment:
-      Connection_String: postgresql://postgres:postgres@postgres:5432/file_ingestion
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
-      FRONTEND_URL: http://localhost:5173
-      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-dev-access-secret}
-      JWT_REFRESH_SECRET_KEY: ${JWT_REFRESH_SECRET_KEY:-dev-refresh-secret}
-      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-15}
-      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-7}
-      OTP_EXPIRE_MINUTES: ${OTP_EXPIRE_MINUTES:-10}
-      PASSWORD_RESET_EXPIRE_MINUTES: ${PASSWORD_RESET_EXPIRE_MINUTES:-15}
-      UPLOAD_STORAGE_DIR: /app/uploads
     ports:
       - "8000:8000"
     depends_on:
