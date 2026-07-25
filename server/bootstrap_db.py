@@ -6,12 +6,12 @@ import subprocess
 # Add src to python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
-from helpers.get_env import load_environment_variables
+from src.helpers.get_env import load_environment_variables
 load_environment_variables()
 
-from config.database import get_engine
-from models.auth_model import Base
-from models import file_model  # noqa: F401
+from src.config.database import get_engine
+from src.models.auth_model import Base
+from src.models import file_model  # noqa: F401
 
 def bootstrap():
     engine = get_engine()

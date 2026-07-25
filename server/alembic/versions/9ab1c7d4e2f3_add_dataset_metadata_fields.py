@@ -24,6 +24,7 @@ def upgrade() -> None:
     op.add_column("datasets", sa.Column("content_type", sa.String(length=255), nullable=True))
     op.add_column("datasets", sa.Column("format", sa.String(length=255), nullable=True))
     op.add_column("datasets", sa.Column("language", sa.String(length=255), nullable=True))
+    op.add_column("datasets", sa.Column("status", sa.String(length=50), nullable=False, server_default="created"))
 
 
 def downgrade() -> None:
@@ -32,3 +33,4 @@ def downgrade() -> None:
     op.drop_column("datasets", "format")
     op.drop_column("datasets", "content_type")
     op.drop_column("datasets", "source_type")
+    op.drop_column("datasets", "status")

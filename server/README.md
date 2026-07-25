@@ -92,3 +92,32 @@ If the backend fails to start, check these first:
 - Redis is running
 - Database connection string is correct
 - `.env` file exists in the `server` folder
+
+## 7. Run with Docker (recommended for sharing via Git)
+
+If you plan to share the repository and let someone else run the service using Docker, do the following:
+
+- Add a `.env` file in the `server` folder (do not commit it). Use `.env.example` as a template and send the actual `.env` privately to your friend.
+- The project includes a `docker-compose.yml` that builds the `api` image and uses official `postgres` and `redis` images.
+
+From the `server` folder:
+
+```bash
+# build image and start services
+docker compose build
+docker compose up
+
+# or run in background
+docker compose up -d --build
+```
+
+To stop and remove containers:
+
+```bash
+docker compose down
+```
+
+Notes:
+
+- Your friend only needs Docker / Docker Desktop installed; they do not need to install Postgres or Redis locally.
+- Make sure to provide the `.env` file privately — the `.env.example` file in the repo is safe to commit.

@@ -208,6 +208,7 @@ class PasswordResetChallengeResponse(BaseModel):
     """Return a safe password-reset acknowledgment."""
 
     email: str
+    reset_token: str
     message: str = "Password reset created"
 
 

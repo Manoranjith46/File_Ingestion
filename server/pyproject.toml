@@ -4,6 +4,11 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
+dependencies = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "pytest-cov>=7.1.0",
+]
 [tool.pytest.ini_options]
 pythonpath = ["."]
 filterwarnings = ["ignore::ResourceWarning",]

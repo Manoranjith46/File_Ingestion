@@ -16,3 +16,4 @@ __pycache__/
 *.sqlite3
 *.db
 uploads/
+endpoint.txt

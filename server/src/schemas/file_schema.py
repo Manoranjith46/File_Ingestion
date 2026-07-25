@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
 CHUNK_SIZE_BYTES = 5242880
+UploadStatus = Literal[
+    "created",
+    "In Progress",
+    "completed",
+    "duplicate_short_circuit",
+    "duplicate_suspected",
+    "success",
+    "deleted",
+    "attached",
+]
 
 
 class UploadInitRequest(BaseModel):
@@ -25,7 +36,7 @@ class UploadInitResponse(BaseModel):
     upload_id: str
     chunk_size: int = CHUNK_SIZE_BYTES
     total_chunks: int
-    status: str
+    status: UploadStatus
 
 
 class UploadChunkRequest(BaseModel):
@@ -39,7 +50,7 @@ class UploadChunkRequest(BaseModel):
 class UploadChunkResponse(BaseModel):
     """Schema for chunk upload responses."""
 
-    status: str
+    status: UploadStatus
     upload_id: str
     chunk_index: int
     bytes_received: int
@@ -59,7 +70,7 @@ class UploadFinalizeRequest(BaseModel):
 class UploadFinalizeResponse(BaseModel):
     """Schema for upload finalization responses."""
 
-    status: str
+    status: UploadStatus
     file_id: str
     folder_id: str | None = None
 
@@ -73,7 +84,7 @@ class UploadDeleteRequest(BaseModel):
 class UploadDeleteResponse(BaseModel):
     """Schema for upload delete responses."""
 
-    status: str
+    status: UploadStatus
     file_id: str
 
 
@@ -97,6 +108,7 @@ class DatasetCreate(BaseModel):
     """Schema for dataset creation requests."""
 
     name: str = Field(min_length=1, max_length=255)
+    status: str | None = Field(default="created", max_length=50)
     description: str | None = Field(default=None, max_length=500)
     source_type: str | None = Field(default=None, max_length=255)
     content_type: str | None = Field(default=None, max_length=255)
@@ -108,6 +120,7 @@ class DatasetUpdate(BaseModel):
     """Schema for dataset update requests."""
 
     name: str | None = Field(default=None, min_length=1, max_length=255)
+    status: str | None = Field(default=None, max_length=50)
     description: str | None = Field(default=None, max_length=500)
     source_type: str | None = Field(default=None, max_length=255)
     content_type: str | None = Field(default=None, max_length=255)
@@ -122,12 +135,14 @@ class DatasetResponse(BaseModel):
     user_id: str
     name: str
     description: str | None = None
+    status: str = "created"
     source_type: str | None = None
     content_type: str | None = None
     format: str | None = None
     language: str | None = None
     created_at: datetime
     updated_at: datetime
+    file_count: int
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -142,7 +157,7 @@ class DatasetAttachFileRequest(BaseModel):
 class DatasetAttachFileResponse(BaseModel):
     """Schema for file attach responses."""
 
-    status: str
+    status: UploadStatus
     dataset_id: str
     file_id: str
     folder_id: str | None = None

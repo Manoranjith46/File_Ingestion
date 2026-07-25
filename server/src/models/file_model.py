@@ -30,6 +30,7 @@ class Dataset(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    status: Mapped[str] = mapped_column(String(50), default="created", nullable=False)
     source_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
     format: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -40,6 +41,11 @@ class Dataset(Base):
 
     user = relationship("User")
     mappings = relationship("DatasetFolderFilesMapping", back_populates="dataset", cascade="all, delete-orphan")
+
+    @property
+    def file_count(self) -> int:
+        """Return the number of files linked to this dataset."""
+        return len(self.mappings)
 
 
 class Folder(Base):

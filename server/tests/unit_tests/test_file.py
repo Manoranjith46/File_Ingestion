@@ -19,7 +19,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from models.auth_model import Base, User
 from models.file_model import Dataset, DatasetFolderFilesMapping, Folder, UploadedFile
-from schemas.file_schema import DatasetCreate, UploadInitRequest
+from schemas.file_schema import DatasetCreate, DatasetUpdate, UploadInitRequest
 from services import file_services
 
 
@@ -99,6 +99,57 @@ def test_create_dataset_rejects_duplicate_name(db_session: Session) -> None:
         file_services.create_dataset(db_session, user, payload)
 
     assert exc_info.value.status_code == 409
+
+
+def test_dataset_status_is_persisted_and_returned_on_update(db_session: Session) -> None:
+    """Dataset status should be stored in the database and exposed by the update flow."""
+    user = User(email="status@example.com", username="status", full_name="Status User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    created = file_services.create_dataset(db_session, user, DatasetCreate(name="Status Dataset"))
+    assert created.status == "created"
+
+    updated = file_services.update_dataset(db_session, user, created.id, DatasetUpdate(status="In Progress"))
+    assert updated.status == "In Progress"
+
+    completed = file_services.update_dataset(db_session, user, created.id, DatasetUpdate(status="completed"))
+    assert completed.status == "completed"
+
+
+def test_dataset_status_auto_moves_to_in_progress_for_second_file(db_session: Session) -> None:
+    """Adding a second file to a created dataset should automatically advance it to In Progress."""
+    user = User(email="multi@example.com", username="multi", full_name="Multi User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Multi Dataset"))
+    first_file = UploadedFile(filename="a.txt", file_size_bytes=1, master_hash="1" * 64, physical_path="/tmp/a.txt")
+    second_file = UploadedFile(filename="b.txt", file_size_bytes=1, master_hash="2" * 64, physical_path="/tmp/b.txt")
+    db_session.add_all([first_file, second_file])
+    db_session.commit()
+    db_session.refresh(first_file)
+    db_session.refresh(second_file)
+
+    db_session.add(
+        DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=first_file.id, user_id=user.id)
+    )
+    db_session.commit()
+
+    file_services.attach_file_to_dataset(db_session, user, dataset.id, SimpleNamespace(file_id=first_file.id, relative_path=None))
+    db_session.refresh(dataset)
+    assert dataset.status == "created"
+
+    db_session.add(
+        DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=second_file.id, user_id=user.id)
+    )
+    db_session.commit()
+
+    file_services.attach_file_to_dataset(db_session, user, dataset.id, SimpleNamespace(file_id=second_file.id, relative_path=None))
+    db_session.refresh(dataset)
+    assert dataset.status == "In Progress"
 
 
 def test_initialize_upload_returns_duplicate_short_circuit_for_existing_mapping(db_session: Session, storage_root: Path, fake_redis: FakeRedis) -> None:
@@ -242,3 +293,46 @@ def test_attach_file_to_dataset_requires_user_ownership(db_session: Session) -> 
         file_services.attach_file_to_dataset(db_session, other_user, dataset.id, SimpleNamespace(file_id=uploaded_file.id, relative_path=None))
 
     assert exc_info.value.status_code == 403
+
+
+def test_dataset_file_count(db_session: Session) -> None:
+    """Test that a dataset correctly tracks its linked files count."""
+    user = User(email="count@example.com", username="count_user", full_name="Count User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    dataset = Dataset(user_id=user.id, name="Test Count")
+    db_session.add(dataset)
+    db_session.commit()
+    db_session.refresh(dataset)
+
+    # Initially file count should be 0
+    assert dataset.file_count == 0
+
+    # Add a file mapping
+    file1 = UploadedFile(filename="file1.txt", file_size_bytes=100, master_hash="e" * 64, physical_path="/tmp/file1.txt")
+    db_session.add(file1)
+    db_session.commit()
+    db_session.refresh(file1)
+
+    mapping1 = DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=file1.id, user_id=user.id)
+    db_session.add(mapping1)
+    db_session.commit()
+
+    # Refresh dataset mappings
+    db_session.refresh(dataset)
+    assert dataset.file_count == 1
+
+    # Add another file mapping
+    file2 = UploadedFile(filename="file2.txt", file_size_bytes=200, master_hash="f" * 64, physical_path="/tmp/file2.txt")
+    db_session.add(file2)
+    db_session.commit()
+    db_session.refresh(file2)
+
+    mapping2 = DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=file2.id, user_id=user.id)
+    db_session.add(mapping2)
+    db_session.commit()
+
+    db_session.refresh(dataset)
+    assert dataset.file_count == 2

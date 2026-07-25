@@ -7,13 +7,22 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Install system dependencies commonly needed for DB drivers
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc libpq-dev build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
+# Copy project files
 COPY . .
+
+# Ensure startup script is executable
+RUN chmod +x ./start.sh || true
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "chmod +x start.sh && ./start.sh"]
+# Use the repository start script which bootstraps DB then launches uvicorn
+CMD ["./start.sh"]

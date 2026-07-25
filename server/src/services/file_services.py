@@ -436,7 +436,7 @@ def process_upload_chunk(db: Session, user: User, payload: UploadChunkRequest, c
 
     received_chunks = int(redis_server.bitcount(bitmap_key) or 0)
     return UploadChunkResponse(
-        status="success",
+        status="In Progress",
         upload_id=payload.upload_id,
         chunk_index=payload.chunk_index,
         bytes_received=len(chunk_bytes),
@@ -577,7 +577,7 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
     if not linked_file_id:
         redis_server.delete(_bitmap_key(payload.upload_id), _chunk_hashes_key(payload.upload_id))
 
-    return UploadFinalizeResponse(status="success", file_id=final_file_id, folder_id=folder_id)
+    return UploadFinalizeResponse(status="completed", file_id=final_file_id, folder_id=folder_id)
 
 
 def delete_user_upload(db: Session, user: User, upload_id: str) -> UploadDeleteResponse:
@@ -629,6 +629,14 @@ def list_user_uploads(
     return _build_tree(db, user, dataset_id=dataset_id, folder_id=folder_id)
 
 
+def _normalize_dataset_status(value: str | None) -> str:
+    """Normalize dataset status values to the supported lifecycle states."""
+    if value is None:
+        return "created"
+    normalized = value.strip()
+    return normalized if normalized in {"created", "In Progress", "completed"} else "created"
+
+
 def create_dataset(db: Session, user: User, payload: DatasetCreate) -> Dataset:
     """
     Create a new dataset catalog entry.
@@ -663,6 +671,7 @@ def create_dataset(db: Session, user: User, payload: DatasetCreate) -> Dataset:
         user_id=user.id,
         name=payload.name.strip(),
         description=payload.description.strip() if payload.description else None,
+        status=_normalize_dataset_status(payload.status),
         source_type=payload.source_type.strip() if payload.source_type else None,
         content_type=payload.content_type.strip() if payload.content_type else None,
         format=payload.format.strip() if payload.format else None,
@@ -776,6 +785,20 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
 
     if payload.description is not None:
         dataset.description = payload.description.strip()
+
+    if payload.status is not None:
+        requested_status = _normalize_dataset_status(payload.status)
+        allowed_transitions = {
+            "created": {"created", "In Progress"},
+            "In Progress": {"In Progress", "completed"},
+            "completed": {"completed"},
+        }
+        if requested_status not in allowed_transitions.get(dataset.status, set()):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Dataset status can only move from created to In Progress to completed.",
+            )
+        dataset.status = requested_status
 
     if payload.source_type is not None:
         dataset.source_type = payload.source_type.strip()
@@ -891,6 +914,15 @@ def attach_file_to_dataset(
             user_id=user.id,
         )
         db.add(mapping)
+        db.commit()
+
+    file_count = (
+        db.query(DatasetFolderFilesMapping)
+        .filter(DatasetFolderFilesMapping.dataset_id == dataset.id)
+        .count()
+    )
+    if file_count > 1 and dataset.status == "created":
+        dataset.status = "In Progress"
         db.commit()
 
     return DatasetAttachFileResponse(

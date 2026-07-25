@@ -11,6 +11,8 @@ wheels/
 .env
 
 
+endpoint.txt
 API Architecture.pdf
 Architecture.docx
-endpoint.txt
+logs.md
+plan.md

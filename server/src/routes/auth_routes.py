@@ -203,8 +203,8 @@ def request_password_reset_endpoint(payload: PasswordResetRequest, db: Session =
     """
         Create a password reset challenge for the supplied email address.
     """
-    user, _, _ = request_password_reset(db, payload)
-    return PasswordResetChallengeResponse(email=user.email, message="Password reset challenge created")
+    user, reset_token, _ = request_password_reset(db, payload)
+    return PasswordResetChallengeResponse(email=user.email, reset_token=reset_token, message="Password reset challenge created")
 
 
 @auth_router.post("/password-reset/verify", response_model=MessageResponse)

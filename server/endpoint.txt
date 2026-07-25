@@ -395,6 +395,8 @@ Cookie set by this handler:
 
 Relevant status values from the service:
 - `created`
+- `In Progress`
+- `completed`
 - `duplicate_short_circuit`
 - `duplicate_suspected`
 
@@ -458,7 +460,8 @@ Multipart form fields:
 | `folder_id` | `str \| None` | No | `null` |
 
 Relevant service output values:
-- `status="success"`
+- `status="completed"` on successful finalization
+- `status="In Progress"` while chunk uploads are still being processed
 - on incomplete upload the service raises `409 Upload is incomplete`
 
 #### `GET /v1/uploads`
