@@ -152,6 +152,45 @@ def test_dataset_status_auto_moves_to_in_progress_for_any_file(db_session: Sessi
     assert dataset.status == "In Progress"
 
 
+def test_update_dataset_can_move_mappings_to_another_dataset(db_session: Session) -> None:
+    """Dataset updates should allow moving file mappings to another eligible dataset."""
+    user = User(email="move@example.com", username="move", full_name="Move User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    source_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Source Dataset"))
+    target_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Target Dataset"))
+
+    uploaded_file = UploadedFile(filename="move.txt", file_size_bytes=8, master_hash="m" * 64, physical_path="/tmp/move.txt")
+    db_session.add(uploaded_file)
+    db_session.commit()
+    db_session.refresh(uploaded_file)
+
+    mapping = DatasetFolderFilesMapping(dataset_id=source_dataset.id, folder_id=None, file_id=uploaded_file.id, user_id=user.id)
+    db_session.add(mapping)
+    db_session.commit()
+
+    updated = file_services.update_dataset(
+        db_session,
+        user,
+        source_dataset.id,
+        DatasetUpdate(target_dataset_id=target_dataset.id),
+    )
+
+    assert updated.id == source_dataset.id
+    assert db_session.query(DatasetFolderFilesMapping).filter(
+        DatasetFolderFilesMapping.dataset_id == source_dataset.id,
+        DatasetFolderFilesMapping.file_id == uploaded_file.id,
+    ).count() == 0
+    assert db_session.query(DatasetFolderFilesMapping).filter(
+        DatasetFolderFilesMapping.dataset_id == target_dataset.id,
+        DatasetFolderFilesMapping.file_id == uploaded_file.id,
+    ).count() == 1
+    assert source_dataset.status == "created"
+    assert target_dataset.status == "In Progress"
+
+
 def test_update_dataset_rejects_manual_created_transition(db_session: Session) -> None:
     """Users should not be able to explicitly move a dataset back to created."""
     user = User(email="transition@example.com", username="transition", full_name="Transition User", password_hash="hash", auth_provider="local", is_verified=True)
@@ -366,6 +405,29 @@ def test_delete_dataset_removes_attached_files_and_soft_deletes_dataset(db_sessi
     assert db_session.query(DatasetFolderFilesMapping).filter(DatasetFolderFilesMapping.dataset_id == dataset.id).count() == 0
     assert db_session.query(UploadedFile).filter(UploadedFile.id == uploaded_file.id).first() is None
     assert not file_path.exists()
+
+
+def test_get_dataset_tree_for_dataset_returns_nested_tree(db_session: Session) -> None:
+    """A dataset should expose its linked files and folders through the tree helper."""
+    user = User(email="tree@example.com", username="tree", full_name="Tree User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Tree Dataset"))
+    uploaded_file = UploadedFile(filename="tree.txt", file_size_bytes=4, master_hash="t" * 64, physical_path="/tmp/tree.txt")
+    db_session.add(uploaded_file)
+    db_session.commit()
+    db_session.refresh(uploaded_file)
+
+    mapping = DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=uploaded_file.id, user_id=user.id)
+    db_session.add(mapping)
+    db_session.commit()
+
+    tree = file_services.get_dataset_tree_for_dataset(db_session, user, dataset.id)
+
+    assert tree.type == "folder"
+    assert any(child.type == "file" and child.name == "tree.txt" for child in tree.children)
 
 
 def test_attach_file_to_dataset_requires_user_ownership(db_session: Session) -> None:

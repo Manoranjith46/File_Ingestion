@@ -30,6 +30,7 @@ from services.file_services import (
     process_upload_chunk,
     create_dataset,
     get_dataset_by_id,
+    get_dataset_tree_for_dataset,
     get_datasets,
     update_dataset,
     delete_dataset,
@@ -159,9 +160,11 @@ def get_dataset_by_id_route(
     authorization: str | None = Header(default=None, alias="Authorization"),
     db: Session = Depends(get_db),
 ):
-    """Return a single dataset by ID for the authenticated user."""
+    """Return a single dataset by ID for the authenticated user, including its file/folder tree."""
     user = _resolve_current_user(authorization, db)
-    return get_dataset_by_id(db, user, dataset_id)
+    dataset = get_dataset_by_id(db, user, dataset_id)
+    dataset.tree = get_dataset_tree_for_dataset(db, user, dataset.id)
+    return dataset
 
 
 @file_router.patch("/datasets/{dataset_id}", response_model=DatasetResponse)

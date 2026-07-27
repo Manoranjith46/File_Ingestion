@@ -754,6 +754,11 @@ def get_datasets(
     )
 
 
+def get_dataset_tree_for_dataset(db: Session, user: User, dataset_id: str) -> UploadsTreeResponse:
+    """Return the nested tree for all files and folders linked to a dataset."""
+    return _build_tree(db, user, dataset_id=dataset_id, folder_id=None)
+
+
 def get_dataset_by_id(db: Session, user: User, dataset_id: str) -> Dataset:
     """
     Retrieve an active dataset by its ID and check ownership.
@@ -832,6 +837,47 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
 
     if payload.description is not None:
         dataset.description = payload.description.strip()
+
+    if payload.target_dataset_id is not None:
+        if payload.target_dataset_id == dataset_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Target dataset must be different from the source dataset.")
+
+        target_dataset = get_dataset_by_id(db, user, payload.target_dataset_id)
+        if target_dataset.status not in {"created", "In Progress"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Target dataset must be created or In Progress.")
+
+        mappings_to_move = (
+            db.query(DatasetFolderFilesMapping)
+            .filter(
+                DatasetFolderFilesMapping.dataset_id == dataset.id,
+                DatasetFolderFilesMapping.user_id == user.id,
+            )
+            .all()
+        )
+
+        for mapping in mappings_to_move:
+            existing_target_mapping = (
+                db.query(DatasetFolderFilesMapping)
+                .filter(
+                    DatasetFolderFilesMapping.dataset_id == target_dataset.id,
+                    DatasetFolderFilesMapping.folder_id == mapping.folder_id,
+                    DatasetFolderFilesMapping.file_id == mapping.file_id,
+                )
+                .first()
+            )
+            if existing_target_mapping is None:
+                mapping.dataset_id = target_dataset.id
+                mapping.user_id = user.id
+                db.add(mapping)
+
+        db.query(DatasetFolderFilesMapping).filter(
+            DatasetFolderFilesMapping.dataset_id == dataset.id,
+            DatasetFolderFilesMapping.user_id == user.id,
+        ).delete(synchronize_session=False)
+
+        dataset.status = "created"
+        _sync_dataset_status_from_mappings(db, dataset)
+        _sync_dataset_status_from_mappings(db, target_dataset)
 
     if payload.status is not None:
         requested_status = _normalize_dataset_status(payload.status)
