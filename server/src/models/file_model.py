@@ -89,6 +89,7 @@ class DatasetFolderFilesMapping(Base):
     __table_args__ = (
         UniqueConstraint("dataset_id", "folder_id", "file_id", name="uq_dataset_folder_file"),
     )
+    __mapper_args__ = {"confirm_deleted_rows": False}
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False, index=True)

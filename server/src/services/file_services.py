@@ -195,7 +195,12 @@ def _build_tree(
     Construct the nested upload tree for a user, optionally filtered by dataset or folder.
     """
     if dataset_id:
-        get_dataset_by_id(db, user, dataset_id)
+        try:
+            get_dataset_by_id(db, user, dataset_id)
+        except HTTPException as exc:
+            if exc.status_code == status.HTTP_404_NOT_FOUND:
+                return UploadsTreeResponse(id=str(uuid4()), type="folder", name="root", children=[])
+            raise
 
     if folder_id:
         root_folder = _get_folder_by_id(db, user, folder_id)
@@ -300,8 +305,9 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
     """
     _ensure_storage_dirs()
 
-    # Enforce mandatory dataset ownership check
-    get_dataset_by_id(db, user, payload.dataset_id)
+    dataset = get_dataset_by_id(db, user, payload.dataset_id)
+    if dataset.status == "completed":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Completed datasets cannot receive new uploads")
 
     folder = _get_folder_tree(db, user, payload.relative_path, payload.filename)
     if folder is not None:
@@ -570,6 +576,11 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
         )
     )
     db.execute(stmt)
+
+    dataset = db.query(Dataset).filter(Dataset.id == dataset_id).one_or_none()
+    if dataset is not None:
+        _sync_dataset_status_from_mappings(db, dataset)
+
     db.commit()
 
     # Clear Redis keys
@@ -598,10 +609,22 @@ def delete_user_upload(db: Session, user: User, upload_id: str) -> UploadDeleteR
     if file_path.exists():
         file_path.unlink()
 
+    affected_mappings = (
+        db.query(DatasetFolderFilesMapping)
+        .filter(DatasetFolderFilesMapping.file_id == upload_id)
+        .all()
+    )
+    affected_dataset_ids = {mapping.dataset_id for mapping in affected_mappings}
+
     db.query(DatasetFolderFilesMapping).filter(
         DatasetFolderFilesMapping.file_id == upload_id
     ).delete(synchronize_session=False)
     db.delete(uploaded_file)
+
+    for dataset_id in affected_dataset_ids:
+        dataset = db.query(Dataset).filter(Dataset.id == dataset_id).one_or_none()
+        if dataset is not None:
+            _sync_dataset_status_from_mappings(db, dataset)
 
     db.commit()
 
@@ -635,6 +658,23 @@ def _normalize_dataset_status(value: str | None) -> str:
         return "created"
     normalized = value.strip()
     return normalized if normalized in {"created", "In Progress", "completed"} else "created"
+
+
+def _sync_dataset_status_from_mappings(db: Session, dataset: Dataset) -> None:
+    """Update dataset status based on the current number of linked files."""
+    if dataset.status == "completed":
+        return
+
+    file_count = (
+        db.query(DatasetFolderFilesMapping)
+        .filter(DatasetFolderFilesMapping.dataset_id == dataset.id)
+        .count()
+    )
+
+    if file_count <= 0:
+        dataset.status = "created"
+    else:
+        dataset.status = "In Progress"
 
 
 def create_dataset(db: Session, user: User, payload: DatasetCreate) -> Dataset:
@@ -683,7 +723,13 @@ def create_dataset(db: Session, user: User, payload: DatasetCreate) -> Dataset:
     return dataset
 
 
-def get_datasets(db: Session, user: User, page: int = 1, limit: int = 10) -> list[Dataset]:
+def get_datasets(
+    db: Session,
+    user: User,
+    page: int = 1,
+    limit: int = 10,
+    include_completed: bool = True,
+) -> list[Dataset]:
     """
     Return all active datasets belonging to the user.
 
@@ -697,10 +743,11 @@ def get_datasets(db: Session, user: User, page: int = 1, limit: int = 10) -> lis
         list[Dataset]: The list of active dataset records.
     """
     offset = (page - 1) * limit
+    query = db.query(Dataset).filter(Dataset.user_id == user.id, Dataset.is_deleted == False)
+    if not include_completed:
+        query = query.filter(Dataset.status != "completed")
     return (
-        db.query(Dataset)
-        .filter(Dataset.user_id == user.id, Dataset.is_deleted == False)
-        .order_by(Dataset.created_at.desc())
+        query.order_by(Dataset.created_at.desc())
         .offset(offset)
         .limit(limit)
         .all()
@@ -789,14 +836,14 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
     if payload.status is not None:
         requested_status = _normalize_dataset_status(payload.status)
         allowed_transitions = {
-            "created": {"created", "In Progress"},
-            "In Progress": {"In Progress", "completed"},
-            "completed": {"completed"},
+            "created": {"In Progress", "completed"},
+            "In Progress": {"completed"},
+            "completed": {"In Progress"},
         }
         if requested_status not in allowed_transitions.get(dataset.status, set()):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Dataset status can only move from created to In Progress to completed.",
+                detail="Invalid dataset status transition.",
             )
         dataset.status = requested_status
 
@@ -820,7 +867,7 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
 
 def delete_dataset(db: Session, user: User, dataset_id: str) -> None:
     """
-    Soft-delete an active dataset if no files are attached.
+    Remove a dataset, all of its linked files, and the related database rows.
 
     Args:
         db (Session): The active database session.
@@ -831,23 +878,33 @@ def delete_dataset(db: Session, user: User, dataset_id: str) -> None:
         None
 
     Raises:
-        HTTPException: If files are attached to this dataset.
+        HTTPException: If the dataset does not exist or is not owned by the user.
     """
     dataset = get_dataset_by_id(db, user, dataset_id)
 
-    # Enforce soft-delete cascade rules: Conflict if files are attached
-    attached_files_count = (
+    mappings = (
         db.query(DatasetFolderFilesMapping)
         .filter(DatasetFolderFilesMapping.dataset_id == dataset_id)
-        .count()
+        .all()
     )
-    if attached_files_count > 0:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Cannot delete dataset: files are attached.",
-        )
 
-    dataset.is_deleted = True
+    for mapping in mappings:
+        uploaded_file = (
+            db.query(UploadedFile)
+            .filter(UploadedFile.id == mapping.file_id)
+            .one_or_none()
+        )
+        if uploaded_file is not None:
+            file_path = Path(uploaded_file.physical_path)
+            if file_path.exists():
+                file_path.unlink(missing_ok=True)
+            db.delete(uploaded_file)
+
+    db.query(DatasetFolderFilesMapping).filter(
+        DatasetFolderFilesMapping.dataset_id == dataset_id
+    ).delete(synchronize_session=False)
+
+    db.delete(dataset)
     db.commit()
 
 
@@ -921,8 +978,11 @@ def attach_file_to_dataset(
         .filter(DatasetFolderFilesMapping.dataset_id == dataset.id)
         .count()
     )
-    if file_count > 1 and dataset.status == "created":
-        dataset.status = "In Progress"
+    if dataset.status != "completed":
+        if file_count <= 0:
+            dataset.status = "created"
+        else:
+            dataset.status = "In Progress"
         db.commit()
 
     return DatasetAttachFileResponse(

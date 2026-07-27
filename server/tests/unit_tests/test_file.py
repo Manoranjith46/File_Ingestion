@@ -118,8 +118,8 @@ def test_dataset_status_is_persisted_and_returned_on_update(db_session: Session)
     assert completed.status == "completed"
 
 
-def test_dataset_status_auto_moves_to_in_progress_for_second_file(db_session: Session) -> None:
-    """Adding a second file to a created dataset should automatically advance it to In Progress."""
+def test_dataset_status_auto_moves_to_in_progress_for_any_file(db_session: Session) -> None:
+    """Adding the first file to a created dataset should automatically advance it to In Progress."""
     user = User(email="multi@example.com", username="multi", full_name="Multi User", password_hash="hash", auth_provider="local", is_verified=True)
     db_session.add(user)
     db_session.commit()
@@ -140,7 +140,7 @@ def test_dataset_status_auto_moves_to_in_progress_for_second_file(db_session: Se
 
     file_services.attach_file_to_dataset(db_session, user, dataset.id, SimpleNamespace(file_id=first_file.id, relative_path=None))
     db_session.refresh(dataset)
-    assert dataset.status == "created"
+    assert dataset.status == "In Progress"
 
     db_session.add(
         DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=second_file.id, user_id=user.id)
@@ -150,6 +150,57 @@ def test_dataset_status_auto_moves_to_in_progress_for_second_file(db_session: Se
     file_services.attach_file_to_dataset(db_session, user, dataset.id, SimpleNamespace(file_id=second_file.id, relative_path=None))
     db_session.refresh(dataset)
     assert dataset.status == "In Progress"
+
+
+def test_update_dataset_rejects_manual_created_transition(db_session: Session) -> None:
+    """Users should not be able to explicitly move a dataset back to created."""
+    user = User(email="transition@example.com", username="transition", full_name="Transition User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Transition Dataset"))
+
+    with pytest.raises(HTTPException) as exc_info:
+        file_services.update_dataset(db_session, user, dataset.id, DatasetUpdate(status="created"))
+
+    assert exc_info.value.status_code == 400
+
+
+def test_initialize_upload_rejects_completed_dataset(db_session: Session, storage_root: Path, fake_redis: FakeRedis) -> None:
+    """Uploads should be rejected once the dataset is marked completed."""
+    user = User(email="completed-upload@example.com", username="completedupload", full_name="Completed Upload User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    dataset = Dataset(user_id=user.id, name="Locked", status="completed")
+    db_session.add(dataset)
+    db_session.commit()
+    db_session.refresh(dataset)
+
+    payload = UploadInitRequest(dataset_id=dataset.id, filename="report.txt", filesize=1024, master_hash="b" * 64)
+
+    with pytest.raises(HTTPException) as exc_info:
+        file_services.initialize_upload(db_session, user, payload)
+
+    assert exc_info.value.status_code == 400
+
+
+def test_get_datasets_can_filter_out_completed_datasets(db_session: Session) -> None:
+    """Listing datasets for uploads should optionally exclude completed datasets."""
+    user = User(email="filter@example.com", username="filter", full_name="Filter User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    created_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Created Dataset"))
+    completed_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Completed Dataset"))
+    file_services.update_dataset(db_session, user, completed_dataset.id, DatasetUpdate(status="completed"))
+
+    filtered = file_services.get_datasets(db_session, user, page=1, limit=10, include_completed=False)
+
+    assert [item.id for item in filtered] == [created_dataset.id]
 
 
 def test_initialize_upload_returns_duplicate_short_circuit_for_existing_mapping(db_session: Session, storage_root: Path, fake_redis: FakeRedis) -> None:
@@ -243,8 +294,43 @@ def test_delete_user_upload_removes_database_row_mappings_and_physical_file(
     assert db_session.query(DatasetFolderFilesMapping).filter(DatasetFolderFilesMapping.file_id == uploaded_file.id).count() == 0
 
 
-def test_delete_dataset_conflicts_when_files_are_attached(db_session: Session) -> None:
-    """Deleting a dataset should be blocked while active file mappings still exist."""
+def test_delete_user_upload_recomputes_dataset_status_when_last_file_is_removed(db_session: Session, storage_root: Path) -> None:
+    """Removing the last file from a dataset should move it back to created."""
+    user = User(email="status-delete@example.com", username="statusdelete", full_name="Status Delete User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    dataset = Dataset(user_id=user.id, name="Status Cleanup", status="In Progress")
+    db_session.add(dataset)
+    db_session.commit()
+    db_session.refresh(dataset)
+
+    file_path = storage_root / "files" / "cleanup.txt"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("cleanup")
+    uploaded_file = UploadedFile(
+        filename="cleanup.txt",
+        file_size_bytes=file_path.stat().st_size,
+        master_hash="g" * 64,
+        physical_path=str(file_path),
+    )
+    db_session.add(uploaded_file)
+    db_session.commit()
+    db_session.refresh(uploaded_file)
+
+    mapping = DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=uploaded_file.id, user_id=user.id)
+    db_session.add(mapping)
+    db_session.commit()
+
+    file_services.delete_user_upload(db_session, user, uploaded_file.id)
+    db_session.refresh(dataset)
+
+    assert dataset.status == "created"
+
+
+def test_delete_dataset_removes_attached_files_and_soft_deletes_dataset(db_session: Session, storage_root: Path) -> None:
+    """Deleting a dataset should remove its attached files and mark the dataset as deleted."""
     user = User(email="dataset-owner@example.com", username="datasetowner", full_name="Dataset Owner", password_hash="hash", auth_provider="local", is_verified=True)
     db_session.add(user)
     db_session.commit()
@@ -255,7 +341,16 @@ def test_delete_dataset_conflicts_when_files_are_attached(db_session: Session) -
     db_session.commit()
     db_session.refresh(dataset)
 
-    uploaded_file = UploadedFile(filename="protected.txt", file_size_bytes=64, master_hash="d" * 64, physical_path="/tmp/protected.txt")
+    file_path = storage_root / "files" / "protected.txt"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("protected contents")
+
+    uploaded_file = UploadedFile(
+        filename="protected.txt",
+        file_size_bytes=file_path.stat().st_size,
+        master_hash="d" * 64,
+        physical_path=str(file_path),
+    )
     db_session.add(uploaded_file)
     db_session.commit()
     db_session.refresh(uploaded_file)
@@ -264,10 +359,13 @@ def test_delete_dataset_conflicts_when_files_are_attached(db_session: Session) -
     db_session.add(mapping)
     db_session.commit()
 
-    with pytest.raises(HTTPException) as exc_info:
-        file_services.delete_dataset(db_session, user, dataset.id)
+    response = file_services.delete_dataset(db_session, user, dataset.id)
 
-    assert exc_info.value.status_code == 409
+    assert response is None
+    assert db_session.query(Dataset).filter(Dataset.id == dataset.id).first() is None
+    assert db_session.query(DatasetFolderFilesMapping).filter(DatasetFolderFilesMapping.dataset_id == dataset.id).count() == 0
+    assert db_session.query(UploadedFile).filter(UploadedFile.id == uploaded_file.id).first() is None
+    assert not file_path.exists()
 
 
 def test_attach_file_to_dataset_requires_user_ownership(db_session: Session) -> None:

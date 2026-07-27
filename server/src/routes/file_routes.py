@@ -133,6 +133,7 @@ def create_new_dataset(
 def list_datasets(
     page: int = 1,
     limit: int = 10,
+    include_completed: bool = True,
     authorization: str | None = Header(default=None, alias="Authorization"),
     db: Session = Depends(get_db),
 ):
@@ -149,7 +150,7 @@ def list_datasets(
         list[DatasetResponse]: A list of dataset details.
     """
     user = _resolve_current_user(authorization, db)
-    return get_datasets(db, user, page=page, limit=limit)
+    return get_datasets(db, user, page=page, limit=limit, include_completed=include_completed)
 
 
 @file_router.get("/datasets/{dataset_id}", response_model=DatasetResponse)

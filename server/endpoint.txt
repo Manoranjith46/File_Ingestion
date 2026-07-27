@@ -99,12 +99,14 @@ Validation errors return FastAPI's default 422 payload shape:
 | `user_id` | `str` | Yes | None |
 | `name` | `str` | Yes | None |
 | `description` | `str \| None` | No | `null` |
+| `status` | `str` | No | `created` |
 | `source_type` | `str \| None` | No | `null` |
 | `content_type` | `str \| None` | No | `null` |
 | `format` | `str \| None` | No | `null` |
 | `language` | `str \| None` | No | `null` |
 | `created_at` | `datetime` | Yes | None |
 | `updated_at` | `datetime` | Yes | None |
+| `file_count` | `int` | Yes | None |
 
 #### `DatasetAttachFileResponse`
 
@@ -532,6 +534,7 @@ Query parameters:
 | Field | Type | Required | Default | Constraints |
 |---|---|---:|---|---|
 | `name` | `str` | Yes | None | min length 1, max length 255 |
+| `status` | `str \| None` | No | `created` | max length 50 |
 | `description` | `str \| None` | No | `null` | max length 500 |
 | `source_type` | `str \| None` | No | `null` | max length 255 |
 | `content_type` | `str \| None` | No | `null` | max length 255 |
@@ -589,11 +592,14 @@ Path parameter:
 | Field | Type | Required | Default | Constraints |
 |---|---|---:|---|---|
 | `name` | `str \| None` | No | `null` | min length 1, max length 255 |
+| `status` | `str \| None` | No | `null` | max length 50 |
 | `description` | `str \| None` | No | `null` | max length 500 |
 | `source_type` | `str \| None` | No | `null` | max length 255 |
 | `content_type` | `str \| None` | No | `null` | max length 255 |
 | `format` | `str \| None` | No | `null` | max length 255 |
 | `language` | `str \| None` | No | `null` | max length 255 |
+
+Note: Dataset `status` can only transition forward in sequence: `created` -> `In Progress` -> `completed`.
 
 #### `DELETE /v1/datasets/{dataset_id}`
 
@@ -641,7 +647,8 @@ Path parameter:
 
 ```json
 {
-  "status": "success",
+  "status": "attached",
+  "dataset_id": "dataset-uuid",
   "file_id": "file-uuid",
   "folder_id": null
 }
@@ -686,11 +693,17 @@ Relationships:
 | `user_id` | `String(36)` | Foreign Key to `users.id`, `ON DELETE CASCADE`, `Nullable=False`, `Index` |
 | `name` | `String(255)` | `Nullable=False` |
 | `description` | `String(500)` | `Nullable=True` |
+| `status` | `String(50)` | default `created`, `Nullable=False` |
+| `source_type` | `String(255)` | `Nullable=True` |
+| `content_type` | `String(255)` | `Nullable=True` |
+| `format` | `String(255)` | `Nullable=True` |
+| `language` | `String(255)` | `Nullable=True` |
 | `is_deleted` | `Boolean` | default `False`, `Nullable=False` |
 | `created_at` | `DateTime(timezone=True)` | default `func.now()`, `Nullable=False` |
 | `updated_at` | `DateTime(timezone=True)` | default `func.now()`, `onupdate=func.now()`, `Nullable=False` |
 
-Relationships:
+Properties / Relationships:
+- `file_count` property: returns `len(self.mappings)`
 - `user = relationship("User")`
 - `mappings = relationship("DatasetFolderFilesMapping", back_populates="dataset", cascade="all, delete-orphan")`
 
