@@ -842,18 +842,32 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
         if payload.target_dataset_id == dataset_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Target dataset must be different from the source dataset.")
 
+        if dataset.status not in {"created", "In Progress"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source dataset must be created or In Progress.")
+
         target_dataset = get_dataset_by_id(db, user, payload.target_dataset_id)
         if target_dataset.status not in {"created", "In Progress"}:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Target dataset must be created or In Progress.")
 
-        mappings_to_move = (
+        mappings_query = (
             db.query(DatasetFolderFilesMapping)
             .filter(
                 DatasetFolderFilesMapping.dataset_id == dataset.id,
                 DatasetFolderFilesMapping.user_id == user.id,
             )
-            .all()
         )
+
+        if payload.file_id is not None and payload.file_id.strip() != "":
+            mappings_query = mappings_query.filter(DatasetFolderFilesMapping.file_id == payload.file_id)
+
+        if payload.folder_id is not None and payload.folder_id.strip() != "":
+            folder = _get_folder_by_id(db, user, payload.folder_id)
+            if folder is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Folder not found")
+            folder_ids = _collect_descendant_folder_ids(db, user, folder.id)
+            mappings_query = mappings_query.filter(DatasetFolderFilesMapping.folder_id.in_(folder_ids))
+
+        mappings_to_move = mappings_query.all()
 
         for mapping in mappings_to_move:
             existing_target_mapping = (
@@ -869,11 +883,8 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
                 mapping.dataset_id = target_dataset.id
                 mapping.user_id = user.id
                 db.add(mapping)
-
-        db.query(DatasetFolderFilesMapping).filter(
-            DatasetFolderFilesMapping.dataset_id == dataset.id,
-            DatasetFolderFilesMapping.user_id == user.id,
-        ).delete(synchronize_session=False)
+            else:
+                db.delete(mapping)
 
         dataset.status = "created"
         _sync_dataset_status_from_mappings(db, dataset)

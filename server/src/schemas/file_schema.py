@@ -122,6 +122,8 @@ class DatasetUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     status: str | None = Field(default=None, max_length=50)
     target_dataset_id: str | None = Field(default=None, min_length=1, max_length=255)
+    file_id: str | None = Field(default=None, min_length=1, max_length=255)
+    folder_id: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = Field(default=None, max_length=500)
     source_type: str | None = Field(default=None, max_length=255)
     content_type: str | None = Field(default=None, max_length=255)

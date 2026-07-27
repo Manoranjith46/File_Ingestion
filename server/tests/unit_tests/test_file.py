@@ -188,6 +188,87 @@ def test_update_dataset_can_move_mappings_to_another_dataset(db_session: Session
         DatasetFolderFilesMapping.file_id == uploaded_file.id,
     ).count() == 1
     assert source_dataset.status == "created"
+
+
+def test_update_dataset_can_move_a_single_file_mapping_to_another_dataset(db_session: Session) -> None:
+    """Dataset updates should allow moving a single file mapping to another dataset."""
+    user = User(email="single-move@example.com", username="singlemove", full_name="Single Move", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    source_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Single Source"))
+    target_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Single Target"))
+
+    uploaded_file = UploadedFile(filename="single.txt", file_size_bytes=8, master_hash="s" * 64, physical_path="/tmp/single.txt")
+    db_session.add(uploaded_file)
+    db_session.commit()
+    db_session.refresh(uploaded_file)
+
+    mapping = DatasetFolderFilesMapping(dataset_id=source_dataset.id, folder_id=None, file_id=uploaded_file.id, user_id=user.id)
+    db_session.add(mapping)
+    db_session.commit()
+
+    file_services.update_dataset(
+        db_session,
+        user,
+        source_dataset.id,
+        DatasetUpdate(target_dataset_id=target_dataset.id, file_id=uploaded_file.id),
+    )
+
+    assert db_session.query(DatasetFolderFilesMapping).filter(
+        DatasetFolderFilesMapping.dataset_id == source_dataset.id,
+        DatasetFolderFilesMapping.file_id == uploaded_file.id,
+    ).count() == 0
+    assert db_session.query(DatasetFolderFilesMapping).filter(
+        DatasetFolderFilesMapping.dataset_id == target_dataset.id,
+        DatasetFolderFilesMapping.file_id == uploaded_file.id,
+    ).count() == 1
+
+
+def test_update_dataset_can_move_a_folder_subtree_to_another_dataset(db_session: Session) -> None:
+    """Dataset updates should allow moving a folder subtree to another eligible dataset."""
+    user = User(email="folder-move@example.com", username="foldermove", full_name="Folder Move", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    source_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Folder Source"))
+    target_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Folder Target"))
+
+    parent_folder = Folder(user_id=user.id, name="parent")
+    db_session.add(parent_folder)
+    db_session.flush()
+    child_folder = Folder(user_id=user.id, name="child", parent_id=parent_folder.id)
+    db_session.add(child_folder)
+    db_session.commit()
+    db_session.refresh(parent_folder)
+    db_session.refresh(child_folder)
+
+    uploaded_file = UploadedFile(filename="nested.txt", file_size_bytes=8, master_hash="f" * 64, physical_path="/tmp/nested.txt")
+    db_session.add(uploaded_file)
+    db_session.commit()
+    db_session.refresh(uploaded_file)
+
+    mapping = DatasetFolderFilesMapping(dataset_id=source_dataset.id, folder_id=child_folder.id, file_id=uploaded_file.id, user_id=user.id)
+    db_session.add(mapping)
+    db_session.commit()
+
+    file_services.update_dataset(
+        db_session,
+        user,
+        source_dataset.id,
+        DatasetUpdate(target_dataset_id=target_dataset.id, folder_id=parent_folder.id),
+    )
+
+    assert db_session.query(DatasetFolderFilesMapping).filter(
+        DatasetFolderFilesMapping.dataset_id == source_dataset.id,
+        DatasetFolderFilesMapping.file_id == uploaded_file.id,
+    ).count() == 0
+    assert db_session.query(DatasetFolderFilesMapping).filter(
+        DatasetFolderFilesMapping.dataset_id == target_dataset.id,
+        DatasetFolderFilesMapping.file_id == uploaded_file.id,
+    ).count() == 1
     assert target_dataset.status == "In Progress"
 
 
