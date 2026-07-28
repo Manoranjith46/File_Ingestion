@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from config.redis_server import server as redis_server, atomic_chunk_state
 from helpers.get_env import get_env
 from models.auth_model import User
-from models.file_model import Folder, UploadedFile, Dataset, DatasetFolderFilesMapping
+from models.file_model import Folder, UploadedFile, UploadedFileSourceType, Dataset, DatasetFolderFilesMapping
 from schemas.file_schema import (
     CHUNK_SIZE_BYTES,
     UploadDeleteResponse,
@@ -306,7 +306,7 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
     _ensure_storage_dirs()
 
     dataset = get_dataset_by_id(db, user, payload.dataset_id)
-    if dataset.status == "completed":
+    if dataset.status == "Completed":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Completed datasets cannot receive new uploads")
 
     folder = _get_folder_tree(db, user, payload.relative_path, payload.filename)
@@ -355,6 +355,7 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
                 "folder_id": folder.id if folder else "",
                 "total_chunks": "0",
                 "linked_file_id": exists_file.id,
+                "source_type": payload.source_type or "",
             },
         )
         redis_server.expire(_meta_key(upload_id), SESSION_TTL_SECONDS)
@@ -380,6 +381,7 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
             "master_hash": payload.master_hash,
             "folder_id": folder.id if folder else "",
             "total_chunks": str(total_chunks),
+            "source_type": payload.source_type or "",
         },
     )
     redis_server.expire(_meta_key(upload_id), SESSION_TTL_SECONDS)
@@ -477,6 +479,7 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
 
     dataset_id = meta["dataset_id"]
     folder_id = meta.get("folder_id") or None
+    source_type_value = meta.get("source_type") or None
     if folder_id == "":
         folder_id = None
 
@@ -499,6 +502,8 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
         if uploaded_file is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Linked file not found")
 
+        if source_type_value:
+            uploaded_file.source_type = UploadedFileSourceType(source_type_value)
         final_file_id = linked_file_id
     else:
         # Standard upload flow
@@ -553,6 +558,7 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
                     file_size_bytes=file_size_bytes,
                     master_hash=meta["master_hash"],
                     physical_path=str(final_path),
+                    source_type=(UploadedFileSourceType(source_type_value) if source_type_value else None),
                 )
                 db.add(new_uploaded_file)
                 db.flush()
@@ -655,14 +661,20 @@ def list_user_uploads(
 def _normalize_dataset_status(value: str | None) -> str:
     """Normalize dataset status values to the supported lifecycle states."""
     if value is None:
-        return "created"
+        return "Created"
     normalized = value.strip()
-    return normalized if normalized in {"created", "In Progress", "completed"} else "created"
+    lifecycle_map = {
+        "created": "Created",
+        "draft": "Draft",
+        "completed": "Completed",
+        "in progress": "Draft",
+    }
+    return lifecycle_map.get(normalized.lower(), "Created")
 
 
 def _sync_dataset_status_from_mappings(db: Session, dataset: Dataset) -> None:
     """Update dataset status based on the current number of linked files."""
-    if dataset.status == "completed":
+    if dataset.status == "Completed":
         return
 
     file_count = (
@@ -671,10 +683,7 @@ def _sync_dataset_status_from_mappings(db: Session, dataset: Dataset) -> None:
         .count()
     )
 
-    if file_count <= 0:
-        dataset.status = "created"
-    else:
-        dataset.status = "In Progress"
+    dataset.status = "Draft" if file_count > 0 else "Created"
 
 
 def create_dataset(db: Session, user: User, payload: DatasetCreate) -> Dataset:
@@ -711,11 +720,8 @@ def create_dataset(db: Session, user: User, payload: DatasetCreate) -> Dataset:
         user_id=user.id,
         name=payload.name.strip(),
         description=payload.description.strip() if payload.description else None,
-        status=_normalize_dataset_status(payload.status),
-        source_type=payload.source_type.strip() if payload.source_type else None,
-        content_type=payload.content_type.strip() if payload.content_type else None,
-        format=payload.format.strip() if payload.format else None,
-        language=payload.language.strip() if payload.language else None,
+        status="Created",
+        language=payload.language.strip(),
     )
     db.add(dataset)
     db.commit()
@@ -745,7 +751,7 @@ def get_datasets(
     offset = (page - 1) * limit
     query = db.query(Dataset).filter(Dataset.user_id == user.id, Dataset.is_deleted == False)
     if not include_completed:
-        query = query.filter(Dataset.status != "completed")
+        query = query.filter(Dataset.status != "Completed")
     return (
         query.order_by(Dataset.created_at.desc())
         .offset(offset)
@@ -838,16 +844,22 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
     if payload.description is not None:
         dataset.description = payload.description.strip()
 
+    if dataset.status == "Completed":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Completed datasets cannot be modified.",
+        )
+
     if payload.target_dataset_id is not None:
         if payload.target_dataset_id == dataset_id:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Target dataset must be different from the source dataset.")
 
-        if dataset.status not in {"created", "In Progress"}:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source dataset must be created or In Progress.")
+        if dataset.status not in {"Created", "Draft"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source dataset must be in created or Draft status.")
 
         target_dataset = get_dataset_by_id(db, user, payload.target_dataset_id)
-        if target_dataset.status not in {"created", "In Progress"}:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Target dataset must be created or In Progress.")
+        if target_dataset.status not in {"Created", "Draft"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Target dataset must be in created or Draft status.")
 
         mappings_query = (
             db.query(DatasetFolderFilesMapping)
@@ -886,32 +898,24 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
             else:
                 db.delete(mapping)
 
-        dataset.status = "created"
+        dataset.status = "Draft"
         _sync_dataset_status_from_mappings(db, dataset)
         _sync_dataset_status_from_mappings(db, target_dataset)
 
     if payload.status is not None:
         requested_status = _normalize_dataset_status(payload.status)
+        current_status = _normalize_dataset_status(dataset.status)
         allowed_transitions = {
-            "created": {"In Progress", "completed"},
-            "In Progress": {"completed"},
-            "completed": {"In Progress"},
+            "Created": {"Draft", "Completed"},
+            "Draft": {"Completed"},
+            "Completed": set(),
         }
-        if requested_status not in allowed_transitions.get(dataset.status, set()):
+        if requested_status not in allowed_transitions.get(current_status, set()):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid dataset status transition.",
             )
         dataset.status = requested_status
-
-    if payload.source_type is not None:
-        dataset.source_type = payload.source_type.strip()
-
-    if payload.content_type is not None:
-        dataset.content_type = payload.content_type.strip()
-
-    if payload.format is not None:
-        dataset.format = payload.format.strip()
 
     if payload.language is not None:
         dataset.language = payload.language.strip()
@@ -1005,6 +1009,12 @@ def attach_file_to_dataset(
         else:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="File does not belong to the user.")
 
+    if dataset.status == "Completed":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Completed datasets cannot be modified.",
+        )
+
     # 3. Resolve folder structure if relative_path provided
     folder = _get_folder_tree(db, user, payload.relative_path)
     folder_id = folder.id if folder else None
@@ -1035,11 +1045,8 @@ def attach_file_to_dataset(
         .filter(DatasetFolderFilesMapping.dataset_id == dataset.id)
         .count()
     )
-    if dataset.status != "completed":
-        if file_count <= 0:
-            dataset.status = "created"
-        else:
-            dataset.status = "In Progress"
+    if dataset.status != "Completed":
+        dataset.status = "Draft"
         db.commit()
 
     return DatasetAttachFileResponse(

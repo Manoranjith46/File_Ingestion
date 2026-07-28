@@ -78,7 +78,6 @@ def login(payload: LoginRequest, response: Response, db: Session = Depends(get_d
         samesite="lax",
         path="/auth",
     )
-    response.headers["Authorization"] = f"Bearer {access_token}"
     return session
 
 
@@ -136,7 +135,6 @@ def refresh(response: Response, refresh_token: str | None = Cookie(default=None)
         samesite="lax",
         path="/auth",
     )
-    response.headers["Authorization"] = f"Bearer {access_token}"
     return session
 
 
@@ -167,7 +165,6 @@ def verify_signup_endpoint(payload: OtpVerifyRequest, response: Response, db: Se
         samesite="lax",
         path="/auth",
     )
-    response.headers["Authorization"] = f"Bearer {access_token}"
     return session
 
 
@@ -194,7 +191,6 @@ def login(payload: LoginRequest, response: Response, db: Session = Depends(get_d
         samesite="lax",
         path="/auth",
     )
-    response.headers["Authorization"] = f"Bearer {access_token}"
     return session
 
 
@@ -214,14 +210,6 @@ def reset_password_endpoint(payload: PasswordResetConfirmRequest, db: Session = 
     """
     reset_password(db, payload)
     return MessageResponse(message="Password updated successfully")
-
-
-
-
-
-
-
-
 
 
 

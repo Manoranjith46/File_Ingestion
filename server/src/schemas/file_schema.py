@@ -9,8 +9,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 CHUNK_SIZE_BYTES = 5242880
 UploadStatus = Literal[
-    "created",
+    "Created",
     "In Progress",
+    "Completed",
+    "created",
+    "in progress",
     "completed",
     "duplicate_short_circuit",
     "duplicate_suspected",
@@ -18,6 +21,8 @@ UploadStatus = Literal[
     "deleted",
     "attached",
 ]
+DatasetLanguage = Literal["Tamil", "English", "Chinese", "french"]
+DatasetStatus = str
 
 
 class UploadInitRequest(BaseModel):
@@ -28,6 +33,7 @@ class UploadInitRequest(BaseModel):
     filesize: int = Field(gt=0)
     master_hash: str = Field(min_length=64, max_length=64)
     relative_path: str | None = Field(default=None, min_length=0, max_length=500)
+    source_type: Literal["FTP", "GDrive", "Sharepoint"] | None = Field(default=None)
 
 
 class UploadInitResponse(BaseModel):
@@ -108,27 +114,20 @@ class DatasetCreate(BaseModel):
     """Schema for dataset creation requests."""
 
     name: str = Field(min_length=1, max_length=255)
-    status: str | None = Field(default="created", max_length=50)
     description: str | None = Field(default=None, max_length=500)
-    source_type: str | None = Field(default=None, max_length=255)
-    content_type: str | None = Field(default=None, max_length=255)
-    format: str | None = Field(default=None, max_length=255)
-    language: str | None = Field(default=None, max_length=255)
+    language: DatasetLanguage
 
 
 class DatasetUpdate(BaseModel):
     """Schema for dataset update requests."""
 
     name: str | None = Field(default=None, min_length=1, max_length=255)
-    status: str | None = Field(default=None, max_length=50)
+    status: DatasetStatus | None = Field(default=None)
     target_dataset_id: str | None = Field(default=None, min_length=1, max_length=255)
     file_id: str | None = Field(default=None, min_length=1, max_length=255)
     folder_id: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = Field(default=None, max_length=500)
-    source_type: str | None = Field(default=None, max_length=255)
-    content_type: str | None = Field(default=None, max_length=255)
-    format: str | None = Field(default=None, max_length=255)
-    language: str | None = Field(default=None, max_length=255)
+    language: DatasetLanguage | None = Field(default=None)
 
 
 class DatasetResponse(BaseModel):
@@ -138,11 +137,8 @@ class DatasetResponse(BaseModel):
     user_id: str
     name: str
     description: str | None = None
-    status: str = "created"
-    source_type: str | None = None
-    content_type: str | None = None
-    format: str | None = None
-    language: str | None = None
+    status: DatasetStatus = "Created"
+    language: DatasetLanguage | None = None
     created_at: datetime
     updated_at: datetime
     file_count: int

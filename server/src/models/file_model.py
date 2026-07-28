@@ -5,7 +5,9 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, String, UniqueConstraint, func
+from enum import Enum
+
+from sqlalchemy import BigInteger, Boolean, DateTime, Enum as SQLEnum, ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from models.auth_model import Base
@@ -30,10 +32,7 @@ class Dataset(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    status: Mapped[str] = mapped_column(String(50), default="created", nullable=False)
-    source_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    content_type: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    format: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(String(50), default="Created", nullable=False)
     language: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), nullable=False)
@@ -67,6 +66,12 @@ class Folder(Base):
     mappings = relationship("DatasetFolderFilesMapping", back_populates="folder", cascade="all, delete-orphan")
 
 
+class UploadedFileSourceType(str, Enum):
+    FTP = "FTP"
+    GDrive = "GDrive"
+    Sharepoint = "Sharepoint"
+
+
 class UploadedFile(Base):
     """Represent a physical file details uploaded to the server."""
 
@@ -77,6 +82,7 @@ class UploadedFile(Base):
     file_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     master_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
     physical_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    source_type: Mapped[UploadedFileSourceType | None] = mapped_column(SQLEnum(UploadedFileSourceType, name="uploaded_file_source_type"), nullable=True)
     uploaded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), nullable=False)
 
     mappings = relationship("DatasetFolderFilesMapping", back_populates="file", cascade="all, delete-orphan")

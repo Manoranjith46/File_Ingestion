@@ -92,7 +92,7 @@ def test_create_dataset_rejects_duplicate_name(db_session: Session) -> None:
     db_session.commit()
     db_session.refresh(user)
 
-    payload = DatasetCreate(name="Finance", description="Primary finance data")
+    payload = DatasetCreate(name="Finance", description="Primary finance data", language="English")
     file_services.create_dataset(db_session, user, payload)
 
     with pytest.raises(HTTPException) as exc_info:
@@ -108,24 +108,25 @@ def test_dataset_status_is_persisted_and_returned_on_update(db_session: Session)
     db_session.commit()
     db_session.refresh(user)
 
-    created = file_services.create_dataset(db_session, user, DatasetCreate(name="Status Dataset"))
-    assert created.status == "created"
+    created = file_services.create_dataset(db_session, user, DatasetCreate(name="Status Dataset", language="English"))
+    assert created.status == "Created"
 
-    updated = file_services.update_dataset(db_session, user, created.id, DatasetUpdate(status="In Progress"))
-    assert updated.status == "In Progress"
+    with pytest.raises(HTTPException) as exc_info:
+        file_services.update_dataset(db_session, user, created.id, DatasetUpdate(status="In Progress"))
+    assert exc_info.value.status_code == 400
 
-    completed = file_services.update_dataset(db_session, user, created.id, DatasetUpdate(status="completed"))
-    assert completed.status == "completed"
+    completed = file_services.update_dataset(db_session, user, created.id, DatasetUpdate(status="Completed"))
+    assert completed.status == "Completed"
 
 
-def test_dataset_status_auto_moves_to_in_progress_for_any_file(db_session: Session) -> None:
-    """Adding the first file to a created dataset should automatically advance it to In Progress."""
+def test_dataset_status_auto_moves_to_draft_for_any_file(db_session: Session) -> None:
+    """Adding files to a draft dataset should keep it in Draft until completion."""
     user = User(email="multi@example.com", username="multi", full_name="Multi User", password_hash="hash", auth_provider="local", is_verified=True)
     db_session.add(user)
     db_session.commit()
     db_session.refresh(user)
 
-    dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Multi Dataset"))
+    dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Multi Dataset", language="English"))
     first_file = UploadedFile(filename="a.txt", file_size_bytes=1, master_hash="1" * 64, physical_path="/tmp/a.txt")
     second_file = UploadedFile(filename="b.txt", file_size_bytes=1, master_hash="2" * 64, physical_path="/tmp/b.txt")
     db_session.add_all([first_file, second_file])
@@ -140,7 +141,7 @@ def test_dataset_status_auto_moves_to_in_progress_for_any_file(db_session: Sessi
 
     file_services.attach_file_to_dataset(db_session, user, dataset.id, SimpleNamespace(file_id=first_file.id, relative_path=None))
     db_session.refresh(dataset)
-    assert dataset.status == "In Progress"
+    assert dataset.status == "Draft"
 
     db_session.add(
         DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=second_file.id, user_id=user.id)
@@ -149,7 +150,7 @@ def test_dataset_status_auto_moves_to_in_progress_for_any_file(db_session: Sessi
 
     file_services.attach_file_to_dataset(db_session, user, dataset.id, SimpleNamespace(file_id=second_file.id, relative_path=None))
     db_session.refresh(dataset)
-    assert dataset.status == "In Progress"
+    assert dataset.status == "Draft"
 
 
 def test_update_dataset_can_move_mappings_to_another_dataset(db_session: Session) -> None:
@@ -159,8 +160,8 @@ def test_update_dataset_can_move_mappings_to_another_dataset(db_session: Session
     db_session.commit()
     db_session.refresh(user)
 
-    source_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Source Dataset"))
-    target_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Target Dataset"))
+    source_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Source Dataset", language="English"))
+    target_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Target Dataset", language="English"))
 
     uploaded_file = UploadedFile(filename="move.txt", file_size_bytes=8, master_hash="m" * 64, physical_path="/tmp/move.txt")
     db_session.add(uploaded_file)
@@ -187,7 +188,7 @@ def test_update_dataset_can_move_mappings_to_another_dataset(db_session: Session
         DatasetFolderFilesMapping.dataset_id == target_dataset.id,
         DatasetFolderFilesMapping.file_id == uploaded_file.id,
     ).count() == 1
-    assert source_dataset.status == "created"
+    assert source_dataset.status == "Draft"
 
 
 def test_update_dataset_can_move_a_single_file_mapping_to_another_dataset(db_session: Session) -> None:
@@ -197,8 +198,8 @@ def test_update_dataset_can_move_a_single_file_mapping_to_another_dataset(db_ses
     db_session.commit()
     db_session.refresh(user)
 
-    source_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Single Source"))
-    target_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Single Target"))
+    source_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Single Source", language="English"))
+    target_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Single Target", language="English"))
 
     uploaded_file = UploadedFile(filename="single.txt", file_size_bytes=8, master_hash="s" * 64, physical_path="/tmp/single.txt")
     db_session.add(uploaded_file)
@@ -233,8 +234,8 @@ def test_update_dataset_can_move_a_folder_subtree_to_another_dataset(db_session:
     db_session.commit()
     db_session.refresh(user)
 
-    source_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Folder Source"))
-    target_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Folder Target"))
+    source_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Folder Source", language="English"))
+    target_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Folder Target", language="English"))
 
     parent_folder = Folder(user_id=user.id, name="parent")
     db_session.add(parent_folder)
@@ -269,7 +270,7 @@ def test_update_dataset_can_move_a_folder_subtree_to_another_dataset(db_session:
         DatasetFolderFilesMapping.dataset_id == target_dataset.id,
         DatasetFolderFilesMapping.file_id == uploaded_file.id,
     ).count() == 1
-    assert target_dataset.status == "In Progress"
+    assert target_dataset.status == "Draft"
 
 
 def test_update_dataset_rejects_manual_created_transition(db_session: Session) -> None:
@@ -279,10 +280,10 @@ def test_update_dataset_rejects_manual_created_transition(db_session: Session) -
     db_session.commit()
     db_session.refresh(user)
 
-    dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Transition Dataset"))
+    dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Transition Dataset", language="English"))
 
     with pytest.raises(HTTPException) as exc_info:
-        file_services.update_dataset(db_session, user, dataset.id, DatasetUpdate(status="created"))
+        file_services.update_dataset(db_session, user, dataset.id, DatasetUpdate(status="Created"))
 
     assert exc_info.value.status_code == 400
 
@@ -294,7 +295,7 @@ def test_initialize_upload_rejects_completed_dataset(db_session: Session, storag
     db_session.commit()
     db_session.refresh(user)
 
-    dataset = Dataset(user_id=user.id, name="Locked", status="completed")
+    dataset = Dataset(user_id=user.id, name="Locked", status="Completed")
     db_session.add(dataset)
     db_session.commit()
     db_session.refresh(dataset)
@@ -314,9 +315,9 @@ def test_get_datasets_can_filter_out_completed_datasets(db_session: Session) -> 
     db_session.commit()
     db_session.refresh(user)
 
-    created_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Created Dataset"))
-    completed_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Completed Dataset"))
-    file_services.update_dataset(db_session, user, completed_dataset.id, DatasetUpdate(status="completed"))
+    created_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Created Dataset", language="English"))
+    completed_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Completed Dataset", language="English"))
+    file_services.update_dataset(db_session, user, completed_dataset.id, DatasetUpdate(status="Completed"))
 
     filtered = file_services.get_datasets(db_session, user, page=1, limit=10, include_completed=False)
 
@@ -421,7 +422,7 @@ def test_delete_user_upload_recomputes_dataset_status_when_last_file_is_removed(
     db_session.commit()
     db_session.refresh(user)
 
-    dataset = Dataset(user_id=user.id, name="Status Cleanup", status="In Progress")
+    dataset = Dataset(user_id=user.id, name="Status Cleanup", status="Draft")
     db_session.add(dataset)
     db_session.commit()
     db_session.refresh(dataset)
@@ -446,7 +447,87 @@ def test_delete_user_upload_recomputes_dataset_status_when_last_file_is_removed(
     file_services.delete_user_upload(db_session, user, uploaded_file.id)
     db_session.refresh(dataset)
 
-    assert dataset.status == "created"
+    assert dataset.status == "Created"
+
+
+def test_completed_dataset_status_stays_completed_after_file_removal(db_session: Session, storage_root: Path) -> None:
+    """Completed datasets should remain completed even if their last file is removed."""
+    user = User(email="completed-delete@example.com", username="completeddelete", full_name="Completed Delete User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    dataset = Dataset(user_id=user.id, name="Completed Cleanup", status="Completed")
+    db_session.add(dataset)
+    db_session.commit()
+    db_session.refresh(dataset)
+
+    file_path = storage_root / "files" / "completed.txt"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("completed")
+    uploaded_file = UploadedFile(
+        filename="completed.txt",
+        file_size_bytes=file_path.stat().st_size,
+        master_hash="h" * 64,
+        physical_path=str(file_path),
+    )
+    db_session.add(uploaded_file)
+    db_session.commit()
+    db_session.refresh(uploaded_file)
+
+    mapping = DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=uploaded_file.id, user_id=user.id)
+    db_session.add(mapping)
+    db_session.commit()
+
+    file_services.delete_user_upload(db_session, user, uploaded_file.id)
+    db_session.refresh(dataset)
+
+    assert dataset.status == "Completed"
+
+
+def test_finalize_upload_persists_source_type_for_uploaded_file(
+    db_session: Session,
+    storage_root: Path,
+    fake_redis: FakeRedis,
+) -> None:
+    """Upload finalization should store the requested source_type on the physical file record."""
+    user = User(email="source-type@example.com", username="sourcetype", full_name="Source Type User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    dataset = Dataset(user_id=user.id, name="Source Dataset")
+    db_session.add(dataset)
+    db_session.commit()
+    db_session.refresh(dataset)
+
+    payload = UploadInitRequest(
+        dataset_id=dataset.id,
+        filename="source.txt",
+        filesize=1024,
+        master_hash="i" * 64,
+        source_type="FTP",
+    )
+    init_response = file_services.initialize_upload(db_session, user, payload)
+
+    chunk_bytes = b"hello world"
+    chunk_hash = file_services._hash_bytes(chunk_bytes)
+    file_services.process_upload_chunk(
+        db_session,
+        user,
+        SimpleNamespace(upload_id=init_response.upload_id, chunk_index=0, chunk_hash=chunk_hash),
+        chunk_bytes,
+    )
+
+    finalize_response = file_services.finalize_upload(
+        db_session,
+        user,
+        SimpleNamespace(upload_id=init_response.upload_id, master_hash="i" * 64),
+    )
+
+    uploaded_file = db_session.query(UploadedFile).filter(UploadedFile.id == finalize_response.file_id).one()
+    assert finalize_response.status == "completed"
+    assert uploaded_file.source_type == "FTP"
 
 
 def test_delete_dataset_removes_attached_files_and_soft_deletes_dataset(db_session: Session, storage_root: Path) -> None:
@@ -495,7 +576,7 @@ def test_get_dataset_tree_for_dataset_returns_nested_tree(db_session: Session) -
     db_session.commit()
     db_session.refresh(user)
 
-    dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Tree Dataset"))
+    dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Tree Dataset", language="English"))
     uploaded_file = UploadedFile(filename="tree.txt", file_size_bytes=4, master_hash="t" * 64, physical_path="/tmp/tree.txt")
     db_session.add(uploaded_file)
     db_session.commit()
