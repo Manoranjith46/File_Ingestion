@@ -188,6 +188,7 @@ class TokenPairResponse(BaseModel):
 
     message: str = "Authentication successful"
     user: PublicUserSchema
+    access_token: str
 
 
 class RegistrationResponse(BaseModel):

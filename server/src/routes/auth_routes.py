@@ -68,8 +68,7 @@ def login(payload: LoginRequest, response: Response, db: Session = Depends(get_d
     Returns:
         TokenPairResponse: The token pair response containing user profile details.
     """
-    user = authenticate_user(db, payload)
-    session, access_token, refresh_token = issue_token_pair(db, user)
+    session, access_token, refresh_token = issue_token_pair(db, authenticate_user(db, payload))
     response.set_cookie(
         "refresh_token",
         refresh_token,
@@ -78,6 +77,7 @@ def login(payload: LoginRequest, response: Response, db: Session = Depends(get_d
         samesite="lax",
         path="/auth",
     )
+    response.headers["Authorization"] = f"Bearer {access_token}"
     return session
 
 
@@ -125,8 +125,7 @@ def refresh(response: Response, refresh_token: str | None = Cookie(default=None)
     """
     if refresh_token is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing refresh token")
-    user = resolve_refresh_user(db, refresh_token)
-    session, access_token, new_refresh_token = issue_token_pair(db, user)
+    session, access_token, new_refresh_token = issue_token_pair(db, resolve_refresh_user(db, refresh_token))
     response.set_cookie(
         "refresh_token",
         new_refresh_token,
@@ -135,6 +134,7 @@ def refresh(response: Response, refresh_token: str | None = Cookie(default=None)
         samesite="lax",
         path="/auth",
     )
+    response.headers["Authorization"] = f"Bearer {access_token}"
     return session
 
 
@@ -165,32 +165,7 @@ def verify_signup_endpoint(payload: OtpVerifyRequest, response: Response, db: Se
         samesite="lax",
         path="/auth",
     )
-    return session
-
-
-@auth_router.post("/login", response_model=TokenPairResponse)
-def login(payload: LoginRequest, response: Response, db: Session = Depends(get_db)):
-    """
-    Verify the submitted OTP and establish a verified login session.
-
-    Args:
-        payload (OtpVerifyRequest): The OTP verification payload.
-        response (Response): The FastAPI response object.
-        db (Session): The database session.
-
-    Returns:
-        TokenPairResponse: The token pair response containing user profile details.
-    """
-    user = verify_otp(db, payload)
-    session, access_token, refresh_token = issue_token_pair(db, user)
-    response.set_cookie(
-        "refresh_token",
-        refresh_token,
-        httponly=True,
-        secure=False,
-        samesite="lax",
-        path="/auth",
-    )
+    response.headers["Authorization"] = f"Bearer {access_token}"
     return session
 
 

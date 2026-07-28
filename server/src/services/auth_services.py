@@ -299,7 +299,7 @@ def issue_token_pair(db: Session, user: User) -> tuple[TokenPairResponse, str, s
     active_session_limiter(keys=[zset_key], args=[now_timestamp, sid, max_sessions, ttl_seconds])
 
     refresh_token = create_refresh_token(user, sid)
-    return TokenPairResponse(user=create_public_user(user)), access_token, refresh_token
+    return TokenPairResponse(user=create_public_user(user), access_token=access_token), access_token, refresh_token
 
 
 def resolve_refresh_user(db: Session, refresh_token: str) -> User:

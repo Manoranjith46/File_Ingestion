@@ -21,7 +21,7 @@ UploadStatus = Literal[
     "deleted",
     "attached",
 ]
-DatasetLanguage = Literal["Tamil", "English", "Chinese", "french"]
+DatasetLanguage = str
 DatasetStatus = str
 
 
