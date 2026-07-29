@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, EmailStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, EmailStr, field_validator, model_validator
 from email_validator import validate_email, EmailNotValidError
 from helpers.get_env import get_env
 
@@ -47,7 +47,7 @@ class RegisterRequest(BaseModel):
             check_deliver = False
         try:
             info = validate_email(str(v), check_deliverability=check_deliver)
-            return info.email
+            return info.normalized
         except EmailNotValidError as e:
             raise ValueError(str(e))
 
@@ -70,9 +70,19 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     """Validate a username/email plus password login request."""
 
-    identifier: str = Field(min_length=3, max_length=255)
+    identifier: str | None = Field(default=None, min_length=3, max_length=255)
+    username: str | None = Field(default=None, min_length=3, max_length=255)
     password: str = Field(min_length=8, max_length=128)
-    
+
+    @model_validator(mode="before")
+    def _normalize_identifier(cls, values):
+        if isinstance(values, dict):
+            normalized = dict(values)
+            if not normalized.get("identifier") and normalized.get("username"):
+                normalized["identifier"] = normalized["username"]
+            return normalized
+        return values
+
     @field_validator("identifier", mode="before")
     def _strip_identifier(cls, v):
         if isinstance(v, str):
@@ -99,7 +109,7 @@ class OtpRequest(BaseModel):
             check_deliver = False
         try:
             info = validate_email(str(v), check_deliverability=check_deliver)
-            return info.email
+            return info.normalized
         except EmailNotValidError as e:
             raise ValueError(str(e))
 
@@ -124,7 +134,7 @@ class OtpVerifyRequest(BaseModel):
             check_deliver = False
         try:
             info = validate_email(str(v), check_deliverability=check_deliver)
-            return info.email
+            return info.normalized
         except EmailNotValidError as e:
             raise ValueError(str(e))
 
@@ -148,7 +158,7 @@ class PasswordResetRequest(BaseModel):
             check_deliver = False
         try:
             info = validate_email(str(v), check_deliverability=check_deliver)
-            return info.email
+            return info.normalized
         except EmailNotValidError as e:
             raise ValueError(str(e))
 
@@ -174,36 +184,33 @@ class GoogleSignInRequest(BaseModel):
 
 
 class TokenPairResponse(BaseModel):
-    """Return access and refresh token details to the client."""
+    """Return a safe authentication success payload to the client."""
 
-    access_token: str
-    token_type: str = "bearer"
-    refresh_expires_at: datetime
+    message: str = "Authentication successful"
     user: PublicUserSchema
+    access_token: str
 
 
 class RegistrationResponse(BaseModel):
-    """Return registration details together with the OTP challenge."""
+    """Return registration details without exposing OTP secrets."""
 
     user: PublicUserSchema
-    otp_code: str
-    otp_expires_at: datetime
+    message: str = "Registration successful"
 
 
 class OtpChallengeResponse(BaseModel):
-    """Return OTP challenge metadata for testing and development."""
+    """Return a safe OTP acknowledgment."""
 
     email: str
-    otp_code: str
-    otp_expires_at: datetime
+    message: str = "OTP created"
 
 
 class PasswordResetChallengeResponse(BaseModel):
-    """Return password-reset challenge metadata for testing and development."""
+    """Return a safe password-reset acknowledgment."""
 
     email: str
     reset_token: str
-    reset_expires_at: datetime
+    message: str = "Password reset created"
 
 
 class MessageResponse(BaseModel):

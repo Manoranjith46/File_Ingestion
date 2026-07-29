@@ -1,0 +1,355 @@
+.F.F....F.F......                                                        [100%]
+================================== FAILURES ===================================
+___________ test_dataset_status_is_persisted_and_returned_on_update ___________
+
+db_session = <sqlalchemy.orm.session.Session object at 0x000001E22F7DF9D0>
+
+    def test_dataset_status_is_persisted_and_returned_on_update(db_session: Session) -> None:
+        """Dataset status should be stored in the database and exposed by the update flow."""
+        user = User(email="status@example.com", username="status", full_name="Status User", password_hash="hash", auth_provider="local", is_verified=True)
+        db_session.add(user)
+        db_session.commit()
+        db_session.refresh(user)
+    
+        created = file_services.create_dataset(db_session, user, DatasetCreate(name="Status Dataset", language="English"))
+        assert created.status == "Created"
+    
+>       with pytest.raises(HTTPException) as exc_info:
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE HTTPException
+
+tests\unit_tests\test_file.py:114: Failed
+__________ test_update_dataset_can_move_mappings_to_another_dataset ___________
+
+db_session = <sqlalchemy.orm.session.Session object at 0x000001E22F887490>
+
+    def test_update_dataset_can_move_mappings_to_another_dataset(db_session: Session) -> None:
+        """Dataset updates should allow moving file mappings to another eligible dataset."""
+        user = User(email="move@example.com", username="move", full_name="Move User", password_hash="hash", auth_provider="local", is_verified=True)
+        db_session.add(user)
+        db_session.commit()
+        db_session.refresh(user)
+    
+        source_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Source Dataset", language="English"))
+        target_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Target Dataset", language="English"))
+    
+        uploaded_file = UploadedFile(filename="move.txt", file_size_bytes=8, master_hash="m" * 64, physical_path="/tmp/move.txt")
+        db_session.add(uploaded_file)
+        db_session.commit()
+        db_session.refresh(uploaded_file)
+    
+        mapping = DatasetFolderFilesMapping(dataset_id=source_dataset.id, folder_id=None, file_id=uploaded_file.id, user_id=user.id)
+        db_session.add(mapping)
+        db_session.commit()
+    
+        updated = file_services.update_dataset(
+            db_session,
+            user,
+            source_dataset.id,
+            DatasetUpdate(target_dataset_id=target_dataset.id),
+        )
+    
+        assert updated.id == source_dataset.id
+        assert db_session.query(DatasetFolderFilesMapping).filter(
+            DatasetFolderFilesMapping.dataset_id == source_dataset.id,
+            DatasetFolderFilesMapping.file_id == uploaded_file.id,
+        ).count() == 0
+        assert db_session.query(DatasetFolderFilesMapping).filter(
+            DatasetFolderFilesMapping.dataset_id == target_dataset.id,
+            DatasetFolderFilesMapping.file_id == uploaded_file.id,
+        ).count() == 1
+>       assert source_dataset.status == "Draft"
+E       AssertionError: assert 'Created' == 'Draft'
+E         
+E         - Draft
+E         + Created
+
+tests\unit_tests\test_file.py:191: AssertionError
+_____________ test_get_datasets_can_filter_out_completed_datasets _____________
+
+db_session = <sqlalchemy.orm.session.Session object at 0x000001E22FB68150>
+
+    def test_get_datasets_can_filter_out_completed_datasets(db_session: Session) -> None:
+        """Listing datasets for uploads should optionally exclude completed datasets."""
+        user = User(email="filter@example.com", username="filter", full_name="Filter User", password_hash="hash", auth_provider="local", is_verified=True)
+        db_session.add(user)
+        db_session.commit()
+        db_session.refresh(user)
+    
+        created_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Created Dataset", language="English"))
+        completed_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Completed Dataset", language="English"))
+>       file_services.update_dataset(db_session, user, completed_dataset.id, DatasetUpdate(status="Completed"))
+
+tests\unit_tests\test_file.py:320: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+db = <sqlalchemy.orm.session.Session object at 0x000001E22FB68150>
+user = <models.auth_model.User object at 0x000001E22FA77A50>
+dataset_id = '9e15fd74-1ea5-425c-be74-d0eda5e25e72'
+payload = DatasetUpdate(name=None, status='Completed', target_dataset_id=None, file_id=None, folder_id=None, description=None, language=None, source_type=None, content_type=None, format=None)
+
+    def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpdate) -> Dataset:
+        """
+        Update details of an active dataset.
+    
+        Args:
+            db (Session): The active database session.
+            user (User): The authenticated user.
+            dataset_id (str): The ID of the dataset to update.
+            payload (DatasetUpdate): The dataset fields to update.
+    
+        Returns:
+            Dataset: The updated dataset database record.
+    
+        Raises:
+            HTTPException: If the name is duplicate or update fails.
+        """
+        dataset = get_dataset_by_id(db, user, dataset_id)
+    
+        if payload.name is not None:
+            name_clean = payload.name.strip()
+            if not name_clean:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Dataset name cannot be empty.",
+                )
+            # Check uniqueness if name is changing
+            if name_clean.lower() != dataset.name.lower():
+                existing = (
+                    db.query(Dataset)
+                    .filter(
+                        Dataset.user_id == user.id,
+                        func.lower(Dataset.name) == name_clean.lower(),
+                        Dataset.is_deleted == False,
+                    )
+                    .first()
+                )
+                if existing:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail="A dataset with this name already exists.",
+                    )
+            dataset.name = name_clean
+    
+        if payload.description is not None:
+            dataset.description = payload.description.strip()
+    
+        if dataset.status == "Completed":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Completed datasets cannot be modified.",
+            )
+    
+        if payload.target_dataset_id is not None:
+            if payload.target_dataset_id == dataset_id:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Target dataset must be different from the source dataset.")
+    
+            if dataset.status not in {"Created", "Draft"}:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source dataset must be in created or Draft status.")
+    
+            target_dataset = get_dataset_by_id(db, user, payload.target_dataset_id)
+            if target_dataset.status not in {"Created", "Draft"}:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Target dataset must be in created or Draft status.")
+    
+            mappings_query = (
+                db.query(DatasetFolderFilesMapping)
+                .filter(
+                    DatasetFolderFilesMapping.dataset_id == dataset.id,
+                    DatasetFolderFilesMapping.user_id == user.id,
+                )
+            )
+    
+            if payload.file_id is not None and payload.file_id.strip() != "":
+                mappings_query = mappings_query.filter(DatasetFolderFilesMapping.file_id == payload.file_id)
+    
+            if payload.folder_id is not None and payload.folder_id.strip() != "":
+                folder = _get_folder_by_id(db, user, payload.folder_id)
+                if folder is None:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Folder not found")
+                folder_ids = _collect_descendant_folder_ids(db, user, folder.id)
+                mappings_query = mappings_query.filter(DatasetFolderFilesMapping.folder_id.in_(folder_ids))
+    
+            mappings_to_move = mappings_query.all()
+    
+            for mapping in mappings_to_move:
+                existing_target_mapping = (
+                    db.query(DatasetFolderFilesMapping)
+                    .filter(
+                        DatasetFolderFilesMapping.dataset_id == target_dataset.id,
+                        DatasetFolderFilesMapping.folder_id == mapping.folder_id,
+                        DatasetFolderFilesMapping.file_id == mapping.file_id,
+                    )
+                    .first()
+                )
+                if existing_target_mapping is None:
+                    mapping.dataset_id = target_dataset.id
+                    mapping.user_id = user.id
+                    db.add(mapping)
+                else:
+                    db.delete(mapping)
+    
+            dataset.status = "Draft"
+            _sync_dataset_status_from_mappings(db, dataset)
+            _sync_dataset_status_from_mappings(db, target_dataset)
+    
+        if payload.status is not None:
+            requested_status = _normalize_dataset_status(payload.status)
+            current_status = _normalize_dataset_status(dataset.status)
+            allowed_transitions = {
+                "Created": {"Draft"},
+                "Draft": {"Completed"},
+                "Completed": set(),
+            }
+            if requested_status not in allowed_transitions.get(current_status, set()):
+>               raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid dataset status transition.",
+                )
+E               fastapi.exceptions.HTTPException: 400: Invalid dataset status transition.
+
+src\services\file_services.py:908: HTTPException
+__________ test_initialize_upload_creates_new_session_for_new_upload __________
+
+db_session = <sqlalchemy.orm.session.Session object at 0x000001E22FA76850>
+storage_root = WindowsPath('C:/Users/manor/AppData/Local/Temp/pytest-of-manor/pytest-62/test_initialize_upload_creates0/uploads')
+fake_redis = <test_file.FakeRedis object at 0x000001E22FA1B4D0>
+
+    def test_initialize_upload_creates_new_session_for_new_upload(db_session: Session, storage_root: Path, fake_redis: FakeRedis) -> None:
+        """A fresh upload should create a new upload session with metadata."""
+        user = User(email="new-upload@example.com", username="newupload", full_name="New Upload User", password_hash="hash", auth_provider="local", is_verified=True)
+        db_session.add(user)
+        db_session.commit()
+        db_session.refresh(user)
+    
+        dataset = Dataset(user_id=user.id, name="Reports")
+        db_session.add(dataset)
+        db_session.commit()
+        db_session.refresh(dataset)
+    
+        payload = UploadInitRequest(dataset_id=dataset.id, filename="report.txt", filesize=1024, master_hash="b" * 64)
+>       response = file_services.initialize_upload(db_session, user, payload)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests\unit_tests\test_file.py:368: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+db = <sqlalchemy.orm.session.Session object at 0x000001E22FA76850>
+user = <models.auth_model.User object at 0x000001E22F9EE8A0>
+payload = UploadInitRequest(dataset_id='ae8d8bf3-7d55-444b-89ce-56e0a0f596b0', filename='report.txt', filesize=1024, master_hash='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', relative_path=None)
+
+    def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> UploadInitResponse:
+        """
+        Create an upload session and short-circuit when the file already exists.
+    
+        Args:
+            db (Session): The active database session.
+            user (User): The authenticated user.
+            payload (UploadInitRequest): The upload initialization details.
+    
+        Returns:
+            UploadInitResponse: The upload initialization details.
+    
+        Raises:
+            HTTPException: If the dataset is not found, invalid, or unauthorized.
+        """
+        _ensure_storage_dirs()
+    
+        dataset = get_dataset_by_id(db, user, payload.dataset_id)
+        if dataset.status == "Completed":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Completed datasets cannot receive new uploads")
+    
+        folder = _get_folder_tree(db, user, payload.relative_path, payload.filename)
+        if folder is not None:
+            db.commit()
+    
+        # 1. Check if exact mapping already exists (duplicate_short_circuit)
+        exists_mapping = (
+            db.query(DatasetFolderFilesMapping)
+            .join(UploadedFile)
+            .filter(
+                DatasetFolderFilesMapping.user_id == user.id,
+                DatasetFolderFilesMapping.dataset_id == payload.dataset_id,
+                DatasetFolderFilesMapping.folder_id == (folder.id if folder else None),
+                UploadedFile.master_hash == payload.master_hash,
+            )
+            .first()
+        )
+        if exists_mapping is not None:
+            return UploadInitResponse(
+                upload_id=str(uuid4()),
+                chunk_size=CHUNK_SIZE_BYTES,
+                total_chunks=0,
+                status="duplicate_short_circuit",
+            )
+    
+        # 2. Check if physical file exists globally (duplicate_suspected)
+        exists_file = (
+            db.query(UploadedFile)
+            .filter(UploadedFile.master_hash == payload.master_hash)
+            .first()
+        )
+    
+        upload_id = str(uuid4())
+    
+        if exists_file is not None:
+            # Save upload session metadata in Redis without creating ghost SQL mappings
+            redis_server.hset(
+                _meta_key(upload_id),
+                mapping={
+                    "user_id": user.id,
+                    "dataset_id": payload.dataset_id,
+                    "filename": payload.filename,
+                    "filesize": str(payload.filesize),
+                    "master_hash": payload.master_hash,
+                    "folder_id": folder.id if folder else "",
+                    "total_chunks": "0",
+                    "linked_file_id": exists_file.id,
+                },
+            )
+            redis_server.expire(_meta_key(upload_id), SESSION_TTL_SECONDS)
+    
+            return UploadInitResponse(
+                upload_id=upload_id,
+                chunk_size=CHUNK_SIZE_BYTES,
+                total_chunks=0,
+                status="duplicate_suspected",
+            )
+    
+        # 3. New file upload flow
+        total_chunks = _compute_total_chunks(payload.filesize)
+        _parts_dir(upload_id).mkdir(parents=True, exist_ok=True)
+    
+        redis_server.hset(
+            _meta_key(upload_id),
+            mapping={
+                "user_id": user.id,
+                "dataset_id": payload.dataset_id,
+                "filename": payload.filename,
+                "filesize": str(payload.filesize),
+                "master_hash": payload.master_hash,
+                "folder_id": folder.id if folder else "",
+                "total_chunks": str(total_chunks),
+            },
+        )
+        redis_server.expire(_meta_key(upload_id), SESSION_TTL_SECONDS)
+        redis_server.expire(_bitmap_key(upload_id), SESSION_TTL_SECONDS)
+        redis_server.expire(_chunk_hashes_key(upload_id), SESSION_TTL_SECONDS)
+    
+>       return UploadInitResponse(
+            upload_id=upload_id,
+            chunk_size=CHUNK_SIZE_BYTES,
+            total_chunks=total_chunks,
+            status="created",
+        )
+E       pydantic_core._pydantic_core.ValidationError: 1 validation error for UploadInitResponse
+E       status
+E         Input should be 'Created', 'In Progress', 'Completed', 'duplicate_short_circuit', 'duplicate_suspected', 'success', 'deleted' or 'attached' [type=literal_error, input_value='created', input_type=str]
+E           For further information visit https://errors.pydantic.dev/2.13/v/literal_error
+
+src\services\file_services.py:389: ValidationError
+=========================== short test summary info ===========================
+FAILED tests/unit_tests/test_file.py::test_dataset_status_is_persisted_and_returned_on_update
+FAILED tests/unit_tests/test_file.py::test_update_dataset_can_move_mappings_to_another_dataset
+FAILED tests/unit_tests/test_file.py::test_get_datasets_can_filter_out_completed_datasets
+FAILED tests/unit_tests/test_file.py::test_initialize_upload_creates_new_session_for_new_upload
+4 failed, 13 passed in 1.53s

@@ -2,6 +2,7 @@
 """Application entrypoint for the FastAPI server."""
 
 from contextlib import asynccontextmanager
+from sys import prefix
 
 import uvicorn
 from fastapi import FastAPI
@@ -11,6 +12,10 @@ from config.database import Check_db_Connection, get_engine
 from config.redis_server import redis_server_status
 from helpers.get_env import get_env
 from helpers.get_env import load_environment_variables
+
+# Load environment variables before importing modules that depend on them.
+load_environment_variables()
+
 from models.auth_model import Base
 from models import file_model  # noqa: F401
 from services.cleanup_scheduler import start_cleanup_scheduler
@@ -21,9 +26,8 @@ from routes.auth_routes import auth_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-        Load environment settings,Create Redis-Server and prepare the database during application startup.
+        Create Redis-Server and prepare the database during application startup.
     """
-    load_environment_variables()
     redis_server_status()
     Check_db_Connection()
     start_cleanup_scheduler()
@@ -33,9 +37,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-frontend_url = get_env("FRONTEND_URL", "http://localhost:5173", required=False)
-allowed_origins = [origin.strip() for origin in str(frontend_url).split(",") if origin.strip()]
+# Support multiple frontend deployment URLs (comma-separated in env var)
+frontend_urls = get_env("FRONTEND_URL", "http://localhost:5173", required=False)
 
+# Split comma-separated URLs into a list and trim whitespace
+allowed_origins = [origin.strip() for origin in str(frontend_urls).split(",") if origin.strip()]
+
+# Ensure local dev origin is present
 if "http://localhost:5173" not in allowed_origins:
     allowed_origins.append("http://localhost:5173")
 
@@ -45,13 +53,14 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Authorization"],
 )
 
 app.include_router(auth_router, prefix="/auth", tags=["Authentication"])
-app.include_router(file_router, tags=["File Ingestion"])
+app.include_router(file_router, prefix="/v1", tags=["File Ingestion"])
 
 
-@app.get("/")
+@app.get("/v1/health")
 def health_check():
     """
         Return a lightweight health payload for uptime checks.\
@@ -61,9 +70,9 @@ def health_check():
 
 def main():
     """
-        Start the Uvicorn development server.
+        Start the Uvicorn Development server.
     """
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True, log_level="info")
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_level="info")
 
 
 if __name__ == "__main__":

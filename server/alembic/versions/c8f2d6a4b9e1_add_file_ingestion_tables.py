@@ -21,31 +21,35 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     """Create the file ingestion tables."""
     op.create_table(
-        "physical_files",
-        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
-        sa.Column("master_hash", sa.String(length=64), nullable=False),
-        sa.Column("file_fingerprint", sa.String(length=64), nullable=False),
-        sa.Column("file_size_bytes", sa.BigInteger(), nullable=False),
-        sa.Column("file_path", sa.String(length=500), nullable=False),
+        "folders",
+        sa.Column("id", sa.String(length=36), nullable=False),
+        sa.Column("user_id", sa.String(length=36), nullable=False),
+        sa.Column("name", sa.String(length=255), nullable=False),
+        sa.Column("parent_id", sa.String(length=36), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("master_hash"),
-        sa.UniqueConstraint("file_fingerprint"),
+        sa.ForeignKeyConstraint(["user_id"], ["users.id"]),
+        sa.ForeignKeyConstraint(["parent_id"], ["folders.id"]),
+        sa.UniqueConstraint("user_id", "parent_id", "name", name="uq_user_parent_name"),
     )
     op.create_table(
-        "user_upload_mappings",
-        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
+        "uploaded_files",
+        sa.Column("id", sa.String(length=36), nullable=False),
         sa.Column("user_id", sa.String(length=36), nullable=False),
-        sa.Column("physical_file_id", sa.Integer(), nullable=False),
-        sa.Column("client_filename", sa.String(length=255), nullable=False),
+        sa.Column("folder_id", sa.String(length=36), nullable=True),
+        sa.Column("filename", sa.String(length=255), nullable=False),
+        sa.Column("file_size_bytes", sa.BigInteger(), nullable=False),
+        sa.Column("master_hash", sa.String(length=64), nullable=False),
+        sa.Column("physical_path", sa.String(length=500), nullable=False),
         sa.Column("uploaded_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.ForeignKeyConstraint(["physical_file_id"], ["physical_files.id"]),
         sa.ForeignKeyConstraint(["user_id"], ["users.id"]),
+        sa.ForeignKeyConstraint(["folder_id"], ["folders.id"]),
         sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("user_id", "folder_id", "master_hash", name="uq_user_folder_master_hash"),
     )
 
 
 def downgrade() -> None:
     """Drop the file ingestion tables."""
-    op.drop_table("user_upload_mappings")
-    op.drop_table("physical_files")
+    op.drop_table("uploaded_files")
+    op.drop_table("folders")

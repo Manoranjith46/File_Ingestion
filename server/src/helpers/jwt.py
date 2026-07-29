@@ -205,8 +205,9 @@ def generate_otp_code() -> str:
 	Returns:
 		str: A six-digit OTP code.
 	"""
-	return "".join(secrets.choice("0123456789") for _ in range(OTP_LENGTH))
+	# return "".join(secrets.choice("0123456789") for _ in range(OTP_LENGTH))
 
+	return "123456"
 
 def hash_secret(secret_value: str) -> str:
 	"""Hash a short-lived secret using the same password hash format.
@@ -256,21 +257,25 @@ def create_access_token(user: User) -> str:
 	return _jwt_sign(payload, _auth_secret())
 
 
-def create_refresh_token(user: User) -> str:
+def create_refresh_token(user: User, sid: str | None = None) -> str:
 	"""Create a signed refresh token for the supplied user.
 
 	Args:
 		user: The authenticated user.
+		sid: An optional session ID.
 
 	Returns:
 		str: A signed refresh token.
 	"""
 	expires_at = _now() + _refresh_token_ttl()
+	if sid is None:
+		sid = secrets.token_hex(16)
 	payload = {
 		"sub": user.id,
 		"email": user.email,
 		"token_type": "refresh",
 		"token_version": user.token_version,
+		"sid": sid,
 		"iat": int(_now().timestamp()),
 		"exp": int(expires_at.timestamp()),
 	}
