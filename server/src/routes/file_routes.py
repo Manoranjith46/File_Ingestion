@@ -1,6 +1,6 @@
 """HTTP routes for file ingestion workflows."""
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
 from config.database import get_db
@@ -20,6 +20,15 @@ from schemas.file_schema import (
     DatasetResponse,
     DatasetAttachFileRequest,
     DatasetAttachFileResponse,
+    UserIntegrationsResponse,
+    IngestionJobStatusResponse,
+    GDriveIngestInitRequest,
+    GDriveIngestUrlRequest,
+    GDriveIngestResponse,
+    SharepointTreeResponse,
+    SharepointIngestInitRequest,
+    SharepointIngestUrlRequest,
+    SharepointIngestResponse,
 )
 from services.auth_services import get_current_user
 from services.file_services import (
@@ -35,7 +44,11 @@ from services.file_services import (
     update_dataset,
     delete_dataset,
     attach_file_to_dataset,
+    get_user_integrations,
+    get_ingestion_job_status,
 )
+from services.gdrive_service import initiate_gdrive_ingestion
+from services.sharepoint_service import get_sharepoint_tree, initiate_sharepoint_ingestion
 
 
 file_router = APIRouter()
@@ -233,3 +246,205 @@ def attach_file(
     """
     user = _resolve_current_user(authorization, db)
     return attach_file_to_dataset(db, user, dataset_id, payload)
+
+
+@file_router.get("/users/me/integrations", response_model=UserIntegrationsResponse)
+def get_user_integrations_endpoint(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    """
+    Return the authenticated user's cloud integrations connection status.
+
+    Args:
+        authorization (str | None): Optional authorization bearer header.
+        db (Session): The active database session.
+
+    Returns:
+        UserIntegrationsResponse: The user's integration status flags.
+    """
+    user = _resolve_current_user(authorization, db)
+    return get_user_integrations(user)
+
+
+@file_router.get("/ingest/status/{job_id}", response_model=IngestionJobStatusResponse)
+def get_ingestion_job_status_endpoint(
+    job_id: str,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    """
+    Poll the status and progress of an asynchronous cloud ingestion job.
+
+    Args:
+        job_id (str): The unique cloud ingestion job ID.
+        authorization (str | None): Optional authorization bearer header.
+        db (Session): The active database session.
+
+    Returns:
+        IngestionJobStatusResponse: Details of the job status and completion percentage.
+    """
+    user = _resolve_current_user(authorization, db)
+    return get_ingestion_job_status(db, user, job_id)
+
+
+@file_router.post("/ingest/gdrive/init", response_model=GDriveIngestResponse)
+def ingest_gdrive_init_endpoint(
+    payload: GDriveIngestInitRequest,
+    background_tasks: BackgroundTasks,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    """
+    Initiate asynchronous ingestion of a Google Drive file by file_id.
+
+    Args:
+        payload (GDriveIngestInitRequest): Request containing target dataset_id and file_id.
+        background_tasks (BackgroundTasks): FastAPI background task manager.
+        authorization (str | None): Optional authorization bearer header.
+        db (Session): The active database session.
+
+    Returns:
+        GDriveIngestResponse: Acknowledgment payload with job_id and status.
+    """
+    user = _resolve_current_user(authorization, db)
+    return initiate_gdrive_ingestion(
+        db=db,
+        user=user,
+        dataset_id=payload.dataset_id,
+        file_id_or_url=payload.file_id,
+        background_tasks=background_tasks,
+        folder_id=payload.folder_id,
+        filename=payload.filename,
+        mime_type=payload.mime_type,
+    )
+
+
+@file_router.post("/ingest/gdrive/url", response_model=GDriveIngestResponse)
+def ingest_gdrive_url_endpoint(
+    payload: GDriveIngestUrlRequest,
+    background_tasks: BackgroundTasks,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    """
+    Initiate asynchronous ingestion of a Google Drive file by shared URL.
+
+    Args:
+        payload (GDriveIngestUrlRequest): Request containing target dataset_id and gdrive_url.
+        background_tasks (BackgroundTasks): FastAPI background task manager.
+        authorization (str | None): Optional authorization bearer header.
+        db (Session): The active database session.
+
+    Returns:
+        GDriveIngestResponse: Acknowledgment payload with job_id and status.
+    """
+    user = _resolve_current_user(authorization, db)
+    return initiate_gdrive_ingestion(
+        db=db,
+        user=user,
+        dataset_id=payload.dataset_id,
+        file_id_or_url=payload.gdrive_url,
+        background_tasks=background_tasks,
+        folder_id=payload.folder_id,
+        filename=payload.filename,
+        mime_type=payload.mime_type,
+    )
+
+
+@file_router.get("/ingest/sharepoint/tree", response_model=SharepointTreeResponse)
+def get_sharepoint_tree_endpoint(
+    folder_id: str | None = None,
+    drive_id: str | None = None,
+    site_id: str | None = None,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    """
+    Explore Microsoft SharePoint / Graph API directory tree and items.
+
+    Args:
+        folder_id (str | None): Optional target folder ID.
+        drive_id (str | None): Optional target drive ID.
+        site_id (str | None): Optional target site ID.
+        authorization (str | None): Optional authorization bearer header.
+        db (Session): The active database session.
+
+    Returns:
+        SharepointTreeResponse: Directory listing containing folder and file items.
+    """
+    user = _resolve_current_user(authorization, db)
+    return get_sharepoint_tree(
+        db=db,
+        user=user,
+        folder_id=folder_id,
+        drive_id=drive_id,
+        site_id=site_id,
+    )
+
+
+@file_router.post("/ingest/sharepoint/init", response_model=SharepointIngestResponse)
+def ingest_sharepoint_init_endpoint(
+    payload: SharepointIngestInitRequest,
+    background_tasks: BackgroundTasks,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    """
+    Initiate asynchronous ingestion of a SharePoint file by item ID.
+
+    Args:
+        payload (SharepointIngestInitRequest): Request payload containing target dataset_id and file_id.
+        background_tasks (BackgroundTasks): FastAPI background task manager.
+        authorization (str | None): Optional authorization bearer header.
+        db (Session): The active database session.
+
+    Returns:
+        SharepointIngestResponse: Acknowledgment payload with job_id and instant deduplication flag.
+    """
+    user = _resolve_current_user(authorization, db)
+    return initiate_sharepoint_ingestion(
+        db=db,
+        user=user,
+        dataset_id=payload.dataset_id,
+        file_id_or_url=payload.file_id,
+        background_tasks=background_tasks,
+        quick_xor_hash=payload.quick_xor_hash,
+        folder_id=payload.folder_id,
+        filename=payload.filename,
+    )
+
+
+@file_router.post("/ingest/sharepoint/url", response_model=SharepointIngestResponse)
+def ingest_sharepoint_url_endpoint(
+    payload: SharepointIngestUrlRequest,
+    background_tasks: BackgroundTasks,
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    """
+    Initiate asynchronous ingestion of a SharePoint file by shared URL.
+
+    Args:
+        payload (SharepointIngestUrlRequest): Request payload containing target dataset_id and sharepoint_url.
+        background_tasks (BackgroundTasks): FastAPI background task manager.
+        authorization (str | None): Optional authorization bearer header.
+        db (Session): The active database session.
+
+    Returns:
+        SharepointIngestResponse: Acknowledgment payload with job_id and instant deduplication flag.
+    """
+    user = _resolve_current_user(authorization, db)
+    return initiate_sharepoint_ingestion(
+        db=db,
+        user=user,
+        dataset_id=payload.dataset_id,
+        file_id_or_url=payload.sharepoint_url,
+        background_tasks=background_tasks,
+        quick_xor_hash=payload.quick_xor_hash,
+        folder_id=payload.folder_id,
+        filename=payload.filename,
+    )
+
+
+

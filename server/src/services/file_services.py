@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session
 from config.redis_server import server as redis_server, atomic_chunk_state
 from helpers.get_env import get_env
 from models.auth_model import User
-from models.file_model import Folder, UploadedFile, UploadedFileSourceType, Dataset, DatasetFolderFilesMapping
+from models.file_model import Folder, UploadedFile, UploadedFileSourceType, Dataset, DatasetFolderFilesMapping, AsyncIngestionJob
 from schemas.file_schema import (
     CHUNK_SIZE_BYTES,
     UploadDeleteResponse,
@@ -28,6 +28,8 @@ from schemas.file_schema import (
     UploadChunkResponse,
     UploadInitRequest,
     UploadInitResponse,
+    UserIntegrationsResponse,
+    IngestionJobStatusResponse,
     UploadsTreeResponse,
     DatasetCreate,
     DatasetUpdate,
@@ -490,7 +492,8 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
             .one_or_none()
         )
         if folder is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Folder not found")
+            # Fallback gracefully to root dataset mapping if the folder was deleted or is missing
+            folder_id = None
 
     final_file_id = None
 
@@ -1055,4 +1058,67 @@ def attach_file_to_dataset(
         file_id=payload.file_id,
         folder_id=folder_id,
     )
+
+
+def get_user_integrations(user: User) -> UserIntegrationsResponse:
+    """
+    Retrieve the current cloud integration connection status for a user.
+
+    Args:
+        user (User): The authenticated user instance.
+
+    Returns:
+        UserIntegrationsResponse: Connection status flags for Google Drive and SharePoint.
+    """
+    google_connected = bool(user.google_refresh_token and user.google_refresh_token.strip())
+    microsoft_connected = bool(user.microsoft_refresh_token and user.microsoft_refresh_token.strip())
+    return UserIntegrationsResponse(
+        google_connected=google_connected,
+        microsoft_connected=microsoft_connected,
+    )
+
+
+def get_ingestion_job_status(db: Session, user: User, job_id: str) -> IngestionJobStatusResponse:
+    """
+    Query the status and live progress of a background cloud ingestion job.
+
+    Args:
+        db (Session): The active database session.
+        user (User): The authenticated user initiating the query.
+        job_id (str): The unique identifier of the ingestion job.
+
+    Returns:
+        IngestionJobStatusResponse: Details of the job status and progress.
+
+    Raises:
+        HTTPException: If the job is not found or does not belong to the user.
+    """
+    job = (
+        db.query(AsyncIngestionJob)
+        .filter(AsyncIngestionJob.id == job_id, AsyncIngestionJob.user_id == user.id)
+        .one_or_none()
+    )
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ingestion job not found")
+
+    # Check live Redis progress key if present
+    progress_val = redis_server.get(f"ingest:{job_id}:progress")
+    progress_pct = job.progress_percentage
+    if progress_val is not None:
+        try:
+            progress_pct = int(progress_val)
+        except (ValueError, TypeError):
+            pass
+
+    return IngestionJobStatusResponse(
+        job_id=job.id,
+        provider=job.provider,
+        filename=job.filename,
+        status=job.status,
+        progress_percentage=progress_pct,
+        error_message=job.error_message,
+        file_id=job.file_id,
+        master_hash=job.master_hash,
+    )
+
 

@@ -162,3 +162,111 @@ class DatasetAttachFileResponse(BaseModel):
     file_id: str
     folder_id: str | None = None
 
+
+class UserIntegrationsResponse(BaseModel):
+    """Schema for user cloud integration connection status."""
+
+    google_connected: bool = False
+    microsoft_connected: bool = False
+
+
+class IngestionJobStatusResponse(BaseModel):
+    """Schema for async cloud ingestion job status polling."""
+
+    job_id: str
+    provider: str
+    filename: str
+    status: str
+    progress_percentage: int = 0
+    error_message: str | None = None
+    file_id: str | None = None
+    master_hash: str | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class GDriveIngestInitRequest(BaseModel):
+    """Schema for initiating Google Drive file ingestion by file_id."""
+
+    dataset_id: str = Field(min_length=1)
+    file_id: str = Field(min_length=1)
+    folder_id: str | None = Field(default=None)
+    filename: str | None = Field(default=None, max_length=255)
+    mime_type: str | None = Field(default=None, max_length=255)
+
+
+class GDriveIngestUrlRequest(BaseModel):
+    """Schema for initiating Google Drive file ingestion by shared URL."""
+
+    dataset_id: str = Field(min_length=1)
+    gdrive_url: str = Field(min_length=1, max_length=1000)
+    folder_id: str | None = Field(default=None)
+    filename: str | None = Field(default=None, max_length=255)
+    mime_type: str | None = Field(default=None, max_length=255)
+
+
+class GDriveIngestResponse(BaseModel):
+    """Schema for Google Drive ingestion initiation response."""
+
+    job_id: str
+    status: str = "pending"
+    message: str = "Google Drive ingestion job initiated"
+
+
+class SharepointItem(BaseModel):
+    """Schema for a single Microsoft SharePoint / Graph API file or folder item."""
+
+    id: str
+    name: str
+    is_folder: bool
+    mime_type: str | None = None
+    size_bytes: int = 0
+    quick_xor_hash: str | None = None
+    web_url: str | None = None
+    parent_id: str | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SharepointTreeResponse(BaseModel):
+    """Schema for returning SharePoint folder hierarchy listings."""
+
+    items: list[SharepointItem] = Field(default_factory=list)
+    drive_id: str | None = None
+    parent_folder_id: str | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class SharepointIngestInitRequest(BaseModel):
+    """Schema for initiating SharePoint file ingestion by item ID."""
+
+    dataset_id: str = Field(min_length=1)
+    file_id: str = Field(min_length=1)
+    quick_xor_hash: str | None = Field(default=None)
+    folder_id: str | None = Field(default=None)
+    filename: str | None = Field(default=None, max_length=255)
+
+
+class SharepointIngestUrlRequest(BaseModel):
+    """Schema for initiating SharePoint file ingestion by shared URL."""
+
+    dataset_id: str = Field(min_length=1)
+    sharepoint_url: str = Field(min_length=1, max_length=1000)
+    quick_xor_hash: str | None = Field(default=None)
+    folder_id: str | None = Field(default=None)
+    filename: str | None = Field(default=None, max_length=255)
+
+
+class SharepointIngestResponse(BaseModel):
+    """Schema for SharePoint ingestion initiation response."""
+
+    job_id: str
+    status: str = "pending"
+    message: str = "SharePoint ingestion job initiated"
+    is_instant_deduplicated: bool = False
+
+
+
+
+

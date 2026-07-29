@@ -7,7 +7,7 @@ from datetime import datetime
 
 from enum import Enum
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Enum as SQLEnum, ForeignKey, String, UniqueConstraint, func
+from sqlalchemy import BigInteger, Boolean, DateTime, Enum as SQLEnum, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from models.auth_model import Base
@@ -108,3 +108,52 @@ class DatasetFolderFilesMapping(Base):
     folder = relationship("Folder", back_populates="mappings")
     file = relationship("UploadedFile", back_populates="mappings")
     user = relationship("User")
+
+
+class ProviderHashMapping(Base):
+    """
+    Rosetta Stone translation table mapping cloud provider hashes to canonical master_hash.
+    """
+
+    __tablename__ = "provider_hash_mappings"
+    __table_args__ = (
+        UniqueConstraint("provider_name", "provider_hash", name="uq_provider_name_hash"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    provider_name: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
+    provider_file_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    provider_hash: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    master_hash: Mapped[str] = mapped_column(ForeignKey("uploaded_files.master_hash", ondelete="CASCADE"), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), nullable=False)
+
+    uploaded_file = relationship("UploadedFile", foreign_keys=[master_hash], primaryjoin="ProviderHashMapping.master_hash == UploadedFile.master_hash")
+
+
+class AsyncIngestionJob(Base):
+    """
+    Ledger tracking background ingestion tasks for cloud provider downloads.
+    """
+
+    __tablename__ = "async_ingestion_jobs"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False, index=True)
+    folder_id: Mapped[str | None] = mapped_column(ForeignKey("folders.id", ondelete="CASCADE"), nullable=True, index=True)
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    source_url_or_id: Mapped[str] = mapped_column(String(500), nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(50), default="pending", nullable=False, index=True)
+    progress_percentage: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    master_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    file_id: Mapped[str | None] = mapped_column(ForeignKey("uploaded_files.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now(), nullable=False)
+
+    user = relationship("User")
+    dataset = relationship("Dataset")
+    folder = relationship("Folder")
+    file = relationship("UploadedFile")
+

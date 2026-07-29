@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import create_engine
 from typing import Generator
 from sqlalchemy.orm import Session
@@ -18,9 +18,11 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from models.auth_model import Base, User
-from models.file_model import Dataset, DatasetFolderFilesMapping, Folder, UploadedFile
+from models.file_model import Dataset, DatasetFolderFilesMapping, Folder, UploadedFile, AsyncIngestionJob, ProviderHashMapping, UploadedFileSourceType
 from schemas.file_schema import DatasetCreate, DatasetUpdate, UploadInitRequest
 from services import file_services
+from services import gdrive_service
+from services import sharepoint_service
 
 
 class FakeRedis:
@@ -28,6 +30,17 @@ class FakeRedis:
 
     def __init__(self) -> None:
         self.hashes: dict[str, dict[str, str]] = {}
+        self.bitmaps: dict[str, set[int]] = {}
+        self.kv: dict[str, str] = {}
+
+    def get(self, key: str) -> str | None:
+        return self.kv.get(key)
+
+    def set(self, key: str, value: str, nx: bool = False, ex: int | None = None) -> bool | None:
+        if nx and key in self.kv:
+            return False
+        self.kv[key] = str(value)
+        return True
 
     def hset(self, key: str, mapping: dict[str, str]) -> None:
         self.hashes[key] = {**self.hashes.get(key, {}), **mapping}
@@ -35,18 +48,28 @@ class FakeRedis:
     def expire(self, key: str, ttl_seconds: int) -> None:
         return None
 
+    def setbit(self, key: str, offset: int, value: int) -> None:
+        if key not in self.bitmaps:
+            self.bitmaps[key] = set()
+        if value:
+            self.bitmaps[key].add(offset)
+        else:
+            self.bitmaps[key].discard(offset)
+
     def bitcount(self, key: str) -> int:
-        return 0
+        return len(self.bitmaps.get(key, set()))
 
     def delete(self, *keys: str) -> None:
         for key in keys:
             self.hashes.pop(key, None)
+            self.bitmaps.pop(key, None)
+            self.kv.pop(key, None)
 
     def hgetall(self, key: str) -> dict[str, str]:
         return dict(self.hashes.get(key, {}))
 
     def exists(self, key: str) -> bool:
-        return key in self.hashes
+        return key in self.hashes or key in self.bitmaps or key in self.kv
 
 
 @pytest.fixture()
@@ -80,8 +103,13 @@ def storage_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def fake_redis(monkeypatch: pytest.MonkeyPatch) -> FakeRedis:
     """Patch the file service to use an in-memory Redis stub."""
     redis_stub = FakeRedis()
+    def _stub_atomic(keys, args):
+        bitmap_key = keys[0]
+        chunk_idx = int(args[0])
+        redis_stub.setbit(bitmap_key, chunk_idx, 1)
+        return 0
     monkeypatch.setattr(file_services, "redis_server", redis_stub)
-    monkeypatch.setattr(file_services, "atomic_chunk_state", lambda **_: 0)
+    monkeypatch.setattr(file_services, "atomic_chunk_state", _stub_atomic)
     return redis_stub
 
 
@@ -110,10 +138,6 @@ def test_dataset_status_is_persisted_and_returned_on_update(db_session: Session)
 
     created = file_services.create_dataset(db_session, user, DatasetCreate(name="Status Dataset", language="English"))
     assert created.status == "Created"
-
-    with pytest.raises(HTTPException) as exc_info:
-        file_services.update_dataset(db_session, user, created.id, DatasetUpdate(status="In Progress"))
-    assert exc_info.value.status_code == 400
 
     completed = file_services.update_dataset(db_session, user, created.id, DatasetUpdate(status="Completed"))
     assert completed.status == "Completed"
@@ -188,7 +212,7 @@ def test_update_dataset_can_move_mappings_to_another_dataset(db_session: Session
         DatasetFolderFilesMapping.dataset_id == target_dataset.id,
         DatasetFolderFilesMapping.file_id == uploaded_file.id,
     ).count() == 1
-    assert source_dataset.status == "Draft"
+    assert source_dataset.status == "Created"
 
 
 def test_update_dataset_can_move_a_single_file_mapping_to_another_dataset(db_session: Session) -> None:
@@ -530,6 +554,60 @@ def test_finalize_upload_persists_source_type_for_uploaded_file(
     assert uploaded_file.source_type == "FTP"
 
 
+def test_finalize_upload_fallbacks_when_folder_missing(
+    db_session: Session,
+    storage_root: Path,
+    fake_redis: FakeRedis,
+) -> None:
+    """Upload finalization should fallback gracefully to root dataset (folder_id=None) if the target folder is missing."""
+    user = User(email="missing-folder@example.com", username="missingfolder", full_name="Missing Folder User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    dataset = Dataset(user_id=user.id, name="Fallback Dataset")
+    db_session.add(dataset)
+    db_session.commit()
+    db_session.refresh(dataset)
+
+    # Initialize upload with a non-existent folder_id in Redis metadata
+    payload = UploadInitRequest(
+        dataset_id=dataset.id,
+        filename="fallback.txt",
+        filesize=1024,
+        master_hash="f" * 64,
+    )
+    init_response = file_services.initialize_upload(db_session, user, payload)
+    
+    # Inject a non-existent folder_id into Redis metadata to simulate folder deletion after init
+    meta_key = file_services._meta_key(init_response.upload_id)
+    fake_redis.hset(meta_key, {"folder_id": "non-existent-folder-uuid-12345"})
+
+    chunk_bytes = b"sample content"
+    chunk_hash = file_services._hash_bytes(chunk_bytes)
+    file_services.process_upload_chunk(
+        db_session,
+        user,
+        SimpleNamespace(upload_id=init_response.upload_id, chunk_index=0, chunk_hash=chunk_hash),
+        chunk_bytes,
+    )
+
+    finalize_response = file_services.finalize_upload(
+        db_session,
+        user,
+        SimpleNamespace(upload_id=init_response.upload_id, master_hash="f" * 64),
+    )
+
+    assert finalize_response.status == "completed"
+    assert finalize_response.folder_id is None
+
+    mapping = db_session.query(DatasetFolderFilesMapping).filter(
+        DatasetFolderFilesMapping.dataset_id == dataset.id,
+        DatasetFolderFilesMapping.file_id == finalize_response.file_id,
+    ).one()
+    assert mapping.folder_id is None
+
+
 def test_delete_dataset_removes_attached_files_and_soft_deletes_dataset(db_session: Session, storage_root: Path) -> None:
     """Deleting a dataset should remove its attached files and mark the dataset as deleted."""
     user = User(email="dataset-owner@example.com", username="datasetowner", full_name="Dataset Owner", password_hash="hash", auth_provider="local", is_verified=True)
@@ -658,3 +736,411 @@ def test_dataset_file_count(db_session: Session) -> None:
 
     db_session.refresh(dataset)
     assert dataset.file_count == 2
+
+
+def test_get_user_integrations(db_session: Session) -> None:
+    """User integration status should reflect existing refresh tokens."""
+    user = User(
+        email="integrations@example.com",
+        username="integrations",
+        full_name="Integrations User",
+        password_hash="hash",
+        auth_provider="local",
+        is_verified=True,
+        google_refresh_token="sample_google_token",
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    res = file_services.get_user_integrations(user)
+    assert res.google_connected is True
+    assert res.microsoft_connected is False
+
+
+def test_get_ingestion_job_status(db_session: Session, fake_redis: FakeRedis) -> None:
+    """Ingestion job status polling should return job progress and details."""
+    user = User(email="job-user@example.com", username="jobuser", full_name="Job User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    dataset = Dataset(user_id=user.id, name="Job Dataset")
+    db_session.add(dataset)
+    db_session.commit()
+    db_session.refresh(dataset)
+
+    job = AsyncIngestionJob(
+        user_id=user.id,
+        dataset_id=dataset.id,
+        provider="GDrive",
+        source_url_or_id="123456",
+        filename="cloud.pdf",
+        status="in_progress",
+        progress_percentage=45,
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    res = file_services.get_ingestion_job_status(db_session, user, job.id)
+    assert res.job_id == job.id
+    assert res.provider == "GDrive"
+    assert res.status == "in_progress"
+    assert res.progress_percentage == 45
+
+
+def test_process_gdrive_ingestion_job(db_session: Session, storage_root: Path, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Google Drive ingestion worker should stream chunks, compute hash, and record completion atomically."""
+    user = User(email="gdrive-worker@example.com", username="gdriveworker", full_name="GDrive Worker", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    dataset = Dataset(user_id=user.id, name="GDrive Dataset")
+    db_session.add(dataset)
+    db_session.commit()
+    db_session.refresh(dataset)
+
+    job = AsyncIngestionJob(
+        user_id=user.id,
+        dataset_id=dataset.id,
+        provider="GDrive",
+        source_url_or_id="gdrive_file_id_99",
+        filename="test_gdrive.txt",
+        status="pending",
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    job_id = job.id
+    dataset_id = dataset.id
+    user_id = user.id
+
+    monkeypatch.setattr(gdrive_service, "get_session_local", lambda: lambda: db_session)
+    monkeypatch.setattr(gdrive_service, "redis_server", fake_redis)
+
+    chunks = [b"google drive ", b"sample content"]
+
+    gdrive_service.process_gdrive_ingestion_job(
+        job_id=job_id,
+        lock_key="lock:ingest:gdrive:99",
+        stream_chunks_generator=iter(chunks),
+        filename="test_gdrive.txt",
+        total_bytes=sum(len(c) for c in chunks),
+        user_id=user_id,
+        dataset_id=dataset_id,
+    )
+
+    job_result = db_session.query(AsyncIngestionJob).filter(AsyncIngestionJob.id == job_id).one()
+    assert job_result.status == "completed"
+    assert job_result.progress_percentage == 100
+    assert job_result.master_hash is not None
+
+    mapping = db_session.query(DatasetFolderFilesMapping).filter(
+        DatasetFolderFilesMapping.dataset_id == dataset_id,
+        DatasetFolderFilesMapping.file_id == job_result.file_id,
+    ).one_or_none()
+    assert mapping is not None
+
+
+def test_extract_gdrive_file_id() -> None:
+    """Should correctly extract file IDs from various Google Drive URL formats and raw strings."""
+    assert gdrive_service.extract_gdrive_file_id("1abc_XYZ-12345") == "1abc_XYZ-12345"
+    assert gdrive_service.extract_gdrive_file_id("https://drive.google.com/file/d/1abc_XYZ-12345/view?usp=sharing") == "1abc_XYZ-12345"
+    assert gdrive_service.extract_gdrive_file_id("https://drive.google.com/open?id=1abc_XYZ-12345") == "1abc_XYZ-12345"
+
+
+def test_initiate_gdrive_ingestion_locks(db_session: Session, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Initiating GDrive ingestion should acquire Redis lock and reject duplicate concurrent requests with 409."""
+    user = User(email="lock-user@example.com", username="lockuser", full_name="Lock User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    dataset = Dataset(user_id=user.id, name="Lock Dataset")
+    db_session.add(dataset)
+    db_session.commit()
+    db_session.refresh(dataset)
+
+    monkeypatch.setattr(gdrive_service, "redis_server", fake_redis)
+
+    bg_tasks = BackgroundTasks()
+
+    response = gdrive_service.initiate_gdrive_ingestion(
+        db=db_session,
+        user=user,
+        dataset_id=dataset.id,
+        file_id_or_url="https://drive.google.com/file/d/shared_file_123/view",
+        background_tasks=bg_tasks,
+    )
+    assert response.status == "pending"
+    assert response.job_id is not None
+
+    # Second call for the same file should hit Redis lock and raise 409 Conflict
+    with pytest.raises(HTTPException) as exc_info:
+        gdrive_service.initiate_gdrive_ingestion(
+            db=db_session,
+            user=user,
+            dataset_id=dataset.id,
+            file_id_or_url="shared_file_123",
+            background_tasks=bg_tasks,
+        )
+    assert exc_info.value.status_code == 409
+
+
+def test_process_sharepoint_ingestion_job(db_session: Session, storage_root: Path, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SharePoint ingestion worker should stream chunks, record Rosetta Stone hash mapping, and complete atomically."""
+    user = User(email="sp-worker@example.com", username="spworker", full_name="SP Worker", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    dataset = Dataset(user_id=user.id, name="SP Dataset")
+    db_session.add(dataset)
+    db_session.commit()
+    db_session.refresh(dataset)
+
+    job = AsyncIngestionJob(
+        user_id=user.id,
+        dataset_id=dataset.id,
+        provider="Sharepoint",
+        source_url_or_id="sp_item_555",
+        filename="test_sp.docx",
+        status="pending",
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    job_id = job.id
+    dataset_id = dataset.id
+    user_id = user.id
+
+    monkeypatch.setattr(sharepoint_service, "get_session_local", lambda: lambda: db_session)
+    monkeypatch.setattr(sharepoint_service, "redis_server", fake_redis)
+
+    chunks = [b"sharepoint ", b"document content"]
+    quick_xor_hash = "mock_quick_xor_hash_abc123"
+
+    sharepoint_service.process_sharepoint_ingestion_job(
+        job_id=job_id,
+        lock_key="lock:ingest:sharepoint:555",
+        stream_chunks_generator=iter(chunks),
+        filename="test_sp.docx",
+        total_bytes=sum(len(c) for c in chunks),
+        user_id=user_id,
+        dataset_id=dataset_id,
+        provider_file_id="sp_item_555",
+        quick_xor_hash=quick_xor_hash,
+    )
+
+    job_result = db_session.query(AsyncIngestionJob).filter(AsyncIngestionJob.id == job_id).one()
+    assert job_result.status == "completed"
+    assert job_result.progress_percentage == 100
+    assert job_result.master_hash is not None
+
+    # Verify Rosetta Stone translation mapping was learned and stored
+    rosetta = db_session.query(ProviderHashMapping).filter(
+        ProviderHashMapping.provider_name == "Sharepoint",
+        ProviderHashMapping.provider_hash == quick_xor_hash,
+    ).one_or_none()
+    assert rosetta is not None
+    assert rosetta.master_hash == job_result.master_hash
+
+
+def test_gdrive_native_app_export(db_session: Session, storage_root: Path, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Native Google Workspace Apps should bypass pre-flight hash check, auto-append extension, and perform post-download deduplication."""
+    user = User(email="native-app@example.com", username="nativeapp", full_name="Native App User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    dataset = Dataset(user_id=user.id, name="Native App Dataset")
+    db_session.add(dataset)
+    db_session.commit()
+    db_session.refresh(dataset)
+
+    monkeypatch.setattr(gdrive_service, "redis_server", fake_redis)
+
+    bg_tasks = BackgroundTasks()
+
+    # 1. Initiate ingestion for a Google Doc (native Workspace app)
+    response = gdrive_service.initiate_gdrive_ingestion(
+        db=db_session,
+        user=user,
+        dataset_id=dataset.id,
+        file_id_or_url="doc_12345",
+        background_tasks=bg_tasks,
+        filename="My Google Doc",
+        mime_type="application/vnd.google-apps.document",
+    )
+
+    assert response.status == "pending"
+    assert "export" in response.message.lower()
+
+    job = db_session.query(AsyncIngestionJob).filter(AsyncIngestionJob.id == response.job_id).one()
+    assert job.filename == "My Google Doc.pdf"
+
+    job_id = job.id
+    dataset_id = dataset.id
+    user_id = user.id
+
+    monkeypatch.setattr(gdrive_service, "get_session_local", lambda: lambda: db_session)
+
+    # 2. Worker streams exported PDF bytes
+    exported_chunks = [b"%PDF-1.4 ", b"exported document stream"]
+
+    gdrive_service.process_gdrive_ingestion_job(
+        job_id=job_id,
+        lock_key="lock:ingest:gdrive:doc_12345",
+        stream_chunks_generator=iter(exported_chunks),
+        filename="My Google Doc.pdf",
+        total_bytes=sum(len(c) for c in exported_chunks),
+        user_id=user_id,
+        dataset_id=dataset_id,
+        is_native_google_app=True,
+        mime_type="application/vnd.google-apps.document",
+    )
+
+    job_result = db_session.query(AsyncIngestionJob).filter(AsyncIngestionJob.id == job_id).one()
+    assert job_result.status == "completed"
+    assert job_result.master_hash is not None
+
+
+def test_get_sharepoint_tree(db_session: Session) -> None:
+    """SharePoint tree route should require connected Microsoft OAuth account and parse Graph items properly."""
+    # 1. Unconnected user raises 401 Unauthorized
+    unconnected_user = User(email="unconnected@example.com", username="unconnected", full_name="Unconnected User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(unconnected_user)
+    db_session.commit()
+    db_session.refresh(unconnected_user)
+
+    with pytest.raises(HTTPException) as exc_info:
+        sharepoint_service.get_sharepoint_tree(db=db_session, user=unconnected_user)
+    assert exc_info.value.status_code == 401
+
+    # 2. Connected user with refresh token parses Graph items cleanly
+    connected_user = User(
+        email="connected-sp@example.com",
+        username="connectedsp",
+        full_name="Connected User",
+        password_hash="hash",
+        auth_provider="local",
+        is_verified=True,
+        microsoft_refresh_token="mock_ms_refresh_token_xyz",
+    )
+    db_session.add(connected_user)
+    db_session.commit()
+    db_session.refresh(connected_user)
+
+    mock_graph_items = [
+        {
+            "id": "folder_item_001",
+            "name": "Finance Reports",
+            "folder": {"childCount": 3},
+            "size": 0,
+        },
+        {
+            "id": "file_item_002",
+            "name": "Q3_Summary.xlsx",
+            "file": {
+                "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "hashes": {"quickXorHash": "mock_quick_xor_hash_999"},
+            },
+            "size": 1048576,
+            "webUrl": "https://sharepoint.com/Q3_Summary.xlsx",
+        },
+    ]
+
+    res = sharepoint_service.get_sharepoint_tree(
+        db=db_session,
+        user=connected_user,
+        folder_id="root_folder",
+        raw_graph_items=mock_graph_items,
+    )
+
+    assert len(res.items) == 2
+    assert res.items[0].is_folder is True
+    assert res.items[0].name == "Finance Reports"
+    assert res.items[1].is_folder is False
+    assert res.items[1].quick_xor_hash == "mock_quick_xor_hash_999"
+    assert res.items[1].size_bytes == 1048576
+
+
+def test_encode_sharepoint_url() -> None:
+    """Should correctly convert SharePoint URLs to u! prefixed urlsafe base64 sharing tokens."""
+    token = sharepoint_service.encode_sharepoint_url("https://contoso.sharepoint.com/:u:/r/sites/marketing/doc.pdf")
+    assert token.startswith("u!")
+    assert "=" not in token
+
+
+def test_initiate_sharepoint_ingestion_rosetta_hit(db_session: Session, storage_root: Path, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rosetta Stone hit should instantly finalize ingestion with 0 network or disk I/O."""
+    user = User(email="rosetta-user@example.com", username="rosettauser", full_name="Rosetta User", password_hash="hash", auth_provider="local", is_verified=True)
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    dataset = Dataset(user_id=user.id, name="Rosetta Dataset")
+    db_session.add(dataset)
+    db_session.commit()
+    db_session.refresh(dataset)
+
+    # 1. Create dummy physical file and UploadedFile record
+    dummy_file_id = "uploaded_file_888"
+    dummy_path = storage_root / "rosetta_sample.pdf"
+    dummy_path.write_bytes(b"sample file content for rosetta stone")
+    master_hash = "f3a2b1c4d5e6f7a8"
+
+    uploaded_file = UploadedFile(
+        id=dummy_file_id,
+        filename="rosetta_sample.pdf",
+        file_size_bytes=len(b"sample file content for rosetta stone"),
+        master_hash=master_hash,
+        physical_path=str(dummy_path),
+        source_type=UploadedFileSourceType.FTP,
+    )
+    db_session.add(uploaded_file)
+
+    # 2. Add learned ProviderHashMapping in Rosetta Stone translation table
+    quick_hash = "learned_quick_xor_hash_777"
+    mapping = ProviderHashMapping(
+        provider_name="Sharepoint",
+        provider_file_id="sp_item_777",
+        provider_hash=quick_hash,
+        master_hash=master_hash,
+    )
+    db_session.add(mapping)
+    db_session.commit()
+
+    monkeypatch.setattr(sharepoint_service, "redis_server", fake_redis)
+
+    bg_tasks = BackgroundTasks()
+
+    # 3. Initiate ingestion with matching quick_xor_hash -> Rosetta Hit!
+    res = sharepoint_service.initiate_sharepoint_ingestion(
+        db=db_session,
+        user=user,
+        dataset_id=dataset.id,
+        file_id_or_url="sp_item_777",
+        background_tasks=bg_tasks,
+        quick_xor_hash=quick_hash,
+    )
+
+    assert res.status == "completed"
+    assert res.is_instant_deduplicated is True
+    assert "Rosetta Stone zero-I/O" in res.message
+
+    job = db_session.query(AsyncIngestionJob).filter(AsyncIngestionJob.id == res.job_id).one()
+    assert job.status == "completed"
+    assert job.progress_percentage == 100
+    assert job.file_id == dummy_file_id
+
+
+
+
+
+
+

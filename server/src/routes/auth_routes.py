@@ -43,7 +43,14 @@ auth_router = APIRouter()
 @auth_router.post("/signup/init", response_model=RegistrationResponse)
 def register(payload: RegisterRequest, db: Session = Depends(get_db)):
     """
-        Register a new local user and create the first OTP challenge.
+    Register a new local user and create the initial OTP challenge.
+
+    Args:
+        payload (RegisterRequest): User registration details including email, password, and optional username.
+        db (Session): The database session.
+
+    Returns:
+        RegistrationResponse: Response containing public user details and a status message.
     """
     user = create_user(db, payload)
     try:
@@ -58,15 +65,15 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)):
 @auth_router.post("/login", response_model=TokenPairResponse)
 def login(payload: LoginRequest, response: Response, db: Session = Depends(get_db)):
     """
-    Authenticate a verified local user and return a new token pair.
+    Authenticate a verified local user using email/username credentials and return a token pair.
 
     Args:
-        payload (LoginRequest): The login credentials.
-        response (Response): The FastAPI response object.
+        payload (LoginRequest): The credential login payload containing identifier/username and password.
+        response (Response): The FastAPI response object for setting HttpOnly cookies and headers.
         db (Session): The database session.
 
     Returns:
-        TokenPairResponse: The token pair response containing user profile details.
+        TokenPairResponse: The token pair response containing public user profile details and access token.
     """
     session, access_token, refresh_token = issue_token_pair(db, authenticate_user(db, payload))
     response.set_cookie(
@@ -92,9 +99,9 @@ def logout(
     Invalidate the current user session and clear the refresh token cookie.
 
     Args:
-        response (Response): The FastAPI response object.
-        authorization (str | None): Optional authorization bearer header.
-        refresh_token (str | None): Optional refresh token cookie.
+        response (Response): The FastAPI response object for removing cookies.
+        authorization (str | None): Optional authorization bearer header containing access token.
+        refresh_token (str | None): Optional refresh token cookie to revoke.
         db (Session): The database session.
 
     Returns:
@@ -116,12 +123,12 @@ def refresh(response: Response, refresh_token: str | None = Cookie(default=None)
     Rotate a refresh token and return a fresh access token pair.
 
     Args:
-        response (Response): The FastAPI response object.
+        response (Response): The FastAPI response object for setting new HttpOnly cookies and headers.
         refresh_token (str | None): The refresh token cookie.
         db (Session): The database session.
 
     Returns:
-        TokenPairResponse: The token pair response containing user profile details.
+        TokenPairResponse: The token pair response containing public user profile details and new access token.
     """
     if refresh_token is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing refresh token")
@@ -141,7 +148,14 @@ def refresh(response: Response, refresh_token: str | None = Cookie(default=None)
 @auth_router.get("/me", response_model=PublicUserSchema)
 def me(authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
     """
-        Return the authenticated user's public profile.
+    Return the authenticated user's public profile.
+
+    Args:
+        authorization (str | None): Authorization bearer header containing access token.
+        db (Session): The database session.
+
+    Returns:
+        PublicUserSchema: The public user schema excluding sensitive credentials.
     """
     if authorization is None or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing access token")
@@ -153,7 +167,15 @@ def me(authorization: str | None = Header(default=None), db: Session = Depends(g
 @auth_router.post("/signup/verify", response_model=TokenPairResponse)
 def verify_signup_endpoint(payload: OtpVerifyRequest, response: Response, db: Session = Depends(get_db)):
     """
-    Verify the submitted OTP and establish a verified login session.
+    Verify the submitted OTP for user registration and establish a verified session.
+
+    Args:
+        payload (OtpVerifyRequest): Request containing user email and 6-digit OTP code.
+        response (Response): The FastAPI response object.
+        db (Session): The database session.
+
+    Returns:
+        TokenPairResponse: The token pair response with active session token.
     """
     user = verify_otp(db, payload)
     session, access_token, refresh_token = issue_token_pair(db, user)
@@ -172,7 +194,14 @@ def verify_signup_endpoint(payload: OtpVerifyRequest, response: Response, db: Se
 @auth_router.post("/password-reset/request", response_model=PasswordResetChallengeResponse)
 def request_password_reset_endpoint(payload: PasswordResetRequest, db: Session = Depends(get_db)):
     """
-        Create a password reset challenge for the supplied email address.
+    Create a password reset challenge for the supplied email address.
+
+    Args:
+        payload (PasswordResetRequest): Request payload containing user's registered email address.
+        db (Session): The database session.
+
+    Returns:
+        PasswordResetChallengeResponse: Response payload containing reset challenge details.
     """
     user, reset_token, _ = request_password_reset(db, payload)
     return PasswordResetChallengeResponse(email=user.email, reset_token=reset_token, message="Password reset challenge created")
@@ -181,18 +210,28 @@ def request_password_reset_endpoint(payload: PasswordResetRequest, db: Session =
 @auth_router.post("/password-reset/verify", response_model=MessageResponse)
 def reset_password_endpoint(payload: PasswordResetConfirmRequest, db: Session = Depends(get_db)):
     """
-        Update a user's password after verifying the reset token.
+    Update a user's password after verifying the reset token.
+
+    Args:
+        payload (PasswordResetConfirmRequest): Request payload containing email, reset token, and new password.
+        db (Session): The database session.
+
+    Returns:
+        MessageResponse: Success message payload confirming password update.
     """
     reset_password(db, payload)
     return MessageResponse(message="Password updated successfully")
 
 
-
-
 @auth_router.get("/google")
 @auth_router.get("/google/login")
 def google_login():
-    """Redirect the browser to Google's OAuth consent screen."""
+    """
+    Redirect the browser to Google's OAuth consent screen.
+
+    Returns:
+        RedirectResponse: 302 Redirect to Google OAuth consent URL with state cookie.
+    """
     authorization_url, state = build_google_login_url()
     response = RedirectResponse(url=authorization_url, status_code=status.HTTP_302_FOUND)
     response.set_cookie(
@@ -213,7 +252,18 @@ def google_callback(
     oauth_state: str | None = Cookie(default=None, alias="google_oauth_state"),
     db: Session = Depends(get_db),
 ):
-    """Handle Google's callback, create the local session, and redirect to the frontend."""
+    """
+    Handle Google's OAuth callback, create/retrieve local user session, and redirect to the frontend.
+
+    Args:
+        code (str | None): Authorization code returned by Google.
+        state (str | None): State parameter returned by Google.
+        oauth_state (str | None): OAuth state stored in HttpOnly cookie.
+        db (Session): The database session.
+
+    Returns:
+        RedirectResponse: 302 Redirect to frontend application URL.
+    """
     if code is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing code parameter")
     if state is None or oauth_state is None or state != oauth_state:
@@ -236,3 +286,4 @@ def google_callback(
     )
     redirect_response.delete_cookie("google_oauth_state", path="/auth/google")
     return redirect_response
+

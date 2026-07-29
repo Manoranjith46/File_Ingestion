@@ -35,6 +35,8 @@ class User(Base):
     is_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     auth_provider: Mapped[str] = mapped_column(String(50), default="local", nullable=False)
     google_subject: Mapped[str | None] = mapped_column(String(255), unique=True, index=True, nullable=True)
+    google_refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    microsoft_refresh_token: Mapped[str | None] = mapped_column(Text, nullable=True)
     token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     otp_code_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     otp_code_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
