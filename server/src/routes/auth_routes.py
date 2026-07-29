@@ -1,5 +1,6 @@
 """Authentication routes for registration, verification, session, and identity flows."""
 
+from fastapi import Request
 from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Response, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
@@ -240,13 +241,14 @@ def google_login():
         httponly=True,
         secure=False,
         samesite="lax",
-        path="/auth/google",
+        path="/",
     )
     return response
 
 
 @auth_router.get("/google/callback", response_model=None)
 def google_callback(
+    request: Request,
     code: str | None = None,
     state: str | None = None,
     oauth_state: str | None = Cookie(default=None, alias="google_oauth_state"),
@@ -256,6 +258,7 @@ def google_callback(
     Handle Google's OAuth callback, create/retrieve local user session, and redirect to the frontend.
 
     Args:
+        request (Request): FastAPI request context.
         code (str | None): Authorization code returned by Google.
         state (str | None): State parameter returned by Google.
         oauth_state (str | None): OAuth state stored in HttpOnly cookie.
@@ -269,7 +272,8 @@ def google_callback(
     if state is None or oauth_state is None or state != oauth_state:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth state")
 
-    user, is_new_user = continue_with_google(db, code)
+    request_redirect_uri = str(request.url).split("?")[0]
+    user, is_new_user = continue_with_google(db, code, redirect_uri=request_redirect_uri)
     _, access_token, refresh_token = issue_token_pair(db, user)
 
     redirect_response = RedirectResponse(
@@ -282,8 +286,8 @@ def google_callback(
         httponly=True,
         secure=False,
         samesite="lax",
-        path="/auth",
+        path="/",
     )
-    redirect_response.delete_cookie("google_oauth_state", path="/auth/google")
+    redirect_response.delete_cookie("google_oauth_state", path="/")
     return redirect_response
 

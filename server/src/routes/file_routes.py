@@ -47,7 +47,7 @@ from services.file_services import (
     get_user_integrations,
     get_ingestion_job_status,
 )
-from services.gdrive_service import initiate_gdrive_ingestion
+from services.gdrive_service import initiate_gdrive_ingestion, get_user_google_access_token
 from services.sharepoint_service import get_sharepoint_tree, initiate_sharepoint_ingestion
 
 
@@ -265,6 +265,19 @@ def get_user_integrations_endpoint(
     """
     user = _resolve_current_user(authorization, db)
     return get_user_integrations(user)
+
+
+@file_router.get("/users/me/google-token")
+def get_user_google_token_endpoint(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    db: Session = Depends(get_db),
+):
+    """
+    Obtain a fresh Google OAuth access token for Google Picker API initialization.
+    """
+    user = _resolve_current_user(authorization, db)
+    token = get_user_google_access_token(user)
+    return {"access_token": token}
 
 
 @file_router.get("/ingest/status/{job_id}", response_model=IngestionJobStatusResponse)

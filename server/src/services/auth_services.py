@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+import os
 import secrets
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode
 
+# Relax oauthlib scope checks for Google OAuth canonical scope URLs
+os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
+os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+
 from fastapi import HTTPException, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+import logging
 from google.auth.transport.requests import Request
 from google.oauth2 import id_token
 from google_auth_oauthlib.flow import Flow
+
+logger = logging.getLogger(__name__)
 
 from helpers.get_env import get_env
 from helpers.jwt import (
@@ -143,30 +151,43 @@ def _google_scopes() -> list[str]:
     """Return the scopes used by the Google login flow.
 
     Returns:
-        list[str]: OAuth scopes for login.
+        list[str]: OAuth scopes for login and Drive file access.
     """
-    return ["openid", "email", "profile"]
+    return [
+        "openid",
+        "email",
+        "profile",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
 
 
-def _google_flow(state: str | None = None) -> Flow:
+def _google_flow(state: str | None = None, redirect_uri: str | None = None) -> Flow:
     """Build a Google OAuth flow instance.
 
     Args:
         state: Optional CSRF state value.
+        redirect_uri: Optional override for OAuth callback redirect URI.
 
     Returns:
         Flow: A configured Google OAuth flow.
     """
+    chosen_redirect_uri = redirect_uri or _google_redirect_uri()
     client_config = {
         "web": {
             "client_id": _google_client_id(),
             "client_secret": _google_client_secret(),
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": [_google_redirect_uri()],
+            "redirect_uris": [chosen_redirect_uri],
         }
     }
-    return Flow.from_client_config(client_config, scopes=_google_scopes(), state=state, redirect_uri=_google_redirect_uri())
+    return Flow.from_client_config(
+        client_config,
+        scopes=_google_scopes(),
+        state=state,
+        redirect_uri=chosen_redirect_uri,
+        autogenerate_code_verifier=False,
+    )
 
 
 def build_google_login_url() -> tuple[str, str]:
@@ -528,12 +549,13 @@ def reset_password(db: Session, payload: PasswordResetConfirmRequest) -> User:
     return user
 
 
-def continue_with_google(db: Session, code: str) -> tuple[User, bool]:
+def continue_with_google(db: Session, code: str, redirect_uri: str | None = None) -> tuple[User, bool]:
     """Exchange a Google authorization code and create or link a local user.
 
     Args:
         db: The active database session.
         code: The Google authorization code.
+        redirect_uri: Optional override for callback redirect URI matching the request.
 
     Returns:
         tuple[User, bool]: The linked or newly created user account and whether it is new.
@@ -541,13 +563,23 @@ def continue_with_google(db: Session, code: str) -> tuple[User, bool]:
     Raises:
         HTTPException: If Google auth is misconfigured or the token is invalid.
     """
-    flow = _google_flow()
-    flow.fetch_token(code=code)
+    try:
+        flow = _google_flow(redirect_uri=redirect_uri)
+        flow.fetch_token(code=code)
+    except Exception as err:
+        logger.error(f"Fetch token with redirect_uri ({redirect_uri}) failed: {err}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Google token exchange failed: {err}")
+
     credentials = flow.credentials
     if not credentials.id_token:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Google token exchange did not return an ID token")
 
-    google_claims = id_token.verify_oauth2_token(credentials.id_token, Request(), audience=_google_client_id())
+    google_claims = id_token.verify_oauth2_token(
+        credentials.id_token,
+        Request(),
+        audience=_google_client_id(),
+        clock_skew_in_seconds=10,
+    )
     google_subject = google_claims.get("sub")
     email = google_claims.get("email")
     full_name = google_claims.get("name")
@@ -568,6 +600,7 @@ def continue_with_google(db: Session, code: str) -> tuple[User, bool]:
             password_hash=hash_password(secrets.token_urlsafe(32)),
             auth_provider="google",
             google_subject=google_subject,
+            google_refresh_token=credentials.refresh_token,
             is_verified=True,
         )
         db.add(user)
@@ -575,6 +608,8 @@ def continue_with_google(db: Session, code: str) -> tuple[User, bool]:
         user.google_subject = google_subject
         user.auth_provider = "google"
         user.is_verified = True
+        if credentials.refresh_token:
+            user.google_refresh_token = credentials.refresh_token
         if full_name and not user.full_name:
             user.full_name = full_name
 

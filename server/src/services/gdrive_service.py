@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import shutil
 from pathlib import Path
@@ -12,6 +13,8 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 import re
+import requests as http_requests
+from google.oauth2.credentials import Credentials
 from fastapi import BackgroundTasks, HTTPException, status
 
 from config.database import get_session_local
@@ -27,7 +30,9 @@ from models.file_model import (
 )
 from schemas.file_schema import GDriveIngestResponse
 from services.file_services import FINAL_ROOT, _uploaded_filename, _sync_dataset_status_from_mappings
+from helpers.get_env import get_env
 
+logger = logging.getLogger(__name__)
 
 GOOGLE_APPS_MIME_PREFIX = "application/vnd.google-apps."
 
@@ -37,6 +42,95 @@ GOOGLE_APPS_EXPORT_EXTENSIONS = {
     "application/vnd.google-apps.presentation": ".pdf",
     "application/vnd.google-apps.drawing": ".pdf",
 }
+
+GOOGLE_APPS_EXPORT_MIME_MAP = {
+    "application/vnd.google-apps.document": "application/pdf",
+    "application/vnd.google-apps.spreadsheet": "application/pdf",
+    "application/vnd.google-apps.presentation": "application/pdf",
+    "application/vnd.google-apps.drawing": "application/pdf",
+}
+
+GDRIVE_FILE_META_URL = "https://www.googleapis.com/drive/v3/files/{file_id}"
+GDRIVE_FILE_DOWNLOAD_URL = "https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+GDRIVE_FILE_EXPORT_URL = "https://www.googleapis.com/drive/v3/files/{file_id}/export?mimeType={export_mime}"
+GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
+STREAM_CHUNK_SIZE = 8192
+
+
+def _build_google_credentials(refresh_token: str) -> Credentials:
+    """Build Google OAuth2 credentials from a stored refresh token."""
+    return Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri=GOOGLE_TOKEN_URI,
+        client_id=get_env("GOOGLE_CLIENT_ID", default="", required=False).strip(),
+        client_secret=get_env("GOOGLE_CLIENT_SECRET", default="", required=False).strip(),
+    )
+
+
+def get_user_google_access_token(user: User) -> str:
+    """Obtain a fresh Google OAuth2 access token for the authenticated user."""
+    if not user.google_refresh_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Google account not connected. Please connect your Google account first.",
+        )
+    creds = _build_google_credentials(user.google_refresh_token)
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+    creds.refresh(GoogleAuthRequest())
+    if not creds.token:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to obtain Google access token.",
+        )
+    return creds.token
+
+
+def _stream_gdrive_download(gdrive_file_id: str, refresh_token: str, mime_type: str | None = None):
+    """
+    Stream-download a Google Drive file using the user's refresh token.
+
+    Yields raw byte chunks from the Google Drive API.
+    For native Google Workspace files, exports as PDF.
+    """
+    creds = _build_google_credentials(refresh_token)
+
+    # Force refresh to get a valid access token
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+    creds.refresh(GoogleAuthRequest())
+
+    headers = {"Authorization": f"Bearer {creds.token}"}
+
+    is_native = is_google_apps_mime(mime_type)
+
+    if is_native:
+        export_mime = GOOGLE_APPS_EXPORT_MIME_MAP.get(mime_type, "application/pdf")
+        url = GDRIVE_FILE_EXPORT_URL.format(file_id=gdrive_file_id, export_mime=export_mime)
+    else:
+        url = GDRIVE_FILE_DOWNLOAD_URL.format(file_id=gdrive_file_id)
+
+    logger.info(f"Starting GDrive download: {url}")
+    response = http_requests.get(url, headers=headers, stream=True, timeout=600)
+    response.raise_for_status()
+
+    for chunk in response.iter_content(chunk_size=STREAM_CHUNK_SIZE):
+        if chunk:
+            yield chunk
+
+
+def _get_gdrive_file_metadata(gdrive_file_id: str, refresh_token: str) -> dict:
+    """Fetch file metadata (name, mimeType, size) from Google Drive API."""
+    creds = _build_google_credentials(refresh_token)
+
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+    creds.refresh(GoogleAuthRequest())
+
+    headers = {"Authorization": f"Bearer {creds.token}"}
+    url = GDRIVE_FILE_META_URL.format(file_id=gdrive_file_id)
+    params = {"fields": "id,name,mimeType,size"}
+    response = http_requests.get(url, headers=headers, params=params, timeout=30)
+    response.raise_for_status()
+    return response.json()
 
 
 def is_google_apps_mime(mime_type: str | None) -> bool:
@@ -58,6 +152,16 @@ def extract_gdrive_file_id(url_or_id: str) -> str:
     """
     Extract a Google Drive file ID from shared URLs or raw string identifiers.
 
+    Supports:
+        - https://drive.google.com/file/d/FILE_ID/view
+        - https://docs.google.com/document/d/FILE_ID/edit
+        - https://docs.google.com/spreadsheets/d/FILE_ID/edit
+        - https://docs.google.com/presentation/d/FILE_ID/edit
+        - https://docs.google.com/drawings/d/FILE_ID/edit
+        - https://drive.google.com/open?id=FILE_ID
+        - https://drive.google.com/drive/folders/FOLDER_ID
+        - Raw file ID string
+
     Args:
         url_or_id (str): The Google Drive URL or raw file ID string.
 
@@ -65,15 +169,28 @@ def extract_gdrive_file_id(url_or_id: str) -> str:
         str: The extracted Google Drive file ID.
     """
     clean = url_or_id.strip()
-    match = re.search(r"/file/d/([a-zA-Z0-9_-]+)", clean)
+
+    # Match /d/FILE_ID pattern (covers /file/d/, /document/d/, /spreadsheets/d/, /presentation/d/, /drawings/d/)
+    match = re.search(r"/d/([a-zA-Z0-9_-]+)", clean)
     if match:
         return match.group(1)
-    match = re.search(r"id=([a-zA-Z0-9_-]+)", clean)
+
+    # Match /folders/FOLDER_ID pattern
+    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", clean)
     if match:
         return match.group(1)
+
+    # Match ?id=FILE_ID or &id=FILE_ID (but NOT ouid=, etc.)
+    match = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", clean)
+    if match:
+        return match.group(1)
+
+    # If it's a URL but no pattern matched, take the last path segment
     if clean.startswith("http://") or clean.startswith("https://"):
-        parts = clean.rstrip("/").split("/")
+        url_path = clean.split("?")[0]  # Strip query parameters
+        parts = url_path.rstrip("/").split("/")
         return parts[-1]
+
     return clean
 
 
@@ -122,7 +239,28 @@ def initiate_gdrive_ingestion(
         if folder is None:
             folder_id = None
 
+    # Verify user has a connected Google account with refresh token
+    if not user.google_refresh_token:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Google account not connected. Please connect your Google account first via OAuth.",
+        )
+
     is_native_app = is_google_apps_mime(mime_type)
+
+    # Fetch file metadata from Google Drive API to get real filename and mime type
+    try:
+        file_meta = _get_gdrive_file_metadata(gdrive_file_id, user.google_refresh_token)
+        logger.info(f"GDrive file metadata: {file_meta}")
+        if not filename:
+            filename = file_meta.get("name", f"gdrive_{gdrive_file_id}")
+        if not mime_type:
+            mime_type = file_meta.get("mimeType")
+            is_native_app = is_google_apps_mime(mime_type)
+        total_bytes = int(file_meta.get("size", 0)) if file_meta.get("size") else None
+    except Exception as meta_err:
+        logger.warning(f"Could not fetch GDrive metadata for {gdrive_file_id}: {meta_err}")
+        total_bytes = None
 
     lock_key = f"lock:ingest:gdrive:{gdrive_file_id}"
     job_id = str(uuid4())
@@ -155,8 +293,8 @@ def initiate_gdrive_ingestion(
     db.add(job)
     db.commit()
 
-    if stream_chunks_generator is None:
-        stream_chunks_generator = iter([])
+    # Pass the user's refresh token and mime_type so the background worker can download
+    google_refresh_token = user.google_refresh_token
 
     background_tasks.add_task(
         process_gdrive_ingestion_job,
@@ -164,12 +302,14 @@ def initiate_gdrive_ingestion(
         lock_key=lock_key,
         stream_chunks_generator=stream_chunks_generator,
         filename=target_filename,
-        total_bytes=None,
+        total_bytes=total_bytes,
         user_id=user.id,
         dataset_id=dataset_id,
         folder_id=folder_id,
         is_native_google_app=is_native_app,
         mime_type=mime_type,
+        gdrive_file_id=gdrive_file_id,
+        google_refresh_token=google_refresh_token,
     )
 
     return GDriveIngestResponse(
@@ -190,6 +330,8 @@ def process_gdrive_ingestion_job(
     folder_id: str | None = None,
     is_native_google_app: bool = False,
     mime_type: str | None = None,
+    gdrive_file_id: str | None = None,
+    google_refresh_token: str | None = None,
 ) -> None:
     """
     Background worker to stream Google Drive file/export content, perform real-time hashing, and atomically commit.
@@ -205,6 +347,8 @@ def process_gdrive_ingestion_job(
         folder_id (str | None): Optional target folder ID.
         is_native_google_app (bool): Flag indicating if the file was exported from a Google Workspace App.
         mime_type (str | None): Optional original Google Workspace MIME type.
+        gdrive_file_id (str | None): Google Drive file ID for download.
+        google_refresh_token (str | None): User's Google refresh token.
     """
     db: Session = get_session_local()()
     staging_path: Path | None = None
@@ -219,6 +363,17 @@ def process_gdrive_ingestion_job(
             db.commit()
 
         redis_server.set(progress_key, "0")
+
+        # If no pre-built stream generator, create one from Google Drive API
+        if stream_chunks_generator is None and gdrive_file_id and google_refresh_token:
+            logger.info(f"Creating GDrive download stream for file_id={gdrive_file_id}")
+            stream_chunks_generator = _stream_gdrive_download(
+                gdrive_file_id=gdrive_file_id,
+                refresh_token=google_refresh_token,
+                mime_type=mime_type,
+            )
+        elif stream_chunks_generator is None:
+            raise ValueError("No download stream available and no Google credentials provided")
 
         # 2. Prepare staging file and incremental SHA-256 calculation
         staging_file_id = str(uuid4())
