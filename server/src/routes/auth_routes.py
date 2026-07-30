@@ -26,6 +26,9 @@ from services.auth_services import (
     build_google_frontend_redirect_url,
     build_google_login_url,
     continue_with_google,
+    build_microsoft_frontend_redirect_url,
+    build_microsoft_login_url,
+    continue_with_microsoft,
     create_user,
     get_current_user,
     issue_token_pair,
@@ -290,4 +293,73 @@ def google_callback(
     )
     redirect_response.delete_cookie("google_oauth_state", path="/")
     return redirect_response
+
+
+@auth_router.get("/microsoft")
+@auth_router.get("/microsoft/login")
+def microsoft_login():
+    """
+    Redirect the browser to Microsoft's OAuth consent screen.
+
+    Returns:
+        RedirectResponse: 302 Redirect to Microsoft OAuth consent URL with state cookie.
+    """
+    authorization_url, state = build_microsoft_login_url()
+    response = RedirectResponse(url=authorization_url, status_code=status.HTTP_302_FOUND)
+    response.set_cookie(
+        "microsoft_oauth_state",
+        state,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        path="/",
+    )
+    return response
+
+
+@auth_router.get("/microsoft/callback", response_model=None)
+def microsoft_callback(
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    oauth_state: str | None = Cookie(default=None, alias="microsoft_oauth_state"),
+    db: Session = Depends(get_db),
+):
+    """
+    Handle Microsoft's OAuth callback, create/retrieve local user session, and redirect to the frontend.
+
+    Args:
+        request (Request): FastAPI request context.
+        code (str | None): Authorization code returned by Microsoft.
+        state (str | None): State parameter returned by Microsoft.
+        oauth_state (str | None): OAuth state stored in HttpOnly cookie.
+        db (Session): The database session.
+
+    Returns:
+        RedirectResponse: 302 Redirect to frontend application URL.
+    """
+    if code is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing code parameter")
+    if state is None or oauth_state is None or state != oauth_state:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OAuth state")
+
+    request_redirect_uri = str(request.url).split("?")[0]
+    user, is_new_user = continue_with_microsoft(db, code, redirect_uri=request_redirect_uri)
+    _, access_token, refresh_token = issue_token_pair(db, user)
+
+    redirect_response = RedirectResponse(
+        url=build_microsoft_frontend_redirect_url(is_new_user),
+        status_code=status.HTTP_302_FOUND,
+    )
+    redirect_response.set_cookie(
+        "refresh_token",
+        refresh_token,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        path="/",
+    )
+    redirect_response.delete_cookie("microsoft_oauth_state", path="/")
+    return redirect_response
+
 

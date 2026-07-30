@@ -29,7 +29,7 @@ from models.file_model import (
     UploadedFileSourceType,
 )
 from schemas.file_schema import GDriveIngestResponse
-from services.file_services import FINAL_ROOT, _uploaded_filename, _sync_dataset_status_from_mappings
+from services.file_services import FINAL_ROOT, _uploaded_filename, _get_unique_filename, _sync_dataset_status_from_mappings
 from helpers.get_env import get_env
 
 logger = logging.getLogger(__name__)
@@ -420,13 +420,7 @@ def process_gdrive_ingestion_job(
         else:
             # Save new physical file
             final_file_id = str(uuid4())
-            final_filename = _uploaded_filename(filename)
-            final_path = FINAL_ROOT / final_filename
-
-            if final_path.exists():
-                # Disambiguate filename collision
-                final_path = FINAL_ROOT / f"{final_file_id}_{final_filename}"
-
+            final_path = _get_unique_filename(FINAL_ROOT, filename)
             staging_path.replace(final_path)
 
             new_uploaded_file = UploadedFile(

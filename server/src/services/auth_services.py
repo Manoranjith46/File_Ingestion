@@ -602,6 +602,7 @@ def continue_with_google(db: Session, code: str, redirect_uri: str | None = None
             google_subject=google_subject,
             google_refresh_token=credentials.refresh_token,
             is_verified=True,
+            token_version=1,
         )
         db.add(user)
     else:
@@ -614,7 +615,7 @@ def continue_with_google(db: Session, code: str, redirect_uri: str | None = None
             user.full_name = full_name
 
     user.last_login_at = _now()
-    user.token_version += 1
+    user.token_version = (user.token_version or 0) + 1
     db.commit()
     db.refresh(user)
     return user, is_new_user
@@ -624,3 +625,146 @@ def build_google_frontend_redirect_url(is_new_user: bool) -> str:
     """Build the frontend redirect URL after Google login."""
     query = urlencode({"status": "success", "is_new_user": str(is_new_user).lower()})
     return f"{_frontend_url().rstrip('/')}/auth/google/callback?{query}"
+
+
+def _microsoft_client_id() -> str:
+    """Return the configured Microsoft OAuth client ID."""
+    client_id = get_env("MICROSOFT_CLIENT_ID", default="", required=False).strip()
+    if not client_id:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Microsoft client ID is not configured")
+    return client_id
+
+
+def _microsoft_client_secret() -> str:
+    """Return the configured Microsoft OAuth client secret."""
+    client_secret = get_env("MICROSOFT_CLIENT_SECRET", default="", required=False).strip()
+    if not client_secret:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Microsoft client secret is not configured")
+    return client_secret
+
+
+def _microsoft_tenant_id() -> str:
+    """Return the configured Microsoft tenant ID."""
+    return get_env("MICROSOFT_TENANT_ID", default="common", required=False).strip() or "common"
+
+
+def _microsoft_redirect_uri() -> str:
+    """Return the configured Microsoft redirect URI."""
+    return get_env("MICROSOFT_REDIRECT_URI", default="http://localhost:8000/v1/auth/microsoft/callback", required=False).strip()
+
+
+def _microsoft_scopes() -> str:
+    """Return space-separated Microsoft Graph API scopes."""
+    return "offline_access User.Read Files.Read.All Sites.Read.All"
+
+
+def build_microsoft_login_url() -> tuple[str, str]:
+    """Create the Microsoft authorization URL and state value.
+
+    Returns:
+        tuple[str, str]: The authorization URL and CSRF state.
+    """
+    state = secrets.token_urlsafe(24)
+    tenant = _microsoft_tenant_id()
+    params = {
+        "client_id": _microsoft_client_id(),
+        "response_type": "code",
+        "redirect_uri": _microsoft_redirect_uri(),
+        "response_mode": "query",
+        "scope": _microsoft_scopes(),
+        "state": state,
+        "prompt": "consent",
+    }
+    url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize?{urlencode(params)}"
+    return url, state
+
+
+def continue_with_microsoft(db: Session, code: str, redirect_uri: str | None = None) -> tuple[User, bool]:
+    """Exchange a Microsoft authorization code for tokens and link or create user.
+
+    Args:
+        db: Active database session.
+        code: Authorization code from Microsoft.
+        redirect_uri: Optional override redirect URI.
+
+    Returns:
+        tuple[User, bool]: Linked user and whether newly created.
+    """
+    import requests
+
+    tenant = _microsoft_tenant_id()
+    token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    chosen_redirect_uri = redirect_uri or _microsoft_redirect_uri()
+
+    payload = {
+        "client_id": _microsoft_client_id(),
+        "client_secret": _microsoft_client_secret(),
+        "code": code,
+        "redirect_uri": chosen_redirect_uri,
+        "grant_type": "authorization_code",
+        "scope": _microsoft_scopes(),
+    }
+
+    resp = requests.post(token_url, data=payload, timeout=30)
+    if resp.status_code != 200:
+        logger.error(f"Microsoft token exchange failed: {resp.text}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Microsoft token exchange failed: {resp.text}")
+
+    token_data = resp.json()
+    access_token = token_data.get("access_token")
+    refresh_token = token_data.get("refresh_token")
+
+    if not access_token:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Microsoft token exchange did not return an access token")
+
+    # Fetch Microsoft User Profile
+    profile_resp = requests.get(
+        "https://graph.microsoft.com/v1.0/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=30,
+    )
+    if profile_resp.status_code != 200:
+        logger.error(f"Microsoft user profile fetch failed: {profile_resp.text}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Failed to fetch Microsoft user profile")
+
+    profile = profile_resp.json()
+    email = profile.get("mail") or profile.get("userPrincipalName")
+    full_name = profile.get("displayName")
+
+    if not email:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Microsoft account profile is missing email")
+
+    user = db.query(User).filter((func.lower(User.email) == email.lower())).one_or_none()
+    is_new_user = user is None
+
+    if user is None:
+        user = User(
+            email=email,
+            username=email.split("@")[0],
+            full_name=full_name,
+            password_hash=hash_password(secrets.token_urlsafe(32)),
+            auth_provider="microsoft",
+            microsoft_refresh_token=refresh_token,
+            is_verified=True,
+            token_version=1,
+        )
+        db.add(user)
+    else:
+        user.auth_provider = "microsoft"
+        user.is_verified = True
+        if refresh_token:
+            user.microsoft_refresh_token = refresh_token
+        if full_name and not user.full_name:
+            user.full_name = full_name
+
+    user.last_login_at = _now()
+    user.token_version = (user.token_version or 0) + 1
+    db.commit()
+    db.refresh(user)
+    return user, is_new_user
+
+
+def build_microsoft_frontend_redirect_url(is_new_user: bool) -> str:
+    """Build the frontend redirect URL after Microsoft login."""
+    query = urlencode({"status": "success", "is_new_user": str(is_new_user).lower()})
+    return f"{_frontend_url().rstrip('/')}/auth/microsoft/callback?{query}"

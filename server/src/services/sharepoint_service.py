@@ -12,6 +12,8 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 import base64
+import logging
+import requests as http_requests
 from fastapi import BackgroundTasks, HTTPException, status
 
 from config.database import get_session_local
@@ -27,7 +29,10 @@ from models.file_model import (
     UploadedFileSourceType,
 )
 from schemas.file_schema import SharepointIngestResponse, SharepointItem, SharepointTreeResponse
-from services.file_services import FINAL_ROOT, _uploaded_filename, _sync_dataset_status_from_mappings
+from services.file_services import FINAL_ROOT, _uploaded_filename, _get_unique_filename, _sync_dataset_status_from_mappings
+from helpers.get_env import get_env
+
+logger = logging.getLogger(__name__)
 
 
 def encode_sharepoint_url(sharepoint_url: str) -> str:
@@ -44,6 +49,78 @@ def encode_sharepoint_url(sharepoint_url: str) -> str:
     base64_str = base64.b64encode(raw_bytes).decode("utf-8")
     base64_url = base64_str.rstrip("=").replace("/", "_").replace("+", "-")
     return f"u!{base64_url}"
+
+
+def get_user_microsoft_access_token(user: User) -> str:
+    """Obtain a fresh Microsoft Graph API access token using the user's stored refresh token."""
+    if not user.microsoft_refresh_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Microsoft account not connected. Please authenticate via Microsoft OAuth.",
+        )
+    client_id = get_env("MICROSOFT_CLIENT_ID", default="", required=False).strip()
+    client_secret = get_env("MICROSOFT_CLIENT_SECRET", default="", required=False).strip()
+    tenant = get_env("MICROSOFT_TENANT_ID", default="common", required=False).strip() or "common"
+
+    token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    payload = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": "refresh_token",
+        "refresh_token": user.microsoft_refresh_token,
+        "scope": "offline_access User.Read Files.Read.All Sites.Read.All",
+    }
+    resp = http_requests.post(token_url, data=payload, timeout=30)
+    if resp.status_code != 200:
+        logger.error(f"Failed to refresh Microsoft token: {resp.text}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Failed to refresh Microsoft access token. Please re-connect your Microsoft account.",
+        )
+    return resp.json().get("access_token")
+
+
+def _get_sharepoint_item_metadata(file_id_or_url: str, access_token: str) -> dict:
+    """Fetch item metadata (name, size, hashes, downloadUrl) from Microsoft Graph API."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    if file_id_or_url.startswith("http://") or file_id_or_url.startswith("https://"):
+        sharing_token = encode_sharepoint_url(file_id_or_url)
+        url = f"https://graph.microsoft.com/v1.0/shares/{sharing_token}/driveItem"
+    else:
+        url = f"https://graph.microsoft.com/v1.0/me/drive/items/{file_id_or_url}"
+
+    resp = http_requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _stream_sharepoint_download(file_id_or_url: str, access_token: str, download_url: str | None = None):
+    """Stream download file chunks from Microsoft Graph API without sending Authorization headers to location redirects."""
+    if download_url:
+        logger.info(f"Starting SharePoint download using direct pre-authenticated URL...")
+        resp = http_requests.get(download_url, stream=True, timeout=600)
+        resp.raise_for_status()
+    else:
+        headers = {"Authorization": f"Bearer {access_token}"}
+        if file_id_or_url.startswith("http://") or file_id_or_url.startswith("https://"):
+            sharing_token = encode_sharepoint_url(file_id_or_url)
+            target_url = f"https://graph.microsoft.com/v1.0/shares/{sharing_token}/driveItem/content"
+        else:
+            target_url = f"https://graph.microsoft.com/v1.0/me/drive/items/{file_id_or_url}/content"
+
+        logger.info(f"Starting SharePoint download stream from: {target_url[:80]}...")
+        resp = http_requests.get(target_url, headers=headers, allow_redirects=False, timeout=30)
+        if resp.status_code in (301, 302, 303, 307, 308) and "Location" in resp.headers:
+            redirect_url = resp.headers["Location"]
+            logger.info("Following Graph API download redirect without Authorization header...")
+            resp = http_requests.get(redirect_url, stream=True, timeout=600)
+            resp.raise_for_status()
+        else:
+            resp.raise_for_status()
+
+    for chunk in resp.iter_content(chunk_size=8192):
+        if chunk:
+            yield chunk
 
 
 def initiate_sharepoint_ingestion(
@@ -87,7 +164,32 @@ def initiate_sharepoint_ingestion(
         if folder is None:
             folder_id = None
 
-    target_filename = filename or f"sharepoint_{file_id_or_url[:16]}"
+    # Verify user has connected Microsoft account
+    if not user.microsoft_refresh_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Microsoft account not connected. Please authenticate via Microsoft OAuth.",
+        )
+
+    # Fetch Microsoft access token
+    access_token = get_user_microsoft_access_token(user)
+
+    # Fetch real item metadata from Microsoft Graph API
+    download_url = None
+    total_bytes = None
+    try:
+        meta = _get_sharepoint_item_metadata(file_id_or_url, access_token)
+        logger.info(f"SharePoint item metadata: name={meta.get('name')}, size={meta.get('size')}")
+        if not filename:
+            filename = meta.get("name")
+        total_bytes = int(meta.get("size", 0)) if meta.get("size") else None
+        if not quick_xor_hash:
+            quick_xor_hash = meta.get("file", {}).get("hashes", {}).get("quickXorHash")
+        download_url = meta.get("@microsoft.graph.downloadUrl")
+    except Exception as meta_err:
+        logger.warning(f"Could not fetch SharePoint metadata for {file_id_or_url}: {meta_err}")
+
+    target_filename = filename or f"sharepoint_{uuid4().hex[:8]}"
 
     # Determine provider_file_id / sharing token
     if file_id_or_url.startswith("http://") or file_id_or_url.startswith("https://"):
@@ -179,8 +281,7 @@ def initiate_sharepoint_ingestion(
     db.add(job)
     db.commit()
 
-    if stream_chunks_generator is None:
-        stream_chunks_generator = iter([])
+    microsoft_refresh_token = user.microsoft_refresh_token
 
     background_tasks.add_task(
         process_sharepoint_ingestion_job,
@@ -188,12 +289,15 @@ def initiate_sharepoint_ingestion(
         lock_key=lock_key,
         stream_chunks_generator=stream_chunks_generator,
         filename=target_filename,
-        total_bytes=None,
+        total_bytes=total_bytes,
         user_id=user.id,
         dataset_id=dataset_id,
         provider_file_id=provider_file_id,
         quick_xor_hash=quick_xor_hash,
         folder_id=folder_id,
+        file_id_or_url=file_id_or_url,
+        microsoft_refresh_token=microsoft_refresh_token,
+        download_url=download_url,
     )
 
     return SharepointIngestResponse(
@@ -235,6 +339,27 @@ def get_sharepoint_tree(
             detail="Microsoft account not connected. Please authenticate via Microsoft OAuth.",
         )
 
+    if raw_graph_items is None and user.microsoft_refresh_token:
+        try:
+            access_token = get_user_microsoft_access_token(user)
+            headers = {"Authorization": f"Bearer {access_token}"}
+            if folder_id:
+                graph_url = f"https://graph.microsoft.com/v1.0/me/drive/items/{folder_id}/children"
+            elif drive_id:
+                graph_url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/children"
+            else:
+                graph_url = "https://graph.microsoft.com/v1.0/me/drive/root/children"
+
+            resp = http_requests.get(graph_url, headers=headers, timeout=30)
+            if resp.status_code == 200:
+                raw_graph_items = resp.json().get("value", [])
+            else:
+                logger.warning(f"Graph API children call returned {resp.status_code}: {resp.text}")
+                raw_graph_items = []
+        except Exception as err:
+            logger.warning(f"Failed to fetch Graph API items: {err}")
+            raw_graph_items = []
+
     items: list[SharepointItem] = []
     source_items = raw_graph_items or []
 
@@ -273,6 +398,9 @@ def process_sharepoint_ingestion_job(
     provider_file_id: str,
     quick_xor_hash: str | None = None,
     folder_id: str | None = None,
+    file_id_or_url: str | None = None,
+    microsoft_refresh_token: str | None = None,
+    download_url: str | None = None,
 ) -> None:
     """
     Background worker to stream SharePoint file content, record Rosetta Stone hash mapping, and commit atomically.
@@ -288,6 +416,9 @@ def process_sharepoint_ingestion_job(
         provider_file_id (str): SharePoint drive item ID.
         quick_xor_hash (str | None): Optional Microsoft quickXorHash string.
         folder_id (str | None): Optional target folder ID.
+        file_id_or_url (str | None): Original file ID or URL string.
+        microsoft_refresh_token (str | None): User's Microsoft OAuth refresh token.
+        download_url (str | None): Pre-authenticated direct download URL if known.
     """
     db: Session = get_session_local()()
     staging_path: Path | None = None
@@ -302,6 +433,33 @@ def process_sharepoint_ingestion_job(
             db.commit()
 
         redis_server.set(progress_key, "0")
+
+        # Create download stream from Microsoft Graph API if no pre-built generator is provided
+        if stream_chunks_generator is None and file_id_or_url and microsoft_refresh_token:
+            logger.info(f"Creating SharePoint download stream for target={file_id_or_url[:60]}")
+            client_id = get_env("MICROSOFT_CLIENT_ID", default="", required=False).strip()
+            client_secret = get_env("MICROSOFT_CLIENT_SECRET", default="", required=False).strip()
+            tenant = get_env("MICROSOFT_TENANT_ID", default="common", required=False).strip() or "common"
+            token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+            payload = {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "grant_type": "refresh_token",
+                "refresh_token": microsoft_refresh_token,
+                "scope": "offline_access User.Read Files.Read.All Sites.Read.All",
+            }
+            resp = http_requests.post(token_url, data=payload, timeout=30)
+            if resp.status_code == 200:
+                access_token = resp.json().get("access_token")
+                stream_chunks_generator = _stream_sharepoint_download(
+                    file_id_or_url=file_id_or_url,
+                    access_token=access_token,
+                    download_url=download_url,
+                )
+            else:
+                raise ValueError(f"Failed to refresh Microsoft token: {resp.text}")
+        elif stream_chunks_generator is None:
+            raise ValueError("No download stream available and no Microsoft credentials provided")
 
         # 2. Prepare staging file and incremental SHA-256 calculation
         staging_file_id = str(uuid4())
@@ -332,7 +490,36 @@ def process_sharepoint_ingestion_job(
 
         master_hash = sha256_hash.hexdigest()
 
-        # 3. Rosetta Stone Learning Step: Map quickXorHash -> master_hash if provided
+        # 3. Touch 2: Deduplication check and atomic DB finalize
+        uploaded_file = (
+            db.query(UploadedFile)
+            .filter(UploadedFile.master_hash == master_hash)
+            .first()
+        )
+
+        final_file_id: str
+        if uploaded_file is not None:
+            # Re-use existing physical file and remove staging file
+            final_file_id = uploaded_file.id
+            if staging_path.exists():
+                staging_path.unlink()
+        else:
+            final_file_id = str(uuid4())
+            final_path = _get_unique_filename(FINAL_ROOT, filename)
+            staging_path.replace(final_path)
+
+            new_uploaded_file = UploadedFile(
+                id=final_file_id,
+                filename=filename,
+                file_size_bytes=downloaded_bytes,
+                master_hash=master_hash,
+                physical_path=str(final_path),
+                source_type=UploadedFileSourceType.Sharepoint,
+            )
+            db.add(new_uploaded_file)
+            db.flush()
+
+        # 4. Rosetta Stone Learning Step: Map quickXorHash -> master_hash if provided
         if quick_xor_hash and quick_xor_hash.strip():
             clean_hash = quick_xor_hash.strip()
             existing_mapping = (
@@ -352,40 +539,6 @@ def process_sharepoint_ingestion_job(
                 )
                 db.add(new_hash_mapping)
                 db.flush()
-
-        # 4. Touch 2: Deduplication check and atomic DB finalize
-        uploaded_file = (
-            db.query(UploadedFile)
-            .filter(UploadedFile.master_hash == master_hash)
-            .first()
-        )
-
-        final_file_id: str
-        if uploaded_file is not None:
-            # Re-use existing physical file and remove staging file
-            final_file_id = uploaded_file.id
-            if staging_path.exists():
-                staging_path.unlink()
-        else:
-            final_file_id = str(uuid4())
-            final_filename = _uploaded_filename(filename)
-            final_path = FINAL_ROOT / final_filename
-
-            if final_path.exists():
-                final_path = FINAL_ROOT / f"{final_file_id}_{final_filename}"
-
-            staging_path.replace(final_path)
-
-            new_uploaded_file = UploadedFile(
-                id=final_file_id,
-                filename=filename,
-                file_size_bytes=downloaded_bytes,
-                master_hash=master_hash,
-                physical_path=str(final_path),
-                source_type=UploadedFileSourceType.Sharepoint,
-            )
-            db.add(new_uploaded_file)
-            db.flush()
 
         # Insert dataset-folder file mapping
         stmt = (

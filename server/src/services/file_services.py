@@ -79,6 +79,23 @@ def _uploaded_filename(filename: str) -> str:
     return Path(filename).name
 
 
+def _get_unique_filename(base_dir: Path, filename: str) -> Path:
+    """Return a non-colliding Path by appending (1), (2), etc. if the file already exists."""
+    clean_name = _uploaded_filename(filename)
+    candidate = base_dir / clean_name
+    if not candidate.exists():
+        return candidate
+
+    stem = candidate.stem
+    suffix = candidate.suffix
+    counter = 1
+    while True:
+        candidate = base_dir / f"{stem} ({counter}){suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
 def _validate_relative_path(relative_path: str | None) -> list[str]:
     if relative_path is None or relative_path.strip() == "":
         return []
