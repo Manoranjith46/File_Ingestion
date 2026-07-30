@@ -5,5 +5,6 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 echo "Building and starting containers..."
+docker compose down
 docker compose build
-docker compose up
+docker compose up -d --build

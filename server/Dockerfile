@@ -19,10 +19,10 @@ RUN pip install --upgrade pip \
 # Copy project files
 COPY . .
 
-# Ensure startup script is executable
-RUN chmod +x ./start.sh || true
+# Convert Windows CRLF line endings to Unix LF and make executable
+RUN sed -i 's/\r$//' ./start.sh && chmod +x ./start.sh
 
 EXPOSE 8000
 
 # Use the repository start script which bootstraps DB then launches uvicorn
-CMD ["./start.sh"]
+CMD ["/app/start.sh"]

@@ -7,14 +7,15 @@ import os
 import sys
 from sqlalchemy import create_engine
 
-conn = os.getenv("Connection_String")
-if not conn:
-    sys.exit(1)
-engine = create_engine(conn, pool_pre_ping=True)
+conn = os.getenv("Connection_String") or os.getenv("DATABASE_URL") or "postgresql://postgres:Zenteiq@postgres:5432/Ingester-Database"
+if "127.0.0.1" in conn or "localhost" in conn:
+    conn = conn.replace("127.0.0.1", "postgres").replace("localhost", "postgres")
+
 try:
+    engine = create_engine(conn, pool_pre_ping=True)
     with engine.connect():
-        pass
-except Exception:
+        sys.exit(0)
+except Exception as e:
     sys.exit(1)
 PY
 
