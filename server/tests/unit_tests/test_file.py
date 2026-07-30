@@ -854,7 +854,7 @@ def test_extract_gdrive_file_id() -> None:
 
 def test_initiate_gdrive_ingestion_locks(db_session: Session, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
     """Initiating GDrive ingestion should acquire Redis lock and reject duplicate concurrent requests with 409."""
-    user = User(email="lock-user@example.com", username="lockuser", full_name="Lock User", password_hash="hash", auth_provider="local", is_verified=True)
+    user = User(email="lock-user@example.com", username="lockuser", full_name="Lock User", password_hash="hash", auth_provider="local", is_verified=True, google_refresh_token="mock_google_token")
     db_session.add(user)
     db_session.commit()
     db_session.refresh(user)
@@ -865,8 +865,10 @@ def test_initiate_gdrive_ingestion_locks(db_session: Session, fake_redis: FakeRe
     db_session.refresh(dataset)
 
     monkeypatch.setattr(gdrive_service, "redis_server", fake_redis)
+    monkeypatch.setattr(gdrive_service, "_get_gdrive_file_metadata", lambda file_id, token: {"name": "mock.txt", "mimeType": "text/plain", "size": "100"})
 
     bg_tasks = BackgroundTasks()
+
 
     response = gdrive_service.initiate_gdrive_ingestion(
         db=db_session,
@@ -952,7 +954,7 @@ def test_process_sharepoint_ingestion_job(db_session: Session, storage_root: Pat
 
 def test_gdrive_native_app_export(db_session: Session, storage_root: Path, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
     """Native Google Workspace Apps should bypass pre-flight hash check, auto-append extension, and perform post-download deduplication."""
-    user = User(email="native-app@example.com", username="nativeapp", full_name="Native App User", password_hash="hash", auth_provider="local", is_verified=True)
+    user = User(email="native-app@example.com", username="nativeapp", full_name="Native App User", password_hash="hash", auth_provider="local", is_verified=True, google_refresh_token="mock_google_token")
     db_session.add(user)
     db_session.commit()
     db_session.refresh(user)
@@ -963,8 +965,10 @@ def test_gdrive_native_app_export(db_session: Session, storage_root: Path, fake_
     db_session.refresh(dataset)
 
     monkeypatch.setattr(gdrive_service, "redis_server", fake_redis)
+    monkeypatch.setattr(gdrive_service, "_get_gdrive_file_metadata", lambda file_id, token: {"name": "My Google Doc", "mimeType": "application/vnd.google-apps.document", "size": "0"})
 
     bg_tasks = BackgroundTasks()
+
 
     # 1. Initiate ingestion for a Google Doc (native Workspace app)
     response = gdrive_service.initiate_gdrive_ingestion(
@@ -1078,7 +1082,7 @@ def test_encode_sharepoint_url() -> None:
 
 def test_initiate_sharepoint_ingestion_rosetta_hit(db_session: Session, storage_root: Path, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
     """Rosetta Stone hit should instantly finalize ingestion with 0 network or disk I/O."""
-    user = User(email="rosetta-user@example.com", username="rosettauser", full_name="Rosetta User", password_hash="hash", auth_provider="local", is_verified=True)
+    user = User(email="rosetta-user@example.com", username="rosettauser", full_name="Rosetta User", password_hash="hash", auth_provider="local", is_verified=True, microsoft_refresh_token="mock_microsoft_token")
     db_session.add(user)
     db_session.commit()
     db_session.refresh(user)
@@ -1116,8 +1120,11 @@ def test_initiate_sharepoint_ingestion_rosetta_hit(db_session: Session, storage_
     db_session.commit()
 
     monkeypatch.setattr(sharepoint_service, "redis_server", fake_redis)
+    monkeypatch.setattr(sharepoint_service, "get_user_microsoft_access_token", lambda u: "mock_access_token")
+    monkeypatch.setattr(sharepoint_service, "_get_sharepoint_item_metadata", lambda file_id, token: {"name": "rosetta_sample.pdf", "size": 100, "file": {"hashes": {"quickXorHash": "learned_quick_xor_hash_777"}}, "@microsoft.graph.downloadUrl": "https://download"})
 
     bg_tasks = BackgroundTasks()
+
 
     # 3. Initiate ingestion with matching quick_xor_hash -> Rosetta Hit!
     res = sharepoint_service.initiate_sharepoint_ingestion(

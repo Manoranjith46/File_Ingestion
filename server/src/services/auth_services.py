@@ -56,6 +56,26 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _ensure_utc(dt: datetime) -> datetime:
+    """Return a timezone-aware UTC datetime, attaching UTC if the input is naive.
+
+    SQLite and some other database drivers strip timezone information when
+    storing ``DateTime`` columns, so stored values may be read back as
+    offset-naive datetimes.  This helper normalises them so comparisons
+    against ``_now()`` (which is always UTC-aware) do not raise
+    ``TypeError: can't compare offset-naive and offset-aware datetimes``.
+
+    Args:
+        dt: The datetime to normalise.
+
+    Returns:
+        datetime: A UTC-aware copy of the input.
+    """
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt
+
+
 def _access_token_ttl() -> timedelta:
     """Return the configured access-token lifetime.
 
@@ -469,7 +489,7 @@ def verify_otp(db: Session, payload: OtpVerifyRequest) -> User:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     if user.otp_code_hash is None or user.otp_code_expires_at is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No active OTP challenge")
-    if user.otp_code_expires_at <= _now():
+    if _ensure_utc(user.otp_code_expires_at) <= _now():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OTP has expired")
     if user.otp_attempts >= 5:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="OTP attempts exceeded")
@@ -535,7 +555,7 @@ def reset_password(db: Session, payload: PasswordResetConfirmRequest) -> User:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     if user.password_reset_token_hash is None or user.password_reset_expires_at is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No active reset challenge")
-    if user.password_reset_expires_at <= _now():
+    if _ensure_utc(user.password_reset_expires_at) <= _now():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Reset token has expired")
     if not verify_secret(payload.reset_token, user.password_reset_token_hash):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid reset token")

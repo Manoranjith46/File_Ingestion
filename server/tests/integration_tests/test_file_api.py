@@ -26,5 +26,6 @@ def client() -> httpx.AsyncClient:
 @pytest.mark.asyncio
 async def test_dataset_creation_requires_auth_header(client: httpx.AsyncClient) -> None:
     """Dataset creation should reject requests without an authorization header."""
-    response = await client.post("/v1/datasets", json={"name": "Remote"})
+    response = await client.post("/v1/datasets", json={"name": "Remote", "language": "English"})
     assert response.status_code == 401
+
