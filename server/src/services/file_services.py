@@ -40,13 +40,38 @@ from schemas.file_schema import (
 UPLOAD_ROOT = Path(get_env("UPLOAD_STORAGE_DIR", default=str(Path(__file__).resolve().parents[2] / "uploads"), required=False))
 PARTS_ROOT = UPLOAD_ROOT / ".parts"
 FINAL_ROOT = UPLOAD_ROOT / "files"
+LOCAL_STORAGE_DIR = FINAL_ROOT / "Local"
+GDRIVE_STORAGE_DIR = FINAL_ROOT / "GDrive"
+SHAREPOINT_STORAGE_DIR = FINAL_ROOT / "Sharepoint"
 SESSION_TTL_SECONDS = int(get_env("UPLOAD_SESSION_TTL_SECONDS", default="3600", required=False))
 
 
 def _ensure_storage_dirs() -> None:
-    """Ensure upload storage directories exist."""
+    """Ensure upload storage directories exist for each provider."""
     PARTS_ROOT.mkdir(parents=True, exist_ok=True)
     FINAL_ROOT.mkdir(parents=True, exist_ok=True)
+    LOCAL_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    GDRIVE_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    SHAREPOINT_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_storage_root_for_provider(source_type: str | UploadedFileSourceType | None) -> Path:
+    """Return the designated storage directory for a file based on its source type / provider."""
+    if isinstance(source_type, UploadedFileSourceType):
+        val = source_type.value
+    else:
+        val = str(source_type) if source_type else "Local"
+
+    val_lower = val.lower()
+    if "gdrive" in val_lower or "google" in val_lower:
+        dir_path = GDRIVE_STORAGE_DIR
+    elif "sharepoint" in val_lower or "onedrive" in val_lower or "microsoft" in val_lower:
+        dir_path = SHAREPOINT_STORAGE_DIR
+    else:
+        dir_path = LOCAL_STORAGE_DIR
+
+    dir_path.mkdir(parents=True, exist_ok=True)
+    return dir_path
 
 
 def _meta_key(upload_id: str) -> str:
@@ -547,9 +572,10 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
             shutil.rmtree(parts_dir, ignore_errors=True)
         else:
             # Perform chunk assembly
+            target_root = get_storage_root_for_provider(source_type_value)
             parts_dir = _parts_dir(payload.upload_id)
             staging_file_id = str(uuid4())
-            staging_path = FINAL_ROOT / f"{staging_file_id}.pending"
+            staging_path = target_root / f"{staging_file_id}.pending"
             try:
                 with staging_path.open("wb") as destination:
                     for index in range(total_chunks):
@@ -561,13 +587,7 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
                             shutil.copyfileobj(source, destination)
 
                 final_file_id = str(uuid4())
-                final_filename = _uploaded_filename(meta["filename"])
-                final_path = FINAL_ROOT / final_filename
-                if final_path.exists():
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail="A file with this name already exists.",
-                    )
+                final_path = _get_unique_filename(target_root, meta["filename"])
                 staging_path.replace(final_path)
                 file_size_bytes = final_path.stat().st_size
 

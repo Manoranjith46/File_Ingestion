@@ -29,7 +29,7 @@ from models.file_model import (
     UploadedFileSourceType,
 )
 from schemas.file_schema import GDriveIngestResponse
-from services.file_services import FINAL_ROOT, _uploaded_filename, _get_unique_filename, _sync_dataset_status_from_mappings
+from services.file_services import FINAL_ROOT, GDRIVE_STORAGE_DIR, _uploaded_filename, _get_unique_filename, _sync_dataset_status_from_mappings
 from helpers.get_env import get_env
 
 logger = logging.getLogger(__name__)
@@ -376,9 +376,10 @@ def process_gdrive_ingestion_job(
             raise ValueError("No download stream available and no Google credentials provided")
 
         # 2. Prepare staging file and incremental SHA-256 calculation
+        target_root = GDRIVE_STORAGE_DIR
         staging_file_id = str(uuid4())
-        staging_path = FINAL_ROOT / f"{staging_file_id}.pending"
-        FINAL_ROOT.mkdir(parents=True, exist_ok=True)
+        staging_path = target_root / f"{staging_file_id}.pending"
+        target_root.mkdir(parents=True, exist_ok=True)
 
         sha256_hash = hashlib.sha256()
         downloaded_bytes = 0
@@ -420,7 +421,7 @@ def process_gdrive_ingestion_job(
         else:
             # Save new physical file
             final_file_id = str(uuid4())
-            final_path = _get_unique_filename(FINAL_ROOT, filename)
+            final_path = _get_unique_filename(target_root, filename)
             staging_path.replace(final_path)
 
             new_uploaded_file = UploadedFile(
