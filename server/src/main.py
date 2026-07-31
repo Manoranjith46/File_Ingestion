@@ -19,6 +19,7 @@ load_environment_variables()
 from models.auth_model import Base
 from models import file_model  # noqa: F401
 from services.cleanup_scheduler import start_cleanup_scheduler
+from services.ftp_watcher import start_ftp_watcher
 from routes.file_routes import file_router
 from routes.auth_routes import auth_router
 
@@ -31,6 +32,7 @@ async def lifespan(app: FastAPI):
     redis_server_status()
     Check_db_Connection()
     start_cleanup_scheduler()
+    start_ftp_watcher()
     Base.metadata.create_all(bind=get_engine())
     yield
 
