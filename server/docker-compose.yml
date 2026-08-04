@@ -57,6 +57,7 @@ services:
     volumes:
       # Both containers now share the exact same virtual drive
       - uploads-data:/ftp
+      # - D:\Zenteiq\Tasks\uploads:/ftp
     restart: unless-stopped
 
 volumes:
