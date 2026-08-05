@@ -101,6 +101,9 @@ class UploadTreeNode(BaseModel):
     type: str
     name: str
     size: int | None = None
+    dataset_name: str | None = None
+    status: str | None = None
+    source_type: str | None = None
     children: list["UploadTreeNode"] | None = None
 
 

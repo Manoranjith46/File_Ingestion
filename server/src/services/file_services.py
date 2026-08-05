@@ -238,9 +238,10 @@ def _build_tree(
     """
     Construct the nested upload tree for a user, optionally filtered by dataset or folder.
     """
+    dataset = None
     if dataset_id:
         try:
-            get_dataset_by_id(db, user, dataset_id)
+            dataset = get_dataset_by_id(db, user, dataset_id)
         except HTTPException as exc:
             if exc.status_code == status.HTTP_404_NOT_FOUND:
                 return UploadsTreeResponse(id=str(uuid4()), type="folder", name="root", children=[])
@@ -248,10 +249,24 @@ def _build_tree(
 
     if folder_id:
         root_folder = _get_folder_by_id(db, user, folder_id)
-        root = UploadsTreeResponse(id=root_folder.id, type="folder", name=root_folder.name, children=[])
+        root = UploadsTreeResponse(
+            id=root_folder.id,
+            type="folder",
+            name=root_folder.name,
+            dataset_name=dataset.name if dataset else None,
+            status=dataset.status if dataset else None,
+            children=[],
+        )
         scoped_folder_ids = _collect_descendant_folder_ids(db, user, root_folder.id)
     else:
-        root = UploadsTreeResponse(id=str(uuid4()), type="folder", name="root", children=[])
+        root = UploadsTreeResponse(
+            id=str(uuid4()),
+            type="folder",
+            name="root",
+            dataset_name=dataset.name if dataset else None,
+            status=dataset.status if dataset else None,
+            children=[],
+        )
         scoped_folder_ids = set()
 
     mapping_query = (
@@ -293,7 +308,14 @@ def _build_tree(
         if folder_id and folder.id == root.id:
             folder_map[folder.id] = root
             continue
-        node = UploadsTreeResponse(id=folder.id, type="folder", name=folder.name, children=[])
+        node = UploadsTreeResponse(
+            id=folder.id,
+            type="folder",
+            name=folder.name,
+            dataset_name=dataset.name if dataset else None,
+            status=dataset.status if dataset else None,
+            children=[],
+        )
         folder_map[folder.id] = node
 
     for folder in folders:
@@ -309,12 +331,16 @@ def _build_tree(
         uploaded_file = db.query(UploadedFile).filter(UploadedFile.id == m.file_id).first()
         if not uploaded_file:
             continue
+        dataset_for_mapping = db.query(Dataset).filter(Dataset.id == m.dataset_id, Dataset.is_deleted == False).one_or_none()
         parent_id = m.folder_id or "root"
         node = UploadsTreeResponse(
             id=uploaded_file.id,
             type="file",
             name=uploaded_file.filename,
             size=uploaded_file.file_size_bytes,
+            dataset_name=dataset_for_mapping.name if dataset_for_mapping else None,
+            status=dataset_for_mapping.status if dataset_for_mapping else None,
+            source_type=uploaded_file.source_type.value if uploaded_file.source_type else None,
         )
         if parent_id in folder_map:
             folder_map[parent_id].children = folder_map[parent_id].children or []

@@ -655,7 +655,13 @@ def test_get_dataset_tree_for_dataset_returns_nested_tree(db_session: Session) -
     db_session.refresh(user)
 
     dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Tree Dataset", language="English"))
-    uploaded_file = UploadedFile(filename="tree.txt", file_size_bytes=4, master_hash="t" * 64, physical_path="/tmp/tree.txt")
+    uploaded_file = UploadedFile(
+        filename="tree.txt",
+        file_size_bytes=4,
+        master_hash="t" * 64,
+        physical_path="/tmp/tree.txt",
+        source_type=UploadedFileSourceType.FTP,
+    )
     db_session.add(uploaded_file)
     db_session.commit()
     db_session.refresh(uploaded_file)
@@ -667,7 +673,15 @@ def test_get_dataset_tree_for_dataset_returns_nested_tree(db_session: Session) -
     tree = file_services.get_dataset_tree_for_dataset(db_session, user, dataset.id)
 
     assert tree.type == "folder"
-    assert any(child.type == "file" and child.name == "tree.txt" for child in tree.children)
+    file_children = [child for child in tree.children or [] if child.type == "file"]
+    assert any(child.name == "tree.txt" for child in file_children)
+    assert any(
+        child.name == "tree.txt"
+        and child.dataset_name == dataset.name
+        and child.status == dataset.status
+        and child.source_type == uploaded_file.source_type.value
+        for child in file_children
+    )
 
 
 def test_attach_file_to_dataset_requires_user_ownership(db_session: Session) -> None:
