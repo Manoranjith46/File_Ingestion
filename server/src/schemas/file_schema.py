@@ -136,9 +136,11 @@ class DatasetResponse(BaseModel):
     id: str
     user_id: str
     name: str
+    dataset_name: str | None = None
     description: str | None = None
     status: DatasetStatus = "Created"
     language: DatasetLanguage | None = None
+    source_type: str | None = None
     created_at: datetime
     updated_at: datetime
     file_count: int

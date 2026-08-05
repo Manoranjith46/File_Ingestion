@@ -238,6 +238,8 @@ def test_create_dataset_happy_path(client: TestClient) -> None:
     assert resp.status_code == 201
     body = resp.json()
     assert body["name"] == "My Dataset"
+    assert body["dataset_name"] == "My Dataset"
+    assert body["source_type"] is None
     assert body["status"] == "Created"
     assert body["file_count"] == 0
     assert "id" in body

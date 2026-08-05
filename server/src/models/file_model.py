@@ -46,6 +46,19 @@ class Dataset(Base):
         """Return the number of files linked to this dataset."""
         return len(self.mappings)
 
+    @property
+    def dataset_name(self) -> str:
+        """Return the canonical dataset name under the response field expected by clients."""
+        return self.name
+
+    @property
+    def source_type(self) -> str | None:
+        """Return a single source type for this dataset when it can be inferred from linked files."""
+        for mapping in self.mappings:
+            if mapping.file and mapping.file.source_type is not None:
+                return mapping.file.source_type.value
+        return None
+
 
 class Folder(Base):
     """Represent a folder created by a user in the virtual upload tree."""
