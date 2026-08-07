@@ -86,9 +86,18 @@ def login(payload: LoginRequest, response: Response, db: Session = Depends(get_d
         httponly=True,
         secure=False,
         samesite="lax",
-        path="/auth",
+        path="/",
+    )
+    response.set_cookie(
+        "access_token",
+        access_token,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        path="/",
     )
     response.headers["Authorization"] = f"Bearer {access_token}"
+    response.headers["X-Refresh-Token"] = refresh_token
     return session
 
 
@@ -117,12 +126,18 @@ def logout(
     user = get_current_user(db, access_token)
     revoke_session(db, user, refresh_token)
     if refresh_token is not None:
-        response.delete_cookie("refresh_token", path="/auth")
+        response.delete_cookie("refresh_token", path="/")
+    response.delete_cookie("access_token", path="/")
     return MessageResponse(message="Logged out successfully")
 
 
 @auth_router.post("/refresh", response_model=TokenPairResponse)
-def refresh(response: Response, refresh_token: str | None = Cookie(default=None), db: Session = Depends(get_db)):
+def refresh(
+    response: Response,
+    refresh_token: str | None = Cookie(default=None),
+    x_refresh_token: str | None = Header(default=None, alias="X-Refresh-Token"),
+    db: Session = Depends(get_db),
+):
     """
     Rotate a refresh token and return a fresh access token pair.
 
@@ -134,18 +149,28 @@ def refresh(response: Response, refresh_token: str | None = Cookie(default=None)
     Returns:
         TokenPairResponse: The token pair response containing public user profile details and new access token.
     """
-    if refresh_token is None:
+    effective_refresh_token = x_refresh_token or refresh_token
+    if effective_refresh_token is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing refresh token")
-    session, access_token, new_refresh_token = issue_token_pair(db, resolve_refresh_user(db, refresh_token))
+    session, access_token, new_refresh_token = issue_token_pair(db, resolve_refresh_user(db, effective_refresh_token))
     response.set_cookie(
         "refresh_token",
         new_refresh_token,
         httponly=True,
         secure=False,
         samesite="lax",
-        path="/auth",
+        path="/",
+    )
+    response.set_cookie(
+        "access_token",
+        access_token,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        path="/",
     )
     response.headers["Authorization"] = f"Bearer {access_token}"
+    response.headers["X-Refresh-Token"] = new_refresh_token
     return session
 
 
@@ -189,9 +214,18 @@ def verify_signup_endpoint(payload: OtpVerifyRequest, response: Response, db: Se
         httponly=True,
         secure=False,
         samesite="lax",
-        path="/auth",
+        path="/",
+    )
+    response.set_cookie(
+        "access_token",
+        access_token,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        path="/",
     )
     response.headers["Authorization"] = f"Bearer {access_token}"
+    response.headers["X-Refresh-Token"] = refresh_token
     return session
 
 
@@ -291,6 +325,14 @@ def google_callback(
         samesite="lax",
         path="/",
     )
+    redirect_response.set_cookie(
+        "access_token",
+        access_token,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        path="/",
+    )
     redirect_response.delete_cookie("google_oauth_state", path="/")
     return redirect_response
 
@@ -354,6 +396,14 @@ def microsoft_callback(
     redirect_response.set_cookie(
         "refresh_token",
         refresh_token,
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        path="/",
+    )
+    redirect_response.set_cookie(
+        "access_token",
+        access_token,
         httponly=True,
         secure=False,
         samesite="lax",

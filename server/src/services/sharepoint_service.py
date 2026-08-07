@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 import base64
 import logging
 import requests as http_requests
-from fastapi import BackgroundTasks, HTTPException, status
+from fastapi import BackgroundTasks
 
 from config.database import get_session_local
 from config.redis_server import server as redis_server
@@ -31,6 +31,8 @@ from models.file_model import (
 from schemas.file_schema import SharepointIngestResponse, SharepointItem, SharepointTreeResponse
 from services.file_services import FINAL_ROOT, SHAREPOINT_STORAGE_DIR, _uploaded_filename, _get_unique_filename, _sync_dataset_status_from_mappings
 from helpers.get_env import get_env
+from helpers.crypto import decrypt_str
+from utils.errors import DatasetNotFoundError, IntegrationConnectionError, IntegrationRequestError
 
 logger = logging.getLogger(__name__)
 
@@ -54,29 +56,25 @@ def encode_sharepoint_url(sharepoint_url: str) -> str:
 def get_user_microsoft_access_token(user: User) -> str:
     """Obtain a fresh Microsoft Graph API access token using the user's stored refresh token."""
     if not user.microsoft_refresh_token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Microsoft account not connected. Please authenticate via Microsoft OAuth.",
-        )
+        raise IntegrationConnectionError(message="Microsoft account not connected. Please authenticate via Microsoft OAuth.")
     client_id = get_env("MICROSOFT_CLIENT_ID", default="", required=False).strip()
     client_secret = get_env("MICROSOFT_CLIENT_SECRET", default="", required=False).strip()
     tenant = get_env("MICROSOFT_TENANT_ID", default="common", required=False).strip() or "common"
 
     token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+    # decrypt stored refresh token before sending to Microsoft
+    refresh_token = decrypt_str(user.microsoft_refresh_token)
     payload = {
         "client_id": client_id,
         "client_secret": client_secret,
         "grant_type": "refresh_token",
-        "refresh_token": user.microsoft_refresh_token,
+        "refresh_token": refresh_token,
         "scope": "offline_access User.Read Files.Read.All Sites.Read.All",
     }
     resp = http_requests.post(token_url, data=payload, timeout=30)
     if resp.status_code != 200:
         logger.error(f"Failed to refresh Microsoft token: {resp.text}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Failed to refresh Microsoft access token. Please re-connect your Microsoft account.",
-        )
+        raise IntegrationRequestError(message="Failed to refresh Microsoft access token. Please re-connect your Microsoft account.")
     return resp.json().get("access_token")
 
 
@@ -157,7 +155,7 @@ def initiate_sharepoint_ingestion(
     # Verify dataset ownership
     dataset = db.query(Dataset).filter(Dataset.id == dataset_id, Dataset.user_id == user.id, Dataset.is_deleted.is_(False)).one_or_none()
     if dataset is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found or access denied")
+        raise DatasetNotFoundError(message="Dataset not found or access denied")
 
     if folder_id:
         folder = db.query(Folder).filter(Folder.id == folder_id, Folder.user_id == user.id).one_or_none()
@@ -166,10 +164,7 @@ def initiate_sharepoint_ingestion(
 
     # Verify user has connected Microsoft account
     if not user.microsoft_refresh_token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Microsoft account not connected. Please authenticate via Microsoft OAuth.",
-        )
+        raise IntegrationConnectionError(message="Microsoft account not connected. Please authenticate via Microsoft OAuth.")
 
     # Fetch Microsoft access token
     access_token = get_user_microsoft_access_token(user)
@@ -262,9 +257,9 @@ def initiate_sharepoint_ingestion(
 
     lock_acquired = redis_server.set(lock_key, job_id, nx=True, ex=3600)
     if not lock_acquired:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="An ingestion job for this SharePoint file is already in progress.",
+        raise IntegrationRequestError(
+            message="An ingestion job for this SharePoint file is already in progress.",
+            http_status=409,
         )
 
     job = AsyncIngestionJob(
@@ -281,7 +276,8 @@ def initiate_sharepoint_ingestion(
     db.add(job)
     db.commit()
 
-    microsoft_refresh_token = user.microsoft_refresh_token
+    # decrypt stored microsoft refresh token before passing to background worker
+    microsoft_refresh_token = decrypt_str(user.microsoft_refresh_token)
 
     background_tasks.add_task(
         process_sharepoint_ingestion_job,
@@ -334,10 +330,7 @@ def get_sharepoint_tree(
         HTTPException: If the user has not connected their Microsoft account.
     """
     if not user.microsoft_refresh_token and raw_graph_items is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Microsoft account not connected. Please authenticate via Microsoft OAuth.",
-        )
+        raise IntegrationConnectionError(message="Microsoft account not connected. Please authenticate via Microsoft OAuth.")
 
     if raw_graph_items is None and user.microsoft_refresh_token:
         try:

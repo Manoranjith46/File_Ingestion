@@ -9,19 +9,24 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config.database import Check_db_Connection, get_engine
+from utils.errors import APIErrors
 from config.redis_server import redis_server_status
 from helpers.get_env import get_env
 from helpers.get_env import load_environment_variables
+from middlewares.audit_middleware import AuditMiddleware
 
 # Load environment variables before importing modules that depend on them.
 load_environment_variables()
 
 from models.auth_model import Base
 from models import file_model  # noqa: F401
+from models import audit_model  # noqa: F401
 from services.cleanup_scheduler import start_cleanup_scheduler
 from services.ftp_watcher import start_ftp_watcher
 from routes.file_routes import file_router
 from routes.auth_routes import auth_router
+from routes.audit_routes import audit_router
+from services.audit_worker import start_audit_worker
 
 
 @asynccontextmanager
@@ -33,6 +38,7 @@ async def lifespan(app: FastAPI):
     Check_db_Connection()
     start_cleanup_scheduler()
     start_ftp_watcher()
+    await start_audit_worker()
     Base.metadata.create_all(bind=get_engine())
     yield
 
@@ -57,10 +63,18 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Authorization"],
 )
+app.add_middleware(AuditMiddleware)
 
 app.include_router(auth_router, prefix="/auth", tags=["Authentication"])
 app.include_router(auth_router, prefix="/v1/auth", tags=["Authentication Alias"])
 app.include_router(file_router, prefix="/v1", tags=["File Ingestion"])
+app.include_router(audit_router, tags=["Audit"])
+
+
+@app.exception_handler(APIErrors)
+async def event_portal_error_handler(request, exc: APIErrors):
+    """Return a standardized JSON payload for centralized domain errors."""
+    return exc.to_response()
 
 
 @app.get("/v1/health")

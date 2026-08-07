@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Generator
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
@@ -53,6 +53,7 @@ from schemas.auth_schema import (  # noqa: E402
     PasswordResetRequest,
     RegisterRequest,
 )
+from routes import auth_routes  # noqa: E402
 from services import auth_services  # noqa: E402
 from helpers import jwt as jwt_helpers  # noqa: E402
 
@@ -187,6 +188,32 @@ def verified_user(db_session: Session, fake_redis: FakeRedis) -> User:
 # ===========================================================================
 # U-A-01 — create_user: happy path
 # ===========================================================================
+def test_refresh_accepts_refresh_token_from_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The refresh endpoint should accept a refresh token passed via header for browser-safe flows."""
+
+    monkeypatch.setattr(auth_routes, "resolve_refresh_user", lambda db, token: object())
+    monkeypatch.setattr(auth_routes, "issue_token_pair", lambda db, user: (object(), "new-access-token", "new-refresh-token"))
+
+    response = Response()
+    auth_routes.refresh(response, refresh_token=None, x_refresh_token="header-refresh-token", db=None)
+
+    assert response.headers["Authorization"] == "Bearer new-access-token"
+    assert response.headers["X-Refresh-Token"] == "new-refresh-token"
+
+
+def test_login_sets_refresh_cookie_on_root_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Login should issue a refresh cookie that is visible to API subpaths in the browser."""
+
+    monkeypatch.setattr(auth_routes, "authenticate_user", lambda db, payload: object())
+    monkeypatch.setattr(auth_routes, "issue_token_pair", lambda db, user: (object(), "access-token", "refresh-token"))
+
+    response = Response()
+    auth_routes.login(LoginRequest(identifier="user@example.com", password="password123"), response, db=None)
+
+    assert "refresh_token=refresh-token" in response.headers["set-cookie"]
+    assert "Path=/" in response.headers["set-cookie"]
+
+
 def test_create_user_happy_path(db_session: Session) -> None:
     """New user should be persisted with correct fields and is_verified=False."""
     payload = RegisterRequest(

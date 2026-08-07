@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 import re
 import requests as http_requests
 from google.oauth2.credentials import Credentials
-from fastapi import BackgroundTasks, HTTPException, status
+from fastapi import BackgroundTasks
 
 from config.database import get_session_local
 from config.redis_server import server as redis_server
@@ -31,6 +31,8 @@ from models.file_model import (
 from schemas.file_schema import GDriveIngestResponse
 from services.file_services import FINAL_ROOT, GDRIVE_STORAGE_DIR, _uploaded_filename, _get_unique_filename, _sync_dataset_status_from_mappings
 from helpers.get_env import get_env
+from helpers.crypto import decrypt_str
+from utils.errors import IntegrationConnectionError, IntegrationRequestError, DatasetNotFoundError, InvalidRelativePathError
 
 logger = logging.getLogger(__name__)
 
@@ -71,18 +73,13 @@ def _build_google_credentials(refresh_token: str) -> Credentials:
 def get_user_google_access_token(user: User) -> str:
     """Obtain a fresh Google OAuth2 access token for the authenticated user."""
     if not user.google_refresh_token:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Google account not connected. Please connect your Google account first.",
-        )
-    creds = _build_google_credentials(user.google_refresh_token)
+        raise IntegrationConnectionError(message="Google account not connected. Please connect your Google account first.")
+    refresh_token = decrypt_str(user.google_refresh_token)
+    creds = _build_google_credentials(refresh_token)
     from google.auth.transport.requests import Request as GoogleAuthRequest
     creds.refresh(GoogleAuthRequest())
     if not creds.token:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to obtain Google access token.",
-        )
+        raise IntegrationRequestError(message="Failed to obtain Google access token.")
     return creds.token
 
 
@@ -227,12 +224,12 @@ def initiate_gdrive_ingestion(
     """
     gdrive_file_id = extract_gdrive_file_id(file_id_or_url)
     if not gdrive_file_id:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid Google Drive file ID or URL")
+        raise IntegrationRequestError(message="Invalid Google Drive file ID or URL")
 
     # Verify dataset ownership
     dataset = db.query(Dataset).filter(Dataset.id == dataset_id, Dataset.user_id == user.id, Dataset.is_deleted.is_(False)).one_or_none()
     if dataset is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found or access denied")
+        raise DatasetNotFoundError(message="Dataset not found or access denied")
 
     if folder_id:
         folder = db.query(Folder).filter(Folder.id == folder_id, Folder.user_id == user.id).one_or_none()
@@ -241,16 +238,14 @@ def initiate_gdrive_ingestion(
 
     # Verify user has a connected Google account with refresh token
     if not user.google_refresh_token:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Google account not connected. Please connect your Google account first via OAuth.",
-        )
+        raise IntegrationConnectionError(message="Google account not connected. Please connect your Google account first via OAuth.")
 
     is_native_app = is_google_apps_mime(mime_type)
 
     # Fetch file metadata from Google Drive API to get real filename and mime type
     try:
-        file_meta = _get_gdrive_file_metadata(gdrive_file_id, user.google_refresh_token)
+        decrypted_refresh = decrypt_str(user.google_refresh_token)
+        file_meta = _get_gdrive_file_metadata(gdrive_file_id, decrypted_refresh)
         logger.info(f"GDrive file metadata: {file_meta}")
         if not filename:
             filename = file_meta.get("name", f"gdrive_{gdrive_file_id}")
@@ -268,9 +263,9 @@ def initiate_gdrive_ingestion(
     # Redis SETNX Lock to prevent duplicate concurrent downloads of the same GDrive file
     lock_acquired = redis_server.set(lock_key, job_id, nx=True, ex=3600)
     if not lock_acquired:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="An ingestion job for this Google Drive file is already in progress.",
+        raise IntegrationRequestError(
+            message="An ingestion job for this Google Drive file is already in progress.",
+            http_status=409,
         )
 
     # Determine default filename; append .pdf for native apps if no extension provided
@@ -294,7 +289,7 @@ def initiate_gdrive_ingestion(
     db.commit()
 
     # Pass the user's refresh token and mime_type so the background worker can download
-    google_refresh_token = user.google_refresh_token
+    google_refresh_token = decrypt_str(user.google_refresh_token)
 
     background_tasks.add_task(
         process_gdrive_ingestion_job,

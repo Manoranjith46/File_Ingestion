@@ -11,7 +11,6 @@ from urllib.parse import urlencode
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
-from fastapi import HTTPException, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 import logging
@@ -33,6 +32,7 @@ from helpers.jwt import (
     verify_password,
     verify_secret,
 )
+from helpers.crypto import encrypt_str, decrypt_str
 from models.auth_model import User
 from config.redis_server import server as redis_server, active_session_limiter
 from schemas.auth_schema import (
@@ -44,6 +44,25 @@ from schemas.auth_schema import (
     PublicUserSchema,
     RegisterRequest,
     TokenPairResponse,
+)
+from utils.errors import (
+    AccountNotVerifiedError,
+    ConfigurationError,
+    DuplicateEmailError,
+    DuplicateUsernameError,
+    GoogleTokenExchangeError,
+    InvalidCredentialsError,
+    InvalidOTPError,
+    InvalidResetTokenError,
+    InvalidTokenError,
+    MicrosoftTokenExchangeError,
+    NoActiveOTPChallengeError,
+    NoActiveResetChallengeError,
+    OTPExpiredError,
+    OtpAttemptsExceededError,
+    ResetTokenExpiredError,
+    UnauthorizedAccessError,
+    UserNotFoundError,
 )
 
 
@@ -128,7 +147,7 @@ def _google_client_id() -> str:
         if first_client_id:
             return first_client_id
 
-    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Google client ID is not configured")
+    raise ConfigurationError(message="Google client ID is not configured")
 
 
 def _google_client_secret() -> str:
@@ -139,7 +158,7 @@ def _google_client_secret() -> str:
     """
     client_secret = get_env("GOOGLE_CLIENT_SECRET", default="", required=False).strip()
     if not client_secret:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Google client secret is not configured")
+        raise ConfigurationError(message="Google client secret is not configured")
     return client_secret
 
 
@@ -151,7 +170,7 @@ def _google_redirect_uri() -> str:
     """
     redirect_uri = get_env("GOOGLE_REDIRECT_URI", default="http://localhost:8000/auth/google/callback", required=False).strip()
     if not redirect_uri:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Google redirect URI is not configured")
+        raise ConfigurationError(message="Google redirect URI is not configured")
     return redirect_uri
 
 
@@ -163,7 +182,7 @@ def _frontend_url() -> str:
     """
     frontend_url = get_env("FRONTEND_URL", default="http://localhost:5173", required=False).strip()
     if not frontend_url:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Frontend URL is not configured")
+        raise ConfigurationError(message="Frontend URL is not configured")
     return frontend_url
 
 
@@ -270,9 +289,9 @@ def create_user(db: Session, payload: RegisterRequest) -> User:
     username = payload.username.strip() if payload.username else None
 
     if db.query(User).filter(User.email == email).first() is not None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already exists")
+        raise DuplicateEmailError()
     if username and db.query(User).filter(User.username == username).first() is not None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Username already exists")
+        raise DuplicateUsernameError()
 
     user = User(
         email=email,
@@ -303,9 +322,9 @@ def authenticate_user(db: Session, payload: LoginRequest) -> User:
     """
     user = _find_user_by_identifier(db, payload.identifier)
     if user is None or not verify_password(payload.password, user.password_hash):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid login credentials")
+        raise InvalidCredentialsError()
     if not user.is_verified:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User account is not verified")
+        raise AccountNotVerifiedError()
 
     user.last_login_at = _now()
     db.commit()
@@ -360,9 +379,9 @@ def resolve_refresh_user(db: Session, refresh_token: str) -> User:
     payload = decode_refresh_token(refresh_token)
     user = db.query(User).filter(User.id == payload["sub"]).one_or_none()
     if user is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        raise UnauthorizedAccessError(message="User not found")
     if user.token_version != payload.get("token_version"):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token has been revoked")
+        raise UnauthorizedAccessError(message="Refresh token has been revoked")
 
     # Validate session ID (sid) in Redis ZSET
     sid = payload.get("sid")
@@ -370,7 +389,7 @@ def resolve_refresh_user(db: Session, refresh_token: str) -> User:
         zset_key = f"user:sessions:{user.id}"
         score = redis_server.zscore(zset_key, sid)
         if score is None:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session has been evicted or invalidated")
+            raise UnauthorizedAccessError(message="Session has been evicted or invalidated")
 
     return user
 
@@ -391,9 +410,9 @@ def get_current_user(db: Session, access_token: str) -> User:
     payload = decode_access_token(access_token)
     user = db.query(User).filter(User.id == payload["sub"]).one_or_none()
     if user is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        raise UnauthorizedAccessError(message="User not found")
     if user.token_version != payload.get("token_version"):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has been revoked")
+        raise UnauthorizedAccessError(message="Token has been revoked")
     return user
 
 
@@ -456,7 +475,7 @@ def request_otp(db: Session, payload: OtpRequest) -> tuple[User, str, datetime]:
     email = payload.email.strip().lower() if isinstance(payload.email, str) else payload.email
     user = db.query(User).filter(func.lower(User.email) == email).one_or_none()
     if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        raise UserNotFoundError()
 
     otp_code = generate_otp_code()
     expires_at = _now() + _otp_token_ttl()
@@ -486,18 +505,18 @@ def verify_otp(db: Session, payload: OtpVerifyRequest) -> User:
     email = payload.email.strip().lower() if isinstance(payload.email, str) else payload.email
     user = db.query(User).filter(func.lower(User.email) == email).one_or_none()
     if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        raise UserNotFoundError()
     if user.otp_code_hash is None or user.otp_code_expires_at is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No active OTP challenge")
+        raise NoActiveOTPChallengeError()
     if _ensure_utc(user.otp_code_expires_at) <= _now():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OTP has expired")
+        raise OTPExpiredError()
     if user.otp_attempts >= 5:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="OTP attempts exceeded")
+        raise OtpAttemptsExceededError()
 
     user.otp_attempts += 1
     if not verify_secret(payload.otp_code, user.otp_code_hash):
         db.commit()
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OTP code")
+        raise InvalidOTPError()
 
     user.is_verified = True
     user.otp_code_hash = None
@@ -525,7 +544,7 @@ def request_password_reset(db: Session, payload: PasswordResetRequest) -> tuple[
     email = payload.email.strip().lower() if isinstance(payload.email, str) else payload.email
     user = db.query(User).filter(func.lower(User.email) == email).one_or_none()
     if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        raise UserNotFoundError()
 
     reset_token = secrets.token_urlsafe(32)
     expires_at = _now() + _password_reset_ttl()
@@ -552,13 +571,13 @@ def reset_password(db: Session, payload: PasswordResetConfirmRequest) -> User:
     email = payload.email.strip().lower() if isinstance(payload.email, str) else payload.email
     user = db.query(User).filter(func.lower(User.email) == email).one_or_none()
     if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        raise UserNotFoundError()
     if user.password_reset_token_hash is None or user.password_reset_expires_at is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No active reset challenge")
+        raise NoActiveResetChallengeError()
     if _ensure_utc(user.password_reset_expires_at) <= _now():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Reset token has expired")
+        raise ResetTokenExpiredError()
     if not verify_secret(payload.reset_token, user.password_reset_token_hash):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid reset token")
+        raise InvalidResetTokenError()
 
     user.password_hash = hash_password(payload.new_password)
     user.password_reset_token_hash = None
@@ -588,11 +607,11 @@ def continue_with_google(db: Session, code: str, redirect_uri: str | None = None
         flow.fetch_token(code=code)
     except Exception as err:
         logger.error(f"Fetch token with redirect_uri ({redirect_uri}) failed: {err}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Google token exchange failed: {err}")
+        raise GoogleTokenExchangeError(message=f"Google token exchange failed: {err}")
 
     credentials = flow.credentials
     if not credentials.id_token:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Google token exchange did not return an ID token")
+        raise GoogleTokenExchangeError(message="Google token exchange did not return an ID token")
 
     google_claims = id_token.verify_oauth2_token(
         credentials.id_token,
@@ -606,9 +625,9 @@ def continue_with_google(db: Session, code: str, redirect_uri: str | None = None
     email_verified = bool(google_claims.get("email_verified"))
 
     if not google_subject or not email:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Google token is missing account data")
+        raise GoogleTokenExchangeError(message="Google token is missing account data")
     if not email_verified:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Google account email is not verified")
+        raise GoogleTokenExchangeError(message="Google account email is not verified")
 
     user = db.query(User).filter((User.google_subject == google_subject) | (func.lower(User.email) == (email or "").lower())).one_or_none()
     is_new_user = user is None
@@ -620,7 +639,7 @@ def continue_with_google(db: Session, code: str, redirect_uri: str | None = None
             password_hash=hash_password(secrets.token_urlsafe(32)),
             auth_provider="google",
             google_subject=google_subject,
-            google_refresh_token=credentials.refresh_token,
+            google_refresh_token=encrypt_str(credentials.refresh_token) if credentials.refresh_token else None,
             is_verified=True,
             token_version=1,
         )
@@ -630,7 +649,7 @@ def continue_with_google(db: Session, code: str, redirect_uri: str | None = None
         user.auth_provider = "google"
         user.is_verified = True
         if credentials.refresh_token:
-            user.google_refresh_token = credentials.refresh_token
+            user.google_refresh_token = encrypt_str(credentials.refresh_token)
         if full_name and not user.full_name:
             user.full_name = full_name
 
@@ -651,7 +670,7 @@ def _microsoft_client_id() -> str:
     """Return the configured Microsoft OAuth client ID."""
     client_id = get_env("MICROSOFT_CLIENT_ID", default="", required=False).strip()
     if not client_id:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Microsoft client ID is not configured")
+        raise ConfigurationError(message="Microsoft client ID is not configured")
     return client_id
 
 
@@ -659,7 +678,7 @@ def _microsoft_client_secret() -> str:
     """Return the configured Microsoft OAuth client secret."""
     client_secret = get_env("MICROSOFT_CLIENT_SECRET", default="", required=False).strip()
     if not client_secret:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Microsoft client secret is not configured")
+        raise ConfigurationError(message="Microsoft client secret is not configured")
     return client_secret
 
 
@@ -728,14 +747,14 @@ def continue_with_microsoft(db: Session, code: str, redirect_uri: str | None = N
     resp = requests.post(token_url, data=payload, timeout=30)
     if resp.status_code != 200:
         logger.error(f"Microsoft token exchange failed: {resp.text}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Microsoft token exchange failed: {resp.text}")
+        raise MicrosoftTokenExchangeError(message=f"Microsoft token exchange failed: {resp.text}")
 
     token_data = resp.json()
     access_token = token_data.get("access_token")
     refresh_token = token_data.get("refresh_token")
 
     if not access_token:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Microsoft token exchange did not return an access token")
+        raise MicrosoftTokenExchangeError(message="Microsoft token exchange did not return an access token")
 
     # Fetch Microsoft User Profile
     profile_resp = requests.get(
@@ -745,14 +764,14 @@ def continue_with_microsoft(db: Session, code: str, redirect_uri: str | None = N
     )
     if profile_resp.status_code != 200:
         logger.error(f"Microsoft user profile fetch failed: {profile_resp.text}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Failed to fetch Microsoft user profile")
+        raise MicrosoftTokenExchangeError(message="Failed to fetch Microsoft user profile")
 
     profile = profile_resp.json()
     email = profile.get("mail") or profile.get("userPrincipalName")
     full_name = profile.get("displayName")
 
     if not email:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Microsoft account profile is missing email")
+        raise MicrosoftTokenExchangeError(message="Microsoft account profile is missing email")
 
     user = db.query(User).filter((func.lower(User.email) == email.lower())).one_or_none()
     is_new_user = user is None
@@ -764,7 +783,7 @@ def continue_with_microsoft(db: Session, code: str, redirect_uri: str | None = N
             full_name=full_name,
             password_hash=hash_password(secrets.token_urlsafe(32)),
             auth_provider="microsoft",
-            microsoft_refresh_token=refresh_token,
+            microsoft_refresh_token=encrypt_str(refresh_token) if refresh_token else None,
             is_verified=True,
             token_version=1,
         )
@@ -773,7 +792,7 @@ def continue_with_microsoft(db: Session, code: str, redirect_uri: str | None = N
         user.auth_provider = "microsoft"
         user.is_verified = True
         if refresh_token:
-            user.microsoft_refresh_token = refresh_token
+            user.microsoft_refresh_token = encrypt_str(refresh_token)
         if full_name and not user.full_name:
             user.full_name = full_name
 

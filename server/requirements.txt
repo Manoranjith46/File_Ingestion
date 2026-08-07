@@ -12,3 +12,4 @@ psycopg2-binary
 alembic
 python-multipart
 httpx
+cryptography>=40.0.0

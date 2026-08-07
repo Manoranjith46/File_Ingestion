@@ -10,7 +10,6 @@ from math import ceil
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import HTTPException, status
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
@@ -35,6 +34,23 @@ from schemas.file_schema import (
     DatasetUpdate,
     DatasetAttachFileRequest,
     DatasetAttachFileResponse,
+)
+from utils.errors import (
+    ChunkValidationError,
+    DatasetAccessError,
+    DatasetNotFoundError,
+    DuplicateDatasetError,
+    FileNotFoundError,
+    FileOwnershipError,
+    FolderNotFoundError,
+    IngestionJobNotFoundError,
+    InvalidDatasetStateError,
+    InvalidRelativePathError,
+    MissingChunkError,
+    UploadIncompleteError,
+    UploadNotFoundError,
+    UploadOwnershipError,
+    UploadSessionNotFoundError,
 )
 
 UPLOAD_ROOT = Path(get_env("UPLOAD_STORAGE_DIR", default=str(Path(__file__).resolve().parents[2] / "uploads"), required=False))
@@ -127,11 +143,11 @@ def _validate_relative_path(relative_path: str | None) -> list[str]:
 
     normalized = relative_path.replace("\\", "/").strip()
     if normalized.startswith("/"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="relative_path must be relative")
+        raise InvalidRelativePathError(message="relative_path must be relative")
 
     parts = [segment.strip() for segment in normalized.split("/") if segment.strip() and segment != "."]
     if any(part == ".." for part in parts):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="relative_path must not contain traversal segments")
+        raise InvalidRelativePathError(message="relative_path must not contain traversal segments")
 
     return parts
 
@@ -195,7 +211,7 @@ def _get_folder_by_id(db: Session, user: User, folder_id: str) -> Folder:
     """
     folder = db.query(Folder).filter(Folder.id == folder_id, Folder.user_id == user.id).one_or_none()
     if folder is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Folder not found")
+        raise FolderNotFoundError()
     return folder
 
 
@@ -242,10 +258,8 @@ def _build_tree(
     if dataset_id:
         try:
             dataset = get_dataset_by_id(db, user, dataset_id)
-        except HTTPException as exc:
-            if exc.status_code == status.HTTP_404_NOT_FOUND:
-                return UploadsTreeResponse(id=str(uuid4()), type="folder", name="root", children=[])
-            raise
+        except DatasetNotFoundError:
+            return UploadsTreeResponse(id=str(uuid4()), type="folder", name="root", children=[])
 
     if folder_id:
         root_folder = _get_folder_by_id(db, user, folder_id)
@@ -377,7 +391,7 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
 
     dataset = get_dataset_by_id(db, user, payload.dataset_id)
     if dataset.status == "Completed":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Completed datasets cannot receive new uploads")
+        raise InvalidDatasetStateError(message="Completed datasets cannot receive new uploads")
 
     folder = _get_folder_tree(db, user, payload.relative_path, payload.filename)
     if folder is not None:
@@ -484,17 +498,17 @@ def process_upload_chunk(db: Session, user: User, payload: UploadChunkRequest, c
     """
     meta = redis_server.hgetall(_meta_key(payload.upload_id))
     if not meta:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
+        raise UploadSessionNotFoundError()
     if meta.get("user_id") != user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Upload does not belong to the current user")
+        raise UploadOwnershipError()
 
     total_chunks = int(meta["total_chunks"])
     if payload.chunk_index >= total_chunks or payload.chunk_index < 0:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Chunk index outside the valid range")
+        raise ChunkValidationError(message="Chunk index outside the valid range")
 
     computed_hash = _hash_bytes(chunk_bytes)
     if computed_hash != payload.chunk_hash:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Chunk hash mismatch")
+        raise ChunkValidationError(message="Chunk hash mismatch")
 
     bitmap_key = _bitmap_key(payload.upload_id)
     hashes_key = _chunk_hashes_key(payload.upload_id)
@@ -541,11 +555,11 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
     """
     meta = redis_server.hgetall(_meta_key(payload.upload_id))
     if not meta:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found")
+        raise UploadSessionNotFoundError()
     if meta.get("user_id") != user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Upload does not belong to the current user")
+        raise UploadOwnershipError()
     if meta.get("master_hash") != payload.master_hash:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="master_hash mismatch")
+        raise ChunkValidationError(message="master_hash mismatch")
 
     dataset_id = meta["dataset_id"]
     folder_id = meta.get("folder_id") or None
@@ -571,7 +585,7 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
         # Verify the physical file exists
         uploaded_file = db.query(UploadedFile).filter(UploadedFile.id == linked_file_id).one_or_none()
         if uploaded_file is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Linked file not found")
+            raise FileNotFoundError(message="Linked file not found")
 
         if source_type_value:
             uploaded_file.source_type = UploadedFileSourceType(source_type_value)
@@ -582,7 +596,7 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
         bitmap_key = _bitmap_key(payload.upload_id)
         received_chunks = int(redis_server.bitcount(bitmap_key) or 0)
         if received_chunks != total_chunks:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Upload is incomplete")
+            raise UploadIncompleteError()
 
         # 1. Check if the physical file exists globally (concurrency safety)
         uploaded_file = (
@@ -608,7 +622,7 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
                         chunk_file_path = _chunk_path(payload.upload_id, index)
                         if not chunk_file_path.exists():
                             staging_path.unlink(missing_ok=True)
-                            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Missing chunk {index}")
+                            raise MissingChunkError(message=f"Missing chunk {index}")
                         with chunk_file_path.open("rb") as source:
                             shutil.copyfileobj(source, destination)
 
@@ -667,7 +681,7 @@ def delete_user_upload(db: Session, user: User, upload_id: str) -> UploadDeleteR
     """Delete an uploaded file and its physical storage for the authenticated user."""
     uploaded_file = db.query(UploadedFile).filter(UploadedFile.id == upload_id).one_or_none()
     if uploaded_file is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload not found")
+        raise UploadNotFoundError()
 
     ownership_mapping = (
         db.query(DatasetFolderFilesMapping)
@@ -675,7 +689,7 @@ def delete_user_upload(db: Session, user: User, upload_id: str) -> UploadDeleteR
         .first()
     )
     if ownership_mapping is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload not found")
+        raise UploadNotFoundError()
 
     file_path = Path(uploaded_file.physical_path)
     if file_path.exists():
@@ -777,10 +791,7 @@ def create_dataset(db: Session, user: User, payload: DatasetCreate) -> Dataset:
         .first()
     )
     if existing:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="A dataset with this name already exists.",
-        )
+        raise DuplicateDatasetError()
 
     dataset = Dataset(
         user_id=user.id,
@@ -852,15 +863,9 @@ def get_dataset_by_id(db: Session, user: User, dataset_id: str) -> Dataset:
         .one_or_none()
     )
     if dataset is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Dataset not found.",
-        )
+        raise DatasetNotFoundError()
     if dataset.user_id != user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Dataset does not belong to the current user.",
-        )
+        raise DatasetAccessError()
     return dataset
 
 
@@ -885,10 +890,7 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
     if payload.name is not None:
         name_clean = payload.name.strip()
         if not name_clean:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Dataset name cannot be empty.",
-            )
+            raise InvalidDatasetStateError(message="Dataset name cannot be empty.")
         # Check uniqueness if name is changing
         if name_clean.lower() != dataset.name.lower():
             existing = (
@@ -901,31 +903,25 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
                 .first()
             )
             if existing:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="A dataset with this name already exists.",
-                )
+                raise DuplicateDatasetError()
         dataset.name = name_clean
 
     if payload.description is not None:
         dataset.description = payload.description.strip()
 
     if dataset.status == "Completed":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Completed datasets cannot be modified.",
-        )
+        raise InvalidDatasetStateError(message="Completed datasets cannot be modified.")
 
     if payload.target_dataset_id is not None:
         if payload.target_dataset_id == dataset_id:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Target dataset must be different from the source dataset.")
+            raise InvalidDatasetStateError(message="Target dataset must be different from the source dataset.")
 
         if dataset.status not in {"Created", "Draft"}:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source dataset must be in created or Draft status.")
+            raise InvalidDatasetStateError(message="Source dataset must be in created or Draft status.")
 
         target_dataset = get_dataset_by_id(db, user, payload.target_dataset_id)
         if target_dataset.status not in {"Created", "Draft"}:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Target dataset must be in created or Draft status.")
+            raise InvalidDatasetStateError(message="Target dataset must be in created or Draft status.")
 
         mappings_query = (
             db.query(DatasetFolderFilesMapping)
@@ -941,7 +937,7 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
         if payload.folder_id is not None and payload.folder_id.strip() != "":
             folder = _get_folder_by_id(db, user, payload.folder_id)
             if folder is None:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Folder not found")
+                raise FolderNotFoundError()
             folder_ids = _collect_descendant_folder_ids(db, user, folder.id)
             mappings_query = mappings_query.filter(DatasetFolderFilesMapping.folder_id.in_(folder_ids))
 
@@ -977,10 +973,7 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
             "Completed": set(),
         }
         if requested_status not in allowed_transitions.get(current_status, set()):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Invalid dataset status transition.",
-            )
+            raise InvalidDatasetStateError(message="Invalid dataset status transition.")
         dataset.status = requested_status
 
     if payload.language is not None:
@@ -1071,15 +1064,12 @@ def attach_file_to_dataset(
     if user_file_mapping is None:
         file_exists = db.query(UploadedFile).filter(UploadedFile.id == payload.file_id).first()
         if file_exists is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
+            raise FileNotFoundError()
         else:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="File does not belong to the user.")
+            raise FileOwnershipError()
 
     if dataset.status == "Completed":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Completed datasets cannot be modified.",
-        )
+        raise InvalidDatasetStateError(message="Completed datasets cannot be modified.")
 
     # 3. Resolve folder structure if relative_path provided
     folder = _get_folder_tree(db, user, payload.relative_path)
@@ -1162,7 +1152,7 @@ def get_ingestion_job_status(db: Session, user: User, job_id: str) -> IngestionJ
         .one_or_none()
     )
     if job is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ingestion job not found")
+        raise IngestionJobNotFoundError()
 
     # Check live Redis progress key if present
     progress_val = redis_server.get(f"ingest:{job_id}:progress")

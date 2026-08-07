@@ -18,6 +18,7 @@ redis_pool = redis.ConnectionPool(
 )
 
 server = redis.Redis(connection_pool=redis_pool)
+audit_stream_name = "audit:stream"
 
 
 def redis_server_status() -> None:

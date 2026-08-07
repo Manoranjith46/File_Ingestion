@@ -261,6 +261,7 @@ def test_signup_verify_happy_path(client: TestClient) -> None:
     assert "authorization" in resp.headers
     # HttpOnly cookie must be set
     assert "refresh_token" in resp.cookies
+    assert "access_token" in resp.cookies
 
 
 # ===========================================================================
@@ -289,6 +290,7 @@ def test_login_happy_path(client: TestClient) -> None:
     assert "access_token" in body
     assert "authorization" in resp.headers
     assert "refresh_token" in resp.cookies
+    assert "access_token" in resp.cookies
 
 
 # ===========================================================================
@@ -381,6 +383,7 @@ def test_refresh_happy_path(client: TestClient) -> None:
     assert new_access  # new token issued
     # New refresh cookie must be set
     assert "refresh_token" in resp.cookies
+    assert "access_token" in resp.cookies
 
 
 # ===========================================================================
@@ -407,6 +410,7 @@ def test_logout_happy_path(client: TestClient) -> None:
 
     assert resp.status_code == 200
     assert resp.json()["message"] == "Logged out successfully"
+    assert "access_token" not in resp.cookies
 
 
 # ===========================================================================
