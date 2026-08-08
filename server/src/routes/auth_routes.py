@@ -131,6 +131,48 @@ def logout(
     return MessageResponse(message="Logged out successfully")
 
 
+@auth_router.delete("/google/logout", response_model=MessageResponse)
+def disconnect_google_integration(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    """
+    Disconnect the authenticated user's Google Drive integration.
+
+    This clears the stored Google OAuth refresh token for the user so future
+    Google Drive operations will require re-authorization.
+    """
+    if authorization is None or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing access token")
+
+    access_token = authorization.removeprefix("Bearer ").strip()
+    user = get_current_user(db, access_token)
+    user.google_refresh_token = None
+    db.commit()
+    return MessageResponse(message="Google integration disconnected")
+
+
+@auth_router.delete("/microsoft/logout", response_model=MessageResponse)
+def disconnect_microsoft_integration(
+    authorization: str | None = Header(default=None),
+    db: Session = Depends(get_db),
+):
+    """
+    Disconnect the authenticated user's Microsoft integration.
+
+    This clears the stored Microsoft OAuth refresh token for the user so future
+    Microsoft ingestion operations will require re-authorization.
+    """
+    if authorization is None or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing access token")
+
+    access_token = authorization.removeprefix("Bearer ").strip()
+    user = get_current_user(db, access_token)
+    user.microsoft_refresh_token = None
+    db.commit()
+    return MessageResponse(message="Microsoft integration disconnected")
+
+
 @auth_router.post("/refresh", response_model=TokenPairResponse)
 def refresh(
     response: Response,

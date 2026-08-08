@@ -11,15 +11,38 @@ SRC_ROOT = SERVER_ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from src.models.auth_model import User
-from src.services.auth_services import issue_token_pair
+from models.auth_model import User
+from services import auth_services
+
+
+class DummySession:
+    """Minimal session stub for benchmarking token issuance."""
+
+    def commit(self) -> None:
+        return None
+
+    def refresh(self, instance: object) -> None:
+        return None
 
 
 def benchmark_issue_token_pair() -> None:
     """Measure the cost of issuing a token pair for a synthetic user."""
-    user = User(email="benchmark@example.com", username="benchmark", full_name="Benchmark", password_hash="hash", auth_provider="local", is_verified=True)
-    session = None
-    print(timeit.timeit(lambda: issue_token_pair(session, user), number=10))
+    auth_services.active_session_limiter = lambda **_: None
+
+    user = User(
+        id="benchmark-user",
+        email="benchmark@example.com",
+        username="benchmark",
+        full_name="Benchmark",
+        password_hash="hash",
+        role="user",
+        auth_provider="local",
+        is_verified=True,
+        token_version=0,
+    )
+    session = DummySession()
+    elapsed = timeit.timeit(lambda: auth_services.issue_token_pair(session, user), number=10)
+    print(f"{elapsed:.6f} seconds")
 
 
 if __name__ == "__main__":

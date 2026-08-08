@@ -7,13 +7,16 @@ export const options = {
 };
 
 export default function () {
-  const payload = JSON.stringify({
-    name: `dataset-${__VU}-${__ITER}`,
-    description: 'Stress dataset',
-  });
+  const datasetName = `stress-ds-${__VU}-${__ITER}`;
+  const payload = JSON.stringify({ name: datasetName, language: 'English' });
 
-  http.post('http://127.0.0.1:8000/v1/datasets', payload, {
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test-token' },
-  });
+  const params = {
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer test-token', // placeholder token; replace with real token if needed
+    },
+  };
+
+  http.post('http://127.0.0.1:8000/v1/datasets', payload, params);
   sleep(0.1);
 }

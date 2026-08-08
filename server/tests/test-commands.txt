@@ -1,0 +1,40 @@
+# Test commands for server project
+
+# 0. Install test dependencies from requirements-test.txt
+uv run python -m pip install -r requirements-test.txt
+
+# 1. Run tests using uv (recommended if you are using uv)
+uv run python -m pytest tests/unit_tests -q
+uv run python -m pytest tests/integration_tests -q
+uv run python tests/benchmark/benchmark_auth.py
+
+# 2. Run all pytest suites using uv
+uv run python -m pytest tests/unit_tests tests/integration_tests -q
+
+# 3. Run unit tests only using uv
+uv run python -m pytest tests/unit_tests -q
+
+# 4. Run integration tests only using uv
+uv run python -m pytest tests/integration_tests -q
+
+# 5. Run benchmark script using uv
+uv run python tests/benchmark/benchmark_auth.py
+uv run python tests/benchmark/benchmark_chunking.py
+
+# 6. Run stress tests (requires k6 and backend running)
+k6 run tests/stress_tests/auth_stress.js
+k6 run tests/stress_tests/file_stress.js
+
+# 7. Run Locust load/stress test (Locust must be installed in the environment)
+# Run via the `uv` helper (uses configured environment):
+uv run python -m locust -f tests/load_tests/locustfile.py --host=http://localhost:8000
+# Run headless and export CSV results via `uv`:
+uv run python -m locust -f tests/load_tests/locustfile.py --headless -u 100 -r 10 --run-time 5m --csv=locust_results --host=http://localhost:8000
+
+# Notes:
+# - If you have the `uv` helper, you can prefix the commands with `uv run` to
+#   run them in the configured environment (example at top of this file).
+# - For reproducible CI, add `locust` to `requirements-test.txt` or `pyproject.toml`.
+
+# Code Coverage Test(just add the line in the command)
+uv run python -m pytest tests/unit_tests tests/integration_tests --cov=src --cov-report=term-missing

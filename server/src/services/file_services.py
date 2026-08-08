@@ -372,6 +372,18 @@ def _hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _merge_chunk_files(chunk_paths: list[Path], destination_path: Path) -> None:
+    """Merge a sequence of chunk files into a single destination file."""
+    with destination_path.open("wb") as destination:
+        for chunk_path in chunk_paths:
+            if not chunk_path.exists():
+                destination.close()
+                destination_path.unlink(missing_ok=True)
+                raise MissingChunkError(message=f"Missing chunk {chunk_path.name}")
+            with chunk_path.open("rb") as source:
+                shutil.copyfileobj(source, destination)
+
+
 def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> UploadInitResponse:
     """
     Create an upload session and short-circuit when the file already exists.
@@ -617,14 +629,8 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
             staging_file_id = str(uuid4())
             staging_path = target_root / f"{staging_file_id}.pending"
             try:
-                with staging_path.open("wb") as destination:
-                    for index in range(total_chunks):
-                        chunk_file_path = _chunk_path(payload.upload_id, index)
-                        if not chunk_file_path.exists():
-                            staging_path.unlink(missing_ok=True)
-                            raise MissingChunkError(message=f"Missing chunk {index}")
-                        with chunk_file_path.open("rb") as source:
-                            shutil.copyfileobj(source, destination)
+                chunk_paths = [_chunk_path(payload.upload_id, index) for index in range(total_chunks)]
+                _merge_chunk_files(chunk_paths, staging_path)
 
                 final_file_id = str(uuid4())
                 final_path = _get_unique_filename(target_root, meta["filename"])

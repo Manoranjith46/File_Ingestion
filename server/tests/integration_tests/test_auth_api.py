@@ -42,7 +42,7 @@ os.environ.setdefault("PASSWORD_RESET_EXPIRE_MINUTES", "15")
 os.environ.setdefault("MAX_ACTIVE_SESSIONS", "3")
 
 from config.database import get_db  # noqa: E402
-from models.auth_model import Base  # noqa: E402
+from models.auth_model import Base, User  # noqa: E402
 from services import auth_services  # noqa: E402
 
 # Import app AFTER env vars are set
@@ -411,6 +411,40 @@ def test_logout_happy_path(client: TestClient) -> None:
     assert resp.status_code == 200
     assert resp.json()["message"] == "Logged out successfully"
     assert "access_token" not in resp.cookies
+
+
+def test_disconnect_google_integration_clears_refresh_token(client: TestClient, db_session: Session) -> None:
+    """DELETE /auth/google/logout should remove the stored Google refresh token."""
+    _register_and_verify(client, "google_disconnect@example.com", "google_disconnect")
+    access_tok, _ = _login(client, "google_disconnect@example.com")
+
+    user = db_session.query(User).filter_by(email="google_disconnect@example.com").one()
+    user.google_refresh_token = "encrypted-google-refresh-token"
+    db_session.commit()
+
+    resp = client.delete("/auth/google/logout", headers={"Authorization": f"Bearer {access_tok}"})
+
+    assert resp.status_code == 200
+    assert resp.json()["message"] == "Google integration disconnected"
+    db_session.refresh(user)
+    assert user.google_refresh_token is None
+
+
+def test_disconnect_microsoft_integration_clears_refresh_token(client: TestClient, db_session: Session) -> None:
+    """DELETE /auth/microsoft/logout should remove the stored Microsoft refresh token."""
+    _register_and_verify(client, "microsoft_disconnect@example.com", "microsoft_disconnect")
+    access_tok, _ = _login(client, "microsoft_disconnect@example.com")
+
+    user = db_session.query(User).filter_by(email="microsoft_disconnect@example.com").one()
+    user.microsoft_refresh_token = "encrypted-microsoft-refresh-token"
+    db_session.commit()
+
+    resp = client.delete("/auth/microsoft/logout", headers={"Authorization": f"Bearer {access_tok}"})
+
+    assert resp.status_code == 200
+    assert resp.json()["message"] == "Microsoft integration disconnected"
+    db_session.refresh(user)
+    assert user.microsoft_refresh_token is None
 
 
 # ===========================================================================

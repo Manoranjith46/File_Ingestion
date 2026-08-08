@@ -11,3 +11,4 @@ wheels/
 .env
 check_paths.py
 uploads/
+tests/test-explanation.txt

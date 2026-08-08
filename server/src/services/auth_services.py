@@ -343,7 +343,7 @@ def issue_token_pair(db: Session, user: User) -> tuple[TokenPairResponse, str, s
     Returns:
         tuple[TokenPairResponse, str, str]: A tuple containing TokenPairResponse, access_token, and refresh_token.
     """
-    user.token_version += 1
+    user.token_version = (user.token_version or 0) + 1
     user.last_login_at = _now()
     db.commit()
     db.refresh(user)

@@ -165,6 +165,10 @@ def hash_password(password: str) -> str:
 	Returns:
 		str: The encoded password hash.
 	"""
+	if password is None:
+		raise ValueError("password must not be None")
+	if not isinstance(password, str) or not password:
+		raise ValueError("password must be a non-empty string")
 	salt = secrets.token_bytes(16)
 	password_hash = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS)
 	return "pbkdf2_sha256${}${}${}".format(
@@ -184,6 +188,8 @@ def verify_password(password: str, password_hash: str) -> bool:
 	Returns:
 		bool: ``True`` when the password matches the stored hash.
 	"""
+	if not isinstance(password, str) or not isinstance(password_hash, str):
+		return False
 	try:
 		algorithm, iterations, encoded_salt, encoded_hash = password_hash.split("$")
 		if algorithm != "pbkdf2_sha256":

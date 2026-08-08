@@ -43,6 +43,8 @@ def encrypt_str(plaintext: str) -> str:
     """
     if plaintext is None:
         return ""
+    if not isinstance(plaintext, str):
+        raise TypeError("plaintext must be a string")
     key = _load_key()
     aesgcm = AESGCM(key)
     # AES-GCM nonce recommended length is 12 bytes
@@ -58,6 +60,10 @@ def decrypt_str(token_b64: str) -> str:
     Legacy or test values may be stored as plain text rather than encrypted payloads,
     so this helper returns those values unchanged when they are not valid encrypted data.
     """
+    if token_b64 is None:
+        return ""
+    if not isinstance(token_b64, str):
+        raise TypeError("token_b64 must be a string")
     if not token_b64:
         return ""
     try:

@@ -322,6 +322,37 @@ def test_authenticate_user_unknown_user_raises_401(db_session: Session) -> None:
 # ===========================================================================
 # U-A-08 — issue_token_pair: returns signed access + refresh + session
 # ===========================================================================
+def test_issue_token_pair_handles_none_token_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    """issue_token_pair should initialize token_version when the user has no value yet."""
+
+    class DummySession:
+        def commit(self) -> None:
+            return None
+
+        def refresh(self, instance: object) -> None:
+            return None
+
+    monkeypatch.setattr(auth_services, "active_session_limiter", lambda **_: None)
+
+    user = User(
+        id="tp-user-none",
+        email="tp-none@example.com",
+        username="tpnone",
+        password_hash="hash",
+        role="user",
+        auth_provider="local",
+        is_verified=True,
+        token_version=None,
+    )
+
+    token_resp, access_tok, refresh_tok = auth_services.issue_token_pair(DummySession(), user)
+
+    assert token_resp.user.email == "tp-none@example.com"
+    assert access_tok.startswith("ey")
+    assert refresh_tok.startswith("ey")
+    assert user.token_version == 1
+
+
 def test_issue_token_pair_returns_valid_tokens(db_session: Session, fake_redis: FakeRedis) -> None:
     """issue_token_pair must return a TokenPairResponse + two signed JWT strings."""
     user = User(
