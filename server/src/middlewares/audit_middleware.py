@@ -16,7 +16,7 @@ from starlette.responses import Response
 from config.database import get_session_local
 from config.redis_server import audit_stream_name, server as redis_server
 from services.auth_services import get_current_user
-from utils.actions import get_action_name
+from utils.actions import get_action_name, is_valid_audit_action
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,11 @@ class AuditMiddleware(BaseHTTPMiddleware):
             status_code = response.status_code if response is not None else 500
             user_id = await _resolve_request_user_id(request)
             action = getattr(request.state, "audit_action", None) or get_action_name(request.method, request.url.path)
+            if not is_valid_audit_action(action):
+                if response is not None:
+                    return response
+                return
+
             payload = {
                 "request_id": request_id,
                 "user_id": user_id,

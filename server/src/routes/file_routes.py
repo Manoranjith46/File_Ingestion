@@ -77,7 +77,6 @@ def upload_chunk(
     upload_id: str = Form(...),
     chunk_index: int = Form(..., ge=0),
     chunk_hash: str = Form(..., min_length=64, max_length=64),
-    request: Request = None,
     authorization: str | None = Header(default=None, alias="Authorization"),
     chunk_file: UploadFile = File(...),
     db: Session = Depends(get_db),
@@ -86,11 +85,6 @@ def upload_chunk(
     user = _resolve_current_user(authorization, db)
     payload = UploadChunkRequest(upload_id=upload_id, chunk_index=chunk_index, chunk_hash=chunk_hash)
     chunk_bytes = chunk_file.file.read()
-    if request is not None:
-        if chunk_index == 0:
-            request.state.audit_action = "File Upload Started"
-        else:
-            request.state.skip_audit = True
     return process_upload_chunk(db, user, payload, chunk_bytes)
 
 
@@ -190,7 +184,6 @@ def get_dataset_by_id_route(
 def modify_dataset(
     dataset_id: str,
     payload: DatasetUpdate,
-    request: Request,
     authorization: str | None = Header(default=None, alias="Authorization"),
     db: Session = Depends(get_db),
 ):
@@ -200,7 +193,6 @@ def modify_dataset(
     Args:
         dataset_id (str): The unique dataset ID.
         payload (DatasetUpdate): The patch updates schema.
-        request (Request): The current HTTP request (used for audit action tagging).
         authorization (str | None): Optional authorization bearer header.
         db (Session): The active database session.
 
@@ -208,10 +200,7 @@ def modify_dataset(
         DatasetResponse: The updated dataset details.
     """
     user = _resolve_current_user(authorization, db)
-    result = update_dataset(db, user, dataset_id, payload)
-    if payload.target_dataset_id is not None or payload.parent_folder_id is not None:
-        request.state.audit_action = "File Moved"
-    return result
+    return update_dataset(db, user, dataset_id, payload)
 
 
 @file_router.delete("/datasets/{dataset_id}", status_code=status.HTTP_200_OK)

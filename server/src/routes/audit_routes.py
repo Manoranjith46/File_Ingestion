@@ -14,8 +14,6 @@ from schemas.audit_schema import AuditLogCount, AuditLogListResponse, AuditWorke
 from services.audit_worker import get_audit_worker_health
 from services.auth_services import get_current_user
 from models.audit_model import AuditLog
-from utils.actions import get_action_name
-
 audit_router = APIRouter()
 
 
@@ -127,7 +125,7 @@ def list_audit_logs(
             method=log.method,
             status_code=log.status_code,
             created_at=log.created_at,
-            action=get_action_name(log.method, log.path),
+            action=log.action or "",
         )
         for log, username in rows
     ]

@@ -8,23 +8,16 @@ from typing import Final
 
 
 ACTION_MAP: Final[dict[tuple[str, str], str]] = {
-    # Authentication
-    ("POST", "/auth/login"): "User Login",
-    ("POST", "/auth/logout"): "User Logged out",
+    ("POST", "/auth/login"): "Login",
     ("POST", "/auth/signup/verify"): "Account Created",
     ("POST", "/auth/password-reset/verify"): "Password Changed",
-    # Dataset
     ("POST", "/v1/datasets"): "Dataset Created",
-    # Local Upload
-    ("POST", "/v1/upload/init"): "File Upload Initialized",
     ("POST", "/v1/upload/finalize"): "File Uploaded",
     ("POST", "/v1/uploads/delete"): "File Deleted",
-    # Google Drive
     ("GET", "/auth/google/callback"): "Google Drive Connected",
     ("DELETE", "/auth/google/logout"): "Google Drive Disconnected",
     ("POST", "/v1/ingest/gdrive/init"): "Google Drive File Imported",
     ("POST", "/v1/ingest/gdrive/url"): "Google Drive URL Imported",
-    # SharePoint
     ("GET", "/auth/microsoft/callback"): "SharePoint Connected",
     ("DELETE", "/auth/microsoft/logout"): "SharePoint Disconnected",
     ("POST", "/v1/ingest/sharepoint/init"): "SharePoint File Imported",
@@ -36,8 +29,10 @@ PATTERN_ACTIONS: Final[list[tuple[str, re.Pattern[str], str]]] = [
     ("DELETE", re.compile(r"^/v1/datasets/[^/]+$", re.IGNORECASE), "Dataset Deleted"),
 ]
 
+VALID_AUDIT_ACTIONS: Final[set[str]] = set(ACTION_MAP.values()) | {label for _, _, label in PATTERN_ACTIONS}
 
-def get_action_name(method: str, path: str) -> str:
+
+def get_action_name(method: str, path: str) -> str | None:
     """Return a human-friendly activity label for a request method and path."""
     normalized_method = method.strip().upper()
     normalized_path = path.rstrip("/")
@@ -48,5 +43,10 @@ def get_action_name(method: str, path: str) -> str:
         if normalized_method == expected_method and pattern.match(normalized_path):
             return label
 
-    return f"{normalized_method} {path}"
+    return None
+
+
+def is_valid_audit_action(action: str | None) -> bool:
+    """Return True when the resolved action is one of the allowed audit labels."""
+    return action in VALID_AUDIT_ACTIONS
 
