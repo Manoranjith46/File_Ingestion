@@ -19,6 +19,7 @@ os.environ.setdefault("JWT_REFRESH_SECRET_KEY", "test-refresh-secret")
 from models.auth_model import Base  # noqa: E402
 from models.audit_model import AuditLog  # noqa: E402
 from services.audit_worker import persist_audit_logs  # noqa: E402
+from utils.actions import get_action_name, is_valid_audit_action  # noqa: E402
 
 
 def test_persist_audit_logs_is_idempotent_for_duplicate_request_ids():
@@ -52,3 +53,14 @@ def test_persist_audit_logs_is_idempotent_for_duplicate_request_ids():
         session.close()
         Base.metadata.drop_all(bind=engine)
         engine.dispose()
+
+
+def test_get_action_name_filters_to_valid_audit_actions():
+    assert get_action_name("POST", "/auth/login") == "Login"
+    assert is_valid_audit_action(get_action_name("POST", "/auth/login")) is True
+
+    assert get_action_name("POST", "/v1/upload/init") is None
+    assert is_valid_audit_action(get_action_name("POST", "/v1/upload/init")) is False
+
+    assert get_action_name("PATCH", "/v1/datasets/1234") == "Dataset Updated"
+    assert is_valid_audit_action(get_action_name("PATCH", "/v1/datasets/1234")) is True

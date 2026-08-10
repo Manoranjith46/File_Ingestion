@@ -18,6 +18,7 @@ from config.database import get_session_local
 from config.redis_server import audit_stream_name, server as redis_server
 from helpers.get_env import get_env
 from models.audit_model import AuditLog
+from utils.actions import is_valid_audit_action
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,11 @@ def persist_audit_logs(db: Session, payloads: list[dict[str, Any]]) -> int:
     if not new_payloads:
         return 0
 
-    for payload in new_payloads:
+    valid_payloads = [payload for payload in new_payloads if is_valid_audit_action(payload.get("action"))]
+    if not valid_payloads:
+        return 0
+
+    for payload in valid_payloads:
         db.add(
             AuditLog(
                 request_id=payload["request_id"],

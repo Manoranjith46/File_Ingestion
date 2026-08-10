@@ -32,37 +32,31 @@ class AuditMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
             return response
         finally:
-            if _should_skip_request(request):
-                if response is not None:
-                    return response
-                return
-
-            duration_ms = round((time.perf_counter() - start_time) * 1000, 3)
-            status_code = response.status_code if response is not None else 500
-            user_id = await _resolve_request_user_id(request)
-            action = getattr(request.state, "audit_action", None) or get_action_name(request.method, request.url.path)
-            if not is_valid_audit_action(action):
-                if response is not None:
-                    return response
-                return
-
-            payload = {
-                "request_id": request_id,
-                "user_id": user_id,
-                "method": request.method,
-                "path": request.url.path,
-                "status_code": status_code,
-                "duration_ms": duration_ms,
-                "ip_address": request.client.host if request.client else None,
-                "user_agent": request.headers.get("user-agent"),
-                "action": action,
-            }
             try:
-                asyncio.create_task(
-                    _publish_audit_payload(payload)
-                )
+                if _should_skip_request(request):
+                    return
+
+                duration_ms = round((time.perf_counter() - start_time) * 1000, 3)
+                status_code = response.status_code if response is not None else 500
+                user_id = await _resolve_request_user_id(request)
+                action = getattr(request.state, "audit_action", None) or get_action_name(request.method, request.url.path)
+                if not is_valid_audit_action(action):
+                    return
+
+                payload = {
+                    "request_id": request_id,
+                    "user_id": user_id,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status_code": status_code,
+                    "duration_ms": duration_ms,
+                    "ip_address": request.client.host if request.client else None,
+                    "user_agent": request.headers.get("user-agent"),
+                    "action": action,
+                }
+                asyncio.create_task(_publish_audit_payload(payload))
             except Exception:
-                pass
+                logger.exception("Failed to publish audit payload")
 
 
 def _should_skip_request(request: Request) -> bool:
