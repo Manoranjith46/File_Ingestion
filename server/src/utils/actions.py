@@ -8,30 +8,32 @@ from typing import Final
 
 
 ACTION_MAP: Final[dict[tuple[str, str], str]] = {
-    ("POST", "/auth/login"): "Login",
+    # Authentication
+    ("POST", "/auth/login"): "User Login",
+    ("POST", "/auth/logout"): "User Logged out",
     ("POST", "/auth/signup/verify"): "Account Created",
     ("POST", "/auth/password-reset/verify"): "Password Changed",
+    # Dataset
     ("POST", "/v1/datasets"): "Dataset Created",
-    ("PATCH", "/v1/datasets"): "Dataset Updated",
-    ("DELETE", "/v1/datasets"): "Dataset Deleted",
+    # Local Upload
+    ("POST", "/v1/upload/init"): "File Upload Initialized",
     ("POST", "/v1/upload/finalize"): "File Uploaded",
     ("POST", "/v1/uploads/delete"): "File Deleted",
+    # Google Drive
     ("GET", "/auth/google/callback"): "Google Drive Connected",
     ("DELETE", "/auth/google/logout"): "Google Drive Disconnected",
     ("POST", "/v1/ingest/gdrive/init"): "Google Drive File Imported",
     ("POST", "/v1/ingest/gdrive/url"): "Google Drive URL Imported",
+    # SharePoint
     ("GET", "/auth/microsoft/callback"): "SharePoint Connected",
     ("DELETE", "/auth/microsoft/logout"): "SharePoint Disconnected",
     ("POST", "/v1/ingest/sharepoint/init"): "SharePoint File Imported",
     ("POST", "/v1/ingest/sharepoint/url"): "SharePoint URL Imported",
-    ("POST", "/v1/ftp/signup"): "FTP Connected",
-    ("POST", "/v1/ftp/logout"): "FTP Disconnected",
 }
 
 PATTERN_ACTIONS: Final[list[tuple[str, re.Pattern[str], str]]] = [
     ("PATCH", re.compile(r"^/v1/datasets/[^/]+$", re.IGNORECASE), "Dataset Updated"),
     ("DELETE", re.compile(r"^/v1/datasets/[^/]+$", re.IGNORECASE), "Dataset Deleted"),
-    ("POST", re.compile(r"^/v1/uploads/move$", re.IGNORECASE), "File Moved"),
 ]
 
 

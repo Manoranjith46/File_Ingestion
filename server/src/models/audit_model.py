@@ -34,4 +34,5 @@ class AuditLog(Base):
     duration_ms: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     ip_address: Mapped[str | None] = mapped_column(String(128), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    action: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), nullable=False)

@@ -58,6 +58,7 @@ def persist_audit_logs(db: Session, payloads: list[dict[str, Any]]) -> int:
                 duration_ms=float(payload.get("duration_ms", 0.0)),
                 ip_address=payload.get("ip_address"),
                 user_agent=payload.get("user_agent"),
+                action=payload.get("action"),
             )
         )
 

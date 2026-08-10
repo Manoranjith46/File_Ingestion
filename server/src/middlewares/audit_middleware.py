@@ -16,6 +16,7 @@ from starlette.responses import Response
 from config.database import get_session_local
 from config.redis_server import audit_stream_name, server as redis_server
 from services.auth_services import get_current_user
+from utils.actions import get_action_name
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
             duration_ms = round((time.perf_counter() - start_time) * 1000, 3)
             status_code = response.status_code if response is not None else 500
             user_id = await _resolve_request_user_id(request)
+            action = getattr(request.state, "audit_action", None) or get_action_name(request.method, request.url.path)
             payload = {
                 "request_id": request_id,
                 "user_id": user_id,
@@ -48,6 +50,7 @@ class AuditMiddleware(BaseHTTPMiddleware):
                 "duration_ms": duration_ms,
                 "ip_address": request.client.host if request.client else None,
                 "user_agent": request.headers.get("user-agent"),
+                "action": action,
             }
             try:
                 asyncio.create_task(
@@ -60,6 +63,9 @@ class AuditMiddleware(BaseHTTPMiddleware):
 def _should_skip_request(request: Request) -> bool:
     """Return True for requests that should not be tracked as audit events."""
     if request.method.upper() == "OPTIONS":
+        return True
+
+    if getattr(request.state, "skip_audit", False):
         return True
 
     path = request.url.path.rstrip("/")
