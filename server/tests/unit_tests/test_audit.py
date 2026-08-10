@@ -38,7 +38,9 @@ def test_persist_audit_logs_is_idempotent_for_duplicate_request_ids():
                 "duration_ms": 12.5,
                 "ip_address": "127.0.0.1",
                 "user_agent": "pytest",
+                "action": "Login",
             }
+
         ]
 
         inserted = persist_audit_logs(session, payloads)

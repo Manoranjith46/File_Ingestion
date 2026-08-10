@@ -81,6 +81,7 @@ class Folder(Base):
 
 class UploadedFileSourceType(str, Enum):
     FTP = "FTP"
+    Local = "Local"
     GDrive = "GDrive"
     Sharepoint = "Sharepoint"
 
@@ -154,12 +155,15 @@ class AsyncIngestionJob(Base):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     dataset_id: Mapped[str] = mapped_column(ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False, index=True)
     folder_id: Mapped[str | None] = mapped_column(ForeignKey("folders.id", ondelete="CASCADE"), nullable=True, index=True)
-    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    provider: Mapped[UploadedFileSourceType] = mapped_column(SQLEnum(UploadedFileSourceType, name="async_ingestion_job_provider_type"), nullable=False)
     source_url_or_id: Mapped[str] = mapped_column(String(500), nullable=False)
     filename: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="pending", nullable=False, index=True)
     progress_percentage: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    bytes_downloaded: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    total_bytes: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     master_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     file_id: Mapped[str | None] = mapped_column(ForeignKey("uploaded_files.id", ondelete="SET NULL"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), nullable=False)

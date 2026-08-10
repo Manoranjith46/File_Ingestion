@@ -71,9 +71,18 @@ def _cleanup_loop() -> None:
             purged = purge_abandoned_upload_parts()
             if purged:
                 logger.info(f"Cleaned up {len(purged)} abandoned upload session(s): {purged}")
+
+            try:
+                from services.ext_ftp_service import cleanup_ftp_staging_files
+                cleaned_staging = cleanup_ftp_staging_files()
+                if cleaned_staging:
+                    logger.info(f"Cleaned up {cleaned_staging} orphan FTP staging file(s)")
+            except Exception as ftp_err:
+                logger.error(f"Error purging orphan FTP staging files: {ftp_err}")
         except Exception as err:
             logger.error(f"Unexpected error in cleanup loop iteration: {err}")
         time.sleep(CLEANUP_INTERVAL_SECONDS)
+
 
 
 def start_cleanup_scheduler() -> threading.Thread:

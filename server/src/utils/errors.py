@@ -97,3 +97,17 @@ FileOwnershipError = _error("FileOwnershipError", "file_ownership_error", "File 
 IntegrationConnectionError = _error("IntegrationConnectionError", "integration_connection_error", "Cloud integration is not connected.", http_status=401)
 IntegrationRequestError = _error("IntegrationRequestError", "integration_request_error", "Cloud integration request failed.", http_status=400)
 IngestionJobNotFoundError = _error("IngestionJobNotFoundError", "ingestion_job_not_found", "Ingestion job not found", http_status=404)
+
+# --- External FTP Pull Ingestion (v3.3) ---
+FtpConnectionError = _error("FtpConnectionError", "ftp_connection_error", "Failed to connect to external FTP server.", http_status=504)
+FtpTlsRejectedError = _error("FtpTlsRejectedError", "ftp_tls_rejected", "Server rejected TLS and insecure mode is not enabled.", http_status=400)
+FtpAuthError = _error("FtpAuthError", "ftp_auth_error", "Invalid FTP credentials.", http_status=401)
+FtpRateLimitError = _error("FtpRateLimitError", "ftp_rate_limit", "Too many FTP connection attempts. Try again later.", http_status=429)
+FtpSessionNotFoundError = _error("FtpSessionNotFoundError", "ftp_session_not_found", "No active FTP session found.", http_status=404)
+FtpSessionExpiredError = _error("FtpSessionExpiredError", "ftp_session_expired", "FTP session credentials have expired.", http_status=410)
+FtpSessionDrainingError = _error("FtpSessionDrainingError", "ftp_session_draining", "FTP session is currently draining.", http_status=409)
+FtpRemotePathNotFoundError = _error("FtpRemotePathNotFoundError", "ftp_remote_path_not_found", "Remote FTP directory path does not exist.", http_status=404)
+
+# --- Virtual Deduplication (Phase 0) ---
+FilenameCollisionError = _error("FilenameCollisionError", "filename_collision", "Filename collision detected", http_status=409)
+

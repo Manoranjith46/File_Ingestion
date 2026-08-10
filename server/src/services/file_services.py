@@ -42,6 +42,7 @@ from utils.errors import (
     DuplicateDatasetError,
     FileNotFoundError,
     FileOwnershipError,
+    FilenameCollisionError,
     FolderNotFoundError,
     IngestionJobNotFoundError,
     InvalidDatasetStateError,
@@ -118,6 +119,26 @@ def _file_path(file_id: str) -> Path:
 def _uploaded_filename(filename: str) -> str:
     """Return the storage filename derived from the client-supplied name."""
     return Path(filename).name
+
+
+def _generate_rename_suggestion(filename: str, existing_names: set[str]) -> str:
+    """Generate a non-colliding filename by appending (1), (2), etc.
+
+    Args:
+        filename: The original filename that collides.
+        existing_names: Set of filenames already present in the scope.
+
+    Returns:
+        str: A filename guaranteed not to collide with *existing_names*.
+    """
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    counter = 1
+    while True:
+        candidate = f"{stem} ({counter}){suffix}"
+        if candidate not in existing_names:
+            return candidate
+        counter += 1
 
 
 def _get_unique_filename(base_dir: Path, filename: str) -> Path:
@@ -409,6 +430,8 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
     if folder is not None:
         db.commit()
 
+    folder_id_for_check = folder.id if folder else None
+
     # 1. Check if exact mapping already exists (duplicate_short_circuit)
     exists_mapping = (
         db.query(DatasetFolderFilesMapping)
@@ -416,7 +439,7 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
         .filter(
             DatasetFolderFilesMapping.user_id == user.id,
             DatasetFolderFilesMapping.dataset_id == payload.dataset_id,
-            DatasetFolderFilesMapping.folder_id == (folder.id if folder else None),
+            DatasetFolderFilesMapping.folder_id == folder_id_for_check,
             UploadedFile.master_hash == payload.master_hash,
         )
         .first()
@@ -428,6 +451,35 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
             total_chunks=0,
             status="duplicate_short_circuit",
         )
+
+    # 2. Virtual Deduplication — filename collision check for different files
+    existing_mappings = (
+        db.query(DatasetFolderFilesMapping)
+        .join(UploadedFile)
+        .filter(
+            DatasetFolderFilesMapping.dataset_id == payload.dataset_id,
+            DatasetFolderFilesMapping.folder_id == folder_id_for_check,
+        )
+        .all()
+    )
+    existing_names: set[str] = {
+        m.file.filename for m in existing_mappings if m.file is not None and m.file.master_hash != payload.master_hash
+    }
+
+    effective_filename = payload.filename
+    if payload.filename in existing_names:
+        suggestion = _generate_rename_suggestion(payload.filename, existing_names)
+        if not payload.auto_rename:
+            raise FilenameCollisionError(
+                message="Filename collision detected",
+                details={
+                    "conflict_type": "name_exists",
+                    "conflicting_files": [payload.filename],
+                    "suggestion": suggestion,
+                },
+            )
+        # auto_rename=True — use the renamed filename for the rest of the flow
+        effective_filename = suggestion
 
     # 2. Check if physical file exists globally (duplicate_suspected)
     exists_file = (
@@ -445,7 +497,7 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
             mapping={
                 "user_id": user.id,
                 "dataset_id": payload.dataset_id,
-                "filename": payload.filename,
+                "filename": effective_filename,
                 "filesize": str(payload.filesize),
                 "master_hash": payload.master_hash,
                 "folder_id": folder.id if folder else "",
@@ -472,7 +524,7 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
         mapping={
             "user_id": user.id,
             "dataset_id": payload.dataset_id,
-            "filename": payload.filename,
+            "filename": effective_filename,
             "filesize": str(payload.filesize),
             "master_hash": payload.master_hash,
             "folder_id": folder.id if folder else "",

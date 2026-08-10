@@ -26,6 +26,7 @@ from services.ftp_watcher import start_ftp_watcher
 from routes.file_routes import file_router
 from routes.auth_routes import auth_router
 from routes.audit_routes import audit_router
+from routes.ftp_routes import ftp_router
 from services.audit_worker import start_audit_worker
 
 
@@ -68,6 +69,7 @@ app.add_middleware(AuditMiddleware)
 app.include_router(auth_router, prefix="/auth", tags=["Authentication"])
 app.include_router(auth_router, prefix="/v1/auth", tags=["Authentication Alias"])
 app.include_router(file_router, prefix="/v1", tags=["File Ingestion"])
+app.include_router(ftp_router, prefix="/v1", tags=["External FTP Ingestion"])
 app.include_router(audit_router, tags=["Audit"])
 
 

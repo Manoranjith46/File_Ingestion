@@ -22,7 +22,11 @@ ACTION_MAP: Final[dict[tuple[str, str], str]] = {
     ("DELETE", "/auth/microsoft/logout"): "SharePoint Disconnected",
     ("POST", "/v1/ingest/sharepoint/init"): "SharePoint File Imported",
     ("POST", "/v1/ingest/sharepoint/url"): "SharePoint URL Imported",
+    ("POST", "/v1/ingest/ftp/connect"): "FTP Connected",
+    ("POST", "/v1/ingest/ftp/disconnect"): "FTP Disconnected",
+    ("POST", "/v1/ingest/ftp/init"): "FTP File Imported",
 }
+
 
 PATTERN_ACTIONS: Final[list[tuple[str, re.Pattern[str], str]]] = [
     ("PATCH", re.compile(r"^/v1/datasets/[^/]+$", re.IGNORECASE), "Dataset Updated"),

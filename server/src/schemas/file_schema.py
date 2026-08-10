@@ -33,7 +33,8 @@ class UploadInitRequest(BaseModel):
     filesize: int = Field(gt=0)
     master_hash: str = Field(min_length=64, max_length=64)
     relative_path: str | None = Field(default=None, min_length=0, max_length=500)
-    source_type: Literal["FTP", "GDrive", "Sharepoint"] | None = Field(default=None)
+    source_type: Literal["FTP", "Local", "GDrive", "Sharepoint"] | None = Field(default=None)
+    auto_rename: bool = Field(default=False)
 
 
 class UploadInitResponse(BaseModel):

@@ -28,7 +28,7 @@ os.environ.setdefault("MAX_ACTIVE_SESSIONS", "3")
 os.environ.setdefault("ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=")
 
 from models.auth_model import Base
-from routes import auth_routes, file_routes
+from routes import auth_routes, file_routes, ftp_routes
 from main import app as fastapi_app
 import main as main_module
 import config.database as config_database
@@ -71,6 +71,8 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
             self._hashes = {}
             self._bitmaps = {}
             self._sets = {}
+            self._counters = {}
+            self._ttls = {}
 
         def register_script(self, script):
             return lambda *args, **kwargs: 1
@@ -127,10 +129,25 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
             if nx and key in self._data:
                 return False
             self._data[key] = value
+            if ex:
+                self._ttls[key] = ex
             return True
 
         def get(self, key):
             return self._data.get(key)
+
+        def incr(self, key):
+            self._counters[key] = self._counters.get(key, 0) + 1
+            return self._counters[key]
+
+        def decr(self, key):
+            val = self._counters.get(key, 0) - 1
+            self._counters[key] = max(0, val)
+            return self._counters[key]
+
+
+        def ttl(self, key):
+            return self._ttls.get(key, -1)
 
         def xadd(self, *args, **kwargs):
             return "0-0"
@@ -148,6 +165,7 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     import config.redis_server as redis_server_module
     import services.auth_services as auth_services_module
     import services.file_services as file_services_module
+    import services.ext_ftp_service as ext_ftp_service_module
 
     monkeypatch.setattr(redis_server_module, "server", mock_redis)
     monkeypatch.setattr(redis_server_module, "active_session_limiter", lambda *args, **kwargs: 1)
@@ -159,9 +177,12 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     monkeypatch.setattr(file_services_module, "redis_server", mock_redis)
     monkeypatch.setattr(file_services_module, "atomic_chunk_state", lambda *args, **kwargs: 0)
 
+    monkeypatch.setattr(ext_ftp_service_module, "redis_server", mock_redis)
+
     original_overrides = dict(fastapi_app.dependency_overrides)
     fastapi_app.dependency_overrides[auth_routes.get_db] = override_get_db
     fastapi_app.dependency_overrides[file_routes.get_db] = override_get_db
+    fastapi_app.dependency_overrides[ftp_routes.get_db] = override_get_db
 
     with TestClient(fastapi_app) as test_client:
         yield test_client
