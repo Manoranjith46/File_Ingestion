@@ -60,7 +60,25 @@ services:
       # - D:\Zenteiq\Tasks\uploads:/ftp
     restart: unless-stopped
 
+  ext-ftp:
+    image: delfer/alpine-ftp-server
+    container_name: file-ingestion-ext-ftp
+    ports:
+      - "2121:21"
+      - "21100-21110:21100-21110" # Passive ports for external pull data transfer
+    env_file:
+      - .env
+    environment:
+      - USERS=${FTP_SERVER_USER}|${FTP_SERVER_PASSWORD}|/ftp|1000
+      - ADDRESS=${ADDRESS}
+      - MIN_PORT=21100
+      - MAX_PORT=21110
+    volumes:
+      - ext-ftp-data:/ftp
+    restart: unless-stopped
+
 volumes:
   postgres-data:
   redis-data:
   uploads-data:
+  ext-ftp-data:
