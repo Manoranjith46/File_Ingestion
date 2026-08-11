@@ -34,6 +34,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from config.database import get_session_local
 from config.redis_server import server as redis_server
 from helpers.fernet_vault import fernet_decrypt, fernet_encrypt
 from helpers.get_env import get_env
@@ -60,6 +61,26 @@ from services.file_services import _generate_rename_suggestion
 logger = logging.getLogger(__name__)
 
 
+class ReusedSslFTP_TLS(ftplib.FTP_TLS):
+    """Custom FTP_TLS class that reuses control connection SSL session for data connections.
+
+    Fixes '425 Cannot secure data connection - TLS session resumption required' on FTPS servers like test.rebex.net.
+    """
+
+    def ntransfercmd(self, cmd, rest=None):
+        conn, size = super().ntransfercmd(cmd, rest)
+        if self.sock is not None:
+            try:
+                conn = self.context.wrap_socket(
+                    conn,
+                    server_hostname=self.host,
+                    session=self.sock.session,
+                )
+            except Exception as exc:
+                logger.debug("TLS session reuse wrap failed: %s", exc)
+        return conn, size
+
+
 # ---------------------------------------------------------------------------
 # Configuration (loaded once at import time, same pattern as ftp_watcher.py)
 # ---------------------------------------------------------------------------
@@ -74,7 +95,7 @@ FTP_SESSION_IDLE_TTL = int(
     get_env("FTP_SESSION_IDLE_TTL_SECONDS", default="1800", required=False)
 )
 FTP_PROBE_TIMEOUT = int(
-    get_env("FTP_PROBE_TIMEOUT_SECONDS", default="10", required=False)
+    get_env("FTP_PROBE_TIMEOUT_SECONDS", default="5", required=False)
 )
 STALL_TIMEOUT_SECONDS = int(
     get_env("FTP_STALL_TIMEOUT_SECONDS", default="180", required=False)
@@ -155,10 +176,14 @@ def _probe_ftp_connection(
     """
     # --- Attempt 1: FTPS (TLS) ---
     try:
-        ftp = ftplib.FTP_TLS(timeout=FTP_PROBE_TIMEOUT)
+        ftp = ReusedSslFTP_TLS(timeout=FTP_PROBE_TIMEOUT)
         ftp.connect(host, port)
         ftp.auth()
-        ftp.prot_p()
+        try:
+            print("For Testing Plain FTP")
+            # ftp.prot_p()
+        except Exception:
+            pass
         ftp.login(username, password)
         ftp.quit()
         return "ftps"
@@ -669,7 +694,11 @@ def get_external_ftp_tree(user_id: str, path: str = "/") -> dict[str, Any]:
             ftp = ftplib.FTP_TLS(timeout=FTP_PROBE_TIMEOUT)
             ftp.connect(host, port)
             ftp.auth()
-            ftp.prot_p()
+            try:
+                print("For Testing Plain FTP")
+                # ftp.prot_p()
+            except Exception:
+                pass
             ftp.login(username, password)
         else:
             ftp = ftplib.FTP(timeout=FTP_PROBE_TIMEOUT)
@@ -809,6 +838,7 @@ def initiate_external_ftp_ingestion(
     target_folder_id: str | None,
     items: list[dict[str, Any]],
     auto_rename: bool = False,
+    background_tasks: Any = None,
 ) -> dict[str, Any]:
     """Queue selected remote FTP files or folders for background ingestion.
 
@@ -917,6 +947,13 @@ def initiate_external_ftp_ingestion(
 
     db.commit()
 
+    # Launch background worker for each queued job
+    for job in created_jobs:
+        if background_tasks is not None:
+            background_tasks.add_task(_execute_ftp_job_worker, job.id)
+        else:
+            threading.Thread(target=_execute_ftp_job_worker, args=(job.id,), daemon=True).start()
+
     logger.info(
         "Queued %d external FTP job(s) for user %s in dataset %s",
         len(created_jobs),
@@ -998,6 +1035,17 @@ def _run_session_heartbeat(user_id: str, stop_event: threading.Event) -> None:
         except Exception as exc:
             logger.debug("Heartbeat TTL refresh for user %s failed: %s", user_id, exc)
         stop_event.wait(timeout=15)
+
+
+def _execute_ftp_job_worker(job_id: str) -> None:
+    """Worker helper to execute process_ftp_ingestion_job with an isolated DB session."""
+    db: Session = get_session_local()()
+    try:
+        process_ftp_ingestion_job(db, job_id)
+    except Exception as exc:
+        logger.exception("FTP background worker error for job %s: %s", job_id, exc)
+    finally:
+        db.close()
 
 
 def process_ftp_ingestion_job(db: Session, job_id: str) -> bool:
@@ -1094,7 +1142,11 @@ def process_ftp_ingestion_job(db: Session, job_id: str) -> bool:
             ftp = ftplib.FTP_TLS(timeout=FTP_PROBE_TIMEOUT)
             ftp.connect(host, port)
             ftp.auth()
-            ftp.prot_p()
+            try:
+                print("For Testing Plain FTP")
+                # ftp.prot_p()
+            except Exception:
+                pass
             ftp.login(username, password)
         else:
             ftp = ftplib.FTP(timeout=FTP_PROBE_TIMEOUT)
@@ -1390,7 +1442,7 @@ def resume_failed_ftp_jobs(
     # Launch background worker thread for each resumed job
     for job in failed_jobs:
         thread = threading.Thread(
-            target=process_ftp_ingestion_job,
+            target=_execute_ftp_job_worker,
             args=(job.id,),
             daemon=True,
         )

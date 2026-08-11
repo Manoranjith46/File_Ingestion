@@ -45,8 +45,12 @@ FTP_FINAL_ROOT = UPLOAD_ROOT / FINAL_ROOT_NAME / FTP_STORAGE_DIR_NAME
 DROPZONE_DIR_NAME = get_env("FTP_DROPZONE_PATH", default="ftp_dropzone", required=False)
 DROPZONE_ROOT = UPLOAD_ROOT / DROPZONE_DIR_NAME
 
-POLL_INTERVAL_SECONDS = int(get_env("FTP_POLL_INTERVAL_SECONDS", default="10", required=False))
-SAFETY_DELAY_SECONDS = int(get_env("FTP_SAFETY_DELAY_SECONDS", default="5", required=False))
+POLL_INTERVAL_SECONDS = int(get_env("FTP_POLL_INTERVAL_SECONDS", default="1", required=False))
+SAFETY_DELAY_SECONDS = int(get_env("FTP_SAFETY_DELAY_SECONDS", default="2", required=False))
+
+# Batch size & idle timeout triggers
+BATCH_SIZE_TRIGGER = int(get_env("FTP_BATCH_SIZE_TRIGGER", default="100", required=False))
+IDLE_TIMEOUT_SECONDS = float(get_env("FTP_IDLE_TIMEOUT_SECONDS", default="5.0", required=False))
 
 # Extensions that indicate a file is still being written by the FTP client.
 _INCOMPLETE_EXTENSIONS = frozenset({".filepart", ".tmp"})
@@ -136,23 +140,28 @@ def _get_or_create_ftp_dataset(db: Session, user_id: str) -> Dataset:
 # ---------------------------------------------------------------------------
 
 
-def _ingest_ftp_file(username: str, filepath: Path) -> None:
+def _ingest_ftp_file(username: str | None, filepath: Path) -> None:
     """Ingest a single completed FTP file for *username*.
 
     Opens its own database session so each file is an independent transaction.
+    If username is None or not found, falls back to the first available user.
     """
     db: Session = get_session_local()()
     try:
         # 1. Resolve user --------------------------------------------------
-        user = (
-            db.query(User)
-            .filter(User.username == username)
-            .one_or_none()
-        )
+        user = None
+        if username:
+            user = (
+                db.query(User)
+                .filter(User.username == username)
+                .one_or_none()
+            )
+        if user is None:
+            user = db.query(User).first()
+
         if user is None:
             logger.error(
-                "FTP watcher: no user with username '%s' – skipping %s",
-                username,
+                "FTP watcher: no valid user found in database – skipping %s",
                 filepath,
             )
             return
@@ -257,35 +266,77 @@ def _ingest_ftp_file(username: str, filepath: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Scan cycle
+# Scan cycle with Batch (100) & Idle (5s) Triggers
 # ---------------------------------------------------------------------------
 
 
 def _scan_and_ingest() -> None:
-    """Walk the FTP dropzone and ingest every completed file."""
+    """Walk the FTP dropzone and ingest files when count >= 100 OR idle >= 5s."""
     if not DROPZONE_ROOT.exists():
         return
 
-    for user_dir in DROPZONE_ROOT.iterdir():
-        if not user_dir.is_dir():
-            continue
+    # Collect all ready candidate files and track the latest mtime
+    candidate_files: list[tuple[str | None, Path]] = []
+    latest_mtime: float = 0.0
 
-        username = user_dir.name
-
-        for filepath in user_dir.iterdir():
-            if not filepath.is_file():
+    for entry in DROPZONE_ROOT.iterdir():
+        if entry.is_file():
+            if _is_file_still_writing(entry):
                 continue
-            if _is_file_still_writing(filepath):
-                continue
-
             try:
-                _ingest_ftp_file(username, filepath)
-            except Exception:
-                logger.exception(
-                    "FTP watcher: failed to process %s for user '%s'",
-                    filepath,
-                    username,
-                )
+                mtime = entry.stat().st_mtime
+                if mtime > latest_mtime:
+                    latest_mtime = mtime
+                candidate_files.append((None, entry))
+            except OSError:
+                continue
+        elif entry.is_dir():
+            username = entry.name
+            for filepath in entry.iterdir():
+                if not filepath.is_file() or _is_file_still_writing(filepath):
+                    continue
+                try:
+                    mtime = filepath.stat().st_mtime
+                    if mtime > latest_mtime:
+                        latest_mtime = mtime
+                    candidate_files.append((username, filepath))
+                except OSError:
+                    continue
+
+    file_count = len(candidate_files)
+    if file_count == 0:
+        return
+
+    now = time.time()
+    idle_duration = now - latest_mtime if latest_mtime > 0 else 0.0
+
+    # Trigger conditions:
+    # 1. Batch size limit reached (>= 100 files)
+    # 2. Idle timeout reached (>= 5.0 seconds since last write/arrival)
+    should_trigger = (file_count >= BATCH_SIZE_TRIGGER) or (idle_duration >= IDLE_TIMEOUT_SECONDS)
+
+    if not should_trigger:
+        logger.debug(
+            "FTP watcher: accumulating batch (%d/%d files ready, idle %.1fs/%.1fs)",
+            file_count,
+            BATCH_SIZE_TRIGGER,
+            idle_duration,
+            IDLE_TIMEOUT_SECONDS,
+        )
+        return
+
+    logger.info(
+        "FTP watcher: triggering batch ingestion for %d file(s) (idle: %.1fs, batch trigger: %d)",
+        file_count,
+        idle_duration,
+        BATCH_SIZE_TRIGGER,
+    )
+
+    for username, filepath in candidate_files:
+        try:
+            _ingest_ftp_file(username, filepath)
+        except Exception:
+            logger.exception("FTP watcher: failed to process %s", filepath)
 
 
 # ---------------------------------------------------------------------------

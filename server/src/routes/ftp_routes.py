@@ -9,7 +9,7 @@ These routes are mounted under the ``/v1`` prefix by ``main.py``.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from config.database import get_db
@@ -208,6 +208,7 @@ def ftp_tree(
 )
 def ftp_init(
     body: FtpInitRequest,
+    background_tasks: BackgroundTasks,
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> FtpInitResponse:
@@ -215,6 +216,7 @@ def ftp_init(
 
     Args:
         body (FtpInitRequest): Queue parameters.
+        background_tasks (BackgroundTasks): FastAPI background task manager.
         authorization (str | None): Bearer access token from header.
         db (Session): Injected database session.
 
@@ -229,6 +231,7 @@ def ftp_init(
         target_folder_id=body.target_folder_id,
         items=[item.model_dump() for item in body.items],
         auto_rename=body.auto_rename,
+        background_tasks=background_tasks,
     )
     return FtpInitResponse(**result)
 

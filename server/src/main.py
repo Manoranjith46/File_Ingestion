@@ -23,6 +23,7 @@ from models import file_model  # noqa: F401
 from models import audit_model  # noqa: F401
 from services.cleanup_scheduler import start_cleanup_scheduler
 from services.ftp_watcher import start_ftp_watcher
+from services.run_ftp_server import start_ftp_server
 from routes.file_routes import file_router
 from routes.auth_routes import auth_router
 from routes.audit_routes import audit_router
@@ -38,6 +39,7 @@ async def lifespan(app: FastAPI):
     redis_server_status()
     Check_db_Connection()
     start_cleanup_scheduler()
+    start_ftp_server()
     start_ftp_watcher()
     await start_audit_worker()
     Base.metadata.create_all(bind=get_engine())

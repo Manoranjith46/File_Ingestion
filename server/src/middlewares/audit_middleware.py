@@ -39,7 +39,10 @@ class AuditMiddleware(BaseHTTPMiddleware):
                 duration_ms = round((time.perf_counter() - start_time) * 1000, 3)
                 status_code = response.status_code if response is not None else 500
                 user_id = await _resolve_request_user_id(request)
-                action = getattr(request.state, "audit_action", None) or get_action_name(request.method, request.url.path)
+                raw_action = getattr(request.state, "audit_action", None)
+                action = get_action_name(request.method, request.url.path, status_code=status_code) or raw_action
+                if action and status_code >= 400 and not action.endswith("Failed"):
+                    action = f"{action} Failed"
                 if not is_valid_audit_action(action):
                     pass
 

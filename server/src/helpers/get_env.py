@@ -17,11 +17,11 @@ def load_environment_variables():
     """
     if ENV_PATH.exists():
         if load_dotenv(ENV_PATH, override=False):
-            print(f"✅ Environment Variables Loaded from its Path: {ENV_PATH}")
+            print(f"[OK] Environment Variables Loaded from its Path: {ENV_PATH}")
         else:
-            print(f"❌ Failed to Load Environment Variables from its Path: {ENV_PATH}")
+            print(f"[FAIL] Failed to Load Environment Variables from its Path: {ENV_PATH}")
     else:
-        print(f"ℹ️ No .env file found at {ENV_PATH}; using environment variables from the current process.")
+        print(f"[INFO] No .env file found at {ENV_PATH}; using environment variables from the current process.")
 
 
 def get_env(key: str, default=None, required: bool = True):
