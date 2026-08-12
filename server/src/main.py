@@ -54,17 +54,25 @@ frontend_urls = get_env("FRONTEND_URL", "http://localhost:5173", required=False)
 # Split comma-separated URLs into a list and trim whitespace
 allowed_origins = [origin.strip() for origin in str(frontend_urls).split(",") if origin.strip()]
 
-# Ensure local dev origin is present
-if "http://localhost:5173" not in allowed_origins:
-    allowed_origins.append("http://localhost:5173")
+# Default dev & test origins
+default_dev_origins = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "https://staging-debating-broadside.ngrok-free.dev",
+]
+
+for origin in default_dev_origins:
+    if origin not in allowed_origins:
+        allowed_origins.append(origin)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
+    allow_origin_regex=r"https://.*\.ngrok-free\.(dev|app)|https://.*\.ngrok\.io",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Authorization"],
+    expose_headers=["Authorization", "X-Refresh-Token"],
 )
 app.add_middleware(AuditMiddleware)
 

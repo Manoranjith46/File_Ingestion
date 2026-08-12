@@ -100,6 +100,14 @@ FTP_PROBE_TIMEOUT = int(
 STALL_TIMEOUT_SECONDS = int(
     get_env("FTP_STALL_TIMEOUT_SECONDS", default="180", required=False)
 )
+UPLOAD_ROOT = Path(
+    get_env(
+        "UPLOAD_STORAGE_DIR",
+        default=str(Path(__file__).resolve().parents[2] / "uploads"),
+        required=False,
+    )
+)
+FINAL_ROOT_NAME = get_env("FINAL_ROOT", default="files", required=False)
 FTP_STORAGE_DIR = get_env("FTP_STORAGE_DIR", default="FTP", required=False)
 
 
@@ -154,40 +162,30 @@ def _probe_ftp_connection(
     password: str,
     allow_insecure: bool,
 ) -> str:
-    """Open a real FTP connection to validate credentials and TLS support.
+    host = host.strip()
+    username = username.strip()
 
-    Attempts ``FTP_TLS`` first.  If TLS handshake fails and
-    ``allow_insecure`` is ``True``, falls back to plaintext FTP.
-
-    Args:
-        host (str): FTP server hostname or IP.
-        port (int): FTP control port.
-        username (str): FTP login username.
-        password (str): FTP login password.
-        allow_insecure (bool): Whether to permit plaintext fallback.
-
-    Returns:
-        str: ``"ftps"`` or ``"ftp"`` indicating the negotiated protocol.
-
-    Raises:
-        FtpTlsRejectedError: Server rejected TLS and ``allow_insecure`` is ``False``.
-        FtpAuthError: Invalid FTP credentials (530 Login incorrect).
-        FtpConnectionError: Host is unreachable or connection timed out.
-    """
     # --- Attempt 1: FTPS (TLS) ---
+    ftp_tls = None
     try:
-        ftp = ReusedSslFTP_TLS(timeout=FTP_PROBE_TIMEOUT)
-        ftp.connect(host, port)
-        ftp.auth()
+        ftp_tls = ReusedSslFTP_TLS(timeout=FTP_PROBE_TIMEOUT)
+        ftp_tls.connect(host, port)
+        ftp_tls.auth()
         try:
             print("For Testing Plain FTP")
-            # ftp.prot_p()
+            # ftp_tls.prot_p()
         except Exception:
             pass
-        ftp.login(username, password)
-        ftp.quit()
+        ftp_tls.login(username, password)
+        ftp_tls.quit()
         return "ftps"
     except ftplib.error_perm as exc:
+        # Close the dangling TLS connection before fallback
+        try:
+            if ftp_tls is not None:
+                ftp_tls.close()
+        except Exception:
+            pass
         error_code = str(exc).split(None, 1)[0] if str(exc) else ""
         if error_code.startswith("530"):
             raise FtpAuthError(
@@ -202,12 +200,24 @@ def _probe_ftp_connection(
                 ),
             ) from exc
     except (OSError, ftplib.error_reply) as exc:
+        # Close the dangling TLS connection before fallback
+        try:
+            if ftp_tls is not None:
+                ftp_tls.close()
+        except Exception:
+            pass
         # Connection-level failure during TLS attempt.
         if not allow_insecure:
             raise FtpConnectionError(
                 message=f"Unable to reach FTP server at {host}:{port} — {exc}",
             ) from exc
     except Exception as exc:
+        # Close the dangling TLS connection before fallback
+        try:
+            if ftp_tls is not None:
+                ftp_tls.close()
+        except Exception:
+            pass
         if not allow_insecure:
             raise FtpConnectionError(
                 message=f"Unexpected error connecting to {host}:{port} — {exc}",
@@ -221,11 +231,15 @@ def _probe_ftp_connection(
     )
     try:
         ftp = ftplib.FTP(timeout=FTP_PROBE_TIMEOUT)
+        logger.info("Plaintext FTP: connecting to %s:%d (timeout=%ds)...", host, port, FTP_PROBE_TIMEOUT)
         ftp.connect(host, port)
+        logger.info("Plaintext FTP: connected, logging in as '%s'...", username)
         ftp.login(username, password)
+        logger.info("Plaintext FTP: login successful, closing probe connection.")
         ftp.quit()
         return "ftp"
     except ftplib.error_perm as exc:
+        logger.error("Plaintext FTP probe FAILED (error_perm): %s", exc)
         error_code = str(exc).split(None, 1)[0] if str(exc) else ""
         if error_code.startswith("530"):
             raise FtpAuthError(
@@ -235,8 +249,14 @@ def _probe_ftp_connection(
             message=f"FTP permission error on {host}:{port} — {exc}",
         ) from exc
     except (OSError, ftplib.error_reply) as exc:
+        logger.error("Plaintext FTP probe FAILED (OSError/error_reply): %s [%s]", exc, type(exc).__name__)
         raise FtpConnectionError(
             message=f"Unable to reach FTP server at {host}:{port} — {exc}",
+        ) from exc
+    except Exception as exc:
+        logger.error("Plaintext FTP probe FAILED (unexpected): %s [%s]", exc, type(exc).__name__)
+        raise FtpConnectionError(
+            message=f"Unexpected error connecting to FTP server at {host}:{port} — {exc}",
         ) from exc
 
 
@@ -349,6 +369,8 @@ def connect_external_ftp(
     graceful_expiry: bool,
     allow_insecure: bool,
 ) -> dict[str, Any]:
+    host = host.strip()
+    username = username.strip()
     """Validate FTP credentials and store an encrypted session in Redis.
 
     Orchestrates the full ``POST /v1/ingest/ftp/connect`` flow:
@@ -1108,7 +1130,7 @@ def process_ftp_ingestion_job(db: Session, job_id: str) -> bool:
     )
     heartbeat_thread.start()
 
-    staging_dir = Path("uploads") / "staging"
+    staging_dir = UPLOAD_ROOT / "staging"
     staging_dir.mkdir(parents=True, exist_ok=True)
     tmp_filepath = staging_dir / f"{job_id}.tmp"
     manifest_filepath = staging_dir / f"{job_id}.manifest.json"
@@ -1210,7 +1232,7 @@ def process_ftp_ingestion_job(db: Session, job_id: str) -> bool:
                 tmp_filepath.unlink(missing_ok=True)
             logger.info("Dedup hit for job %s; reusing uploaded_files row %s", job_id, file_id)
         else:
-            dest_dir = Path("uploads") / "files" / FTP_STORAGE_DIR
+            dest_dir = UPLOAD_ROOT / FINAL_ROOT_NAME / FTP_STORAGE_DIR
             dest_dir.mkdir(parents=True, exist_ok=True)
             ext = Path(job.filename).suffix
             final_filename = f"{master_hash}{ext}" if ext else master_hash
@@ -1293,7 +1315,7 @@ def cleanup_ftp_staging_files(max_age_seconds: int = 86400) -> int:
     Returns:
         int: Total number of orphan staging files deleted.
     """
-    staging_dir = Path("uploads") / "staging"
+    staging_dir = UPLOAD_ROOT / "staging"
     if not staging_dir.exists():
         return 0
 
