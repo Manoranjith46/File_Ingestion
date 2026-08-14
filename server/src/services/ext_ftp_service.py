@@ -39,7 +39,7 @@ from config.redis_server import server as redis_server
 from helpers.fernet_vault import fernet_decrypt, fernet_encrypt
 from helpers.get_env import get_env
 from models.auth_model import User
-from models.file_model import AsyncIngestionJob, Dataset, DatasetFolderFilesMapping, Folder, UploadedFile
+from models.file_model import Dataset, IngestedFile, IngestedFileProviderType
 from utils.errors import (
     DatasetAccessError,
     DatasetNotFoundError,
@@ -59,6 +59,9 @@ from services.file_services import _generate_rename_suggestion
 
 
 logger = logging.getLogger(__name__)
+
+UPLOAD_STORAGE_DIR = Path(get_env("UPLOAD_STORAGE_DIR", "uploads"))
+STAGING_ROOT = UPLOAD_STORAGE_DIR / "staging"
 
 
 class ReusedSslFTP_TLS(ftplib.FTP_TLS):
@@ -115,8 +118,8 @@ FTP_STORAGE_DIR = get_env("FTP_STORAGE_DIR", default="FTP", required=False)
 _CREDS_KEY = "ext_ftp:creds:{user_id}"
 _RATE_KEY = "ext_ftp:rate:{user_id}"
 
-# Provider label used in async_ingestion_jobs
-EXT_FTP_PROVIDER = "FTP"
+# Provider label used in ingested_files
+EXT_FTP_PROVIDER = IngestedFileProviderType.FTP
 
 
 # ---------------------------------------------------------------------------
@@ -447,11 +450,11 @@ def _count_active_ftp_jobs(db: Session, user_id: str) -> int:
         int: Count of active jobs.
     """
     return (
-        db.query(AsyncIngestionJob)
+        db.query(IngestedFile)
         .filter(
-            AsyncIngestionJob.user_id == user_id,
-            AsyncIngestionJob.provider == EXT_FTP_PROVIDER,
-            AsyncIngestionJob.status.in_(["pending", "in_progress"]),
+            IngestedFile.user_id == user_id,
+            IngestedFile.provider == EXT_FTP_PROVIDER,
+            IngestedFile.status.in_(["pending", "in_progress"]),
         )
         .count()
     )
@@ -468,11 +471,11 @@ def _cancel_active_ftp_jobs(db: Session, user_id: str) -> int:
         int: Number of jobs cancelled.
     """
     jobs = (
-        db.query(AsyncIngestionJob)
+        db.query(IngestedFile)
         .filter(
-            AsyncIngestionJob.user_id == user_id,
-            AsyncIngestionJob.provider == EXT_FTP_PROVIDER,
-            AsyncIngestionJob.status.in_(["pending", "in_progress"]),
+            IngestedFile.user_id == user_id,
+            IngestedFile.provider == EXT_FTP_PROVIDER,
+            IngestedFile.status.in_(["pending", "in_progress"]),
         )
         .all()
     )
@@ -486,11 +489,6 @@ def _cancel_active_ftp_jobs(db: Session, user_id: str) -> int:
 def _cleanup_orphan_files(db: Session, user_id: str) -> int:
     """Reference-counted cleanup of physical files after a force disconnect.
 
-    For each ``UploadedFile`` linked to cancelled external FTP jobs:
-      1. Delete the ``DatasetFolderFilesMapping`` rows tied to this user.
-      2. If the file's total reference count drops to 0, delete the physical
-         file from disk and remove the ``UploadedFile`` row.
-
     Args:
         db (Session): An active SQLAlchemy session.
         user_id (str): The authenticated user's ID.
@@ -501,51 +499,30 @@ def _cleanup_orphan_files(db: Session, user_id: str) -> int:
     import os
 
     cancelled_jobs = (
-        db.query(AsyncIngestionJob)
+        db.query(IngestedFile)
         .filter(
-            AsyncIngestionJob.user_id == user_id,
-            AsyncIngestionJob.provider == EXT_FTP_PROVIDER,
-            AsyncIngestionJob.status == "cancelled",
-            AsyncIngestionJob.file_id.isnot(None),
+            IngestedFile.user_id == user_id,
+            IngestedFile.provider == EXT_FTP_PROVIDER,
+            IngestedFile.status == "cancelled",
         )
         .all()
     )
 
     deleted_count = 0
     for job in cancelled_jobs:
-        file_id = job.file_id
-
-        # Delete mappings belonging to this user for this file
-        db.query(DatasetFolderFilesMapping).filter(
-            DatasetFolderFilesMapping.file_id == file_id,
-            DatasetFolderFilesMapping.user_id == user_id,
-        ).delete(synchronize_session="fetch")
-
-        # Reference count check
-        ref_count = (
-            db.query(DatasetFolderFilesMapping)
-            .filter(DatasetFolderFilesMapping.file_id == file_id)
-            .count()
-        )
-        if ref_count == 0:
-            uploaded_file = db.query(UploadedFile).filter(UploadedFile.id == file_id).first()
-            if uploaded_file:
+        if job.physical_path:
+            ref_count = (
+                db.query(IngestedFile)
+                .filter(IngestedFile.physical_path == job.physical_path, IngestedFile.id != job.id)
+                .count()
+            )
+            if ref_count == 0 and os.path.exists(job.physical_path):
                 try:
-                    if os.path.exists(uploaded_file.physical_path):
-                        os.remove(uploaded_file.physical_path)
-                        deleted_count += 1
-                        logger.info(
-                            "Deleted orphaned file %s (file_id=%s)",
-                            uploaded_file.physical_path,
-                            file_id,
-                        )
-                except OSError as err:
-                    logger.warning(
-                        "Failed to delete orphan file %s: %s",
-                        uploaded_file.physical_path,
-                        err,
-                    )
-                db.delete(uploaded_file)
+                    os.remove(job.physical_path)
+                    deleted_count += 1
+                except OSError:
+                    pass
+        db.delete(job)
 
     db.flush()
     return deleted_count
@@ -917,22 +894,20 @@ def initiate_external_ftp_ingestion(
     for item in items:
         _expand(item["path"], item.get("is_folder", False), item.get("size_bytes", 0))
 
-    # 4b. Virtual Deduplication — check existing filenames in target dataset/folder
-    existing_mappings = (
-        db.query(DatasetFolderFilesMapping)
-        .join(UploadedFile)
+    # 4b. Virtual Deduplication — check existing filenames in target dataset
+    existing_files = (
+        db.query(IngestedFile)
         .filter(
-            DatasetFolderFilesMapping.dataset_id == dataset.id,
-            DatasetFolderFilesMapping.folder_id == target_folder_id,
+            IngestedFile.dataset_id == dataset.id,
         )
         .all()
     )
     existing_names: set[str] = {
-        m.file.filename for m in existing_mappings if m.file is not None
+        f.filename for f in existing_files
     }
 
-    # 5. Insert AsyncIngestionJob rows
-    created_jobs: list[AsyncIngestionJob] = []
+    # 5. Insert IngestedFile rows
+    created_jobs: list[IngestedFile] = []
     for target in file_targets:
         raw_path = target["path"]
         base_filename = raw_path.rstrip("/").split("/")[-1]
@@ -952,17 +927,14 @@ def initiate_external_ftp_ingestion(
             effective_filename = suggestion
             existing_names.add(effective_filename)
 
-        job = AsyncIngestionJob(
+        job = IngestedFile(
             user_id=user.id,
             dataset_id=dataset.id,
-            folder_id=target_folder_id,
             provider=EXT_FTP_PROVIDER,
-            source_url_or_id=raw_path,
+            file_path=raw_path,
             filename=effective_filename,
             status="pending",
-            progress_percentage=0,
-            bytes_downloaded=0,
-            total_bytes=target["size_bytes"],
+            file_size_bytes=target["size_bytes"],
         )
         db.add(job)
         created_jobs.append(job)
@@ -989,10 +961,10 @@ def initiate_external_ftp_ingestion(
         "jobs": [
             {
                 "job_id": job.id,
-                "path": job.source_url_or_id,
+                "path": job.file_path,
                 "status": job.status,
                 "filename": job.filename,
-                "filesize": job.total_bytes,
+                "filesize": job.file_size_bytes or 0,
                 "source": "FTP",
                 "dataset_id": dataset.id,
                 "dataset_name": dataset.name,
@@ -1071,25 +1043,8 @@ def _execute_ftp_job_worker(job_id: str) -> None:
 
 
 def process_ftp_ingestion_job(db: Session, job_id: str) -> bool:
-    """Execute background streaming ingestion for an external FTP job.
-
-    Features:
-        * Two-Tier Semaphores (Host & User) to enforce concurrency limits.
-        * Session Heartbeat thread renewing 1800s idle TTL in Redis every 15s.
-        * Checkpoint Manifest (.manifest.json) enabling zero-read resume via
-          FTP ``REST {offset}``.
-        * Stall Detection (180s zero-byte timeout).
-        * Global SHA-256 deduplication against ``UploadedFile``.
-        * Atomic dataset status synchronization upon completion.
-
-    Args:
-        db (Session): Database session.
-        job_id (str): Target ``AsyncIngestionJob`` UUID.
-
-    Returns:
-        bool: ``True`` if the job completed successfully, ``False`` on failure.
-    """
-    job = db.query(AsyncIngestionJob).filter(AsyncIngestionJob.id == job_id).first()
+    """Execute background streaming ingestion for an external FTP job."""
+    job = db.query(IngestedFile).filter(IngestedFile.id == job_id).first()
     if job is None:
         logger.error("FTP ingestion job %s not found", job_id)
         return False
@@ -1157,7 +1112,7 @@ def process_ftp_ingestion_job(db: Session, job_id: str) -> bool:
         port = creds.get("port", 21)
         username = creds["username"]
         password = creds["password"]
-        remote_path = job.source_url_or_id
+        remote_path = job.file_path
 
         # Open FTP connection
         if protocol == "ftps":
@@ -1166,7 +1121,6 @@ def process_ftp_ingestion_job(db: Session, job_id: str) -> bool:
             ftp.auth()
             try:
                 print("For Testing Plain FTP")
-                # ftp.prot_p()
             except Exception:
                 pass
             ftp.login(username, password)
@@ -1204,10 +1158,7 @@ def process_ftp_ingestion_job(db: Session, job_id: str) -> bool:
                 # Volatile Cache Update: Push progress to Redis every 1 second
                 redis_server.set(f"ingest:{job_id}:progress", str(bytes_written), ex=3600)
 
-                # Update progress in DB object
-                job.bytes_downloaded = bytes_written
-                if job.total_bytes > 0:
-                    job.progress_percentage = min(99, int((bytes_written / job.total_bytes) * 100))
+                job.file_size_bytes = bytes_written
 
                 _save_checkpoint_manifest(
                     str(manifest_filepath),
@@ -1215,7 +1166,7 @@ def process_ftp_ingestion_job(db: Session, job_id: str) -> bool:
                         "job_id": job_id,
                         "remote_path": remote_path,
                         "bytes_downloaded": bytes_written,
-                        "total_bytes": job.total_bytes,
+                        "total_bytes": job.file_size_bytes or 0,
                         "updated_at": time.time(),
                     },
                 )
@@ -1225,12 +1176,12 @@ def process_ftp_ingestion_job(db: Session, job_id: str) -> bool:
         master_hash = hasher.hexdigest()
 
         # Check global SHA-256 deduplication
-        existing_file = db.query(UploadedFile).filter(UploadedFile.master_hash == master_hash).first()
-        if existing_file:
-            file_id = existing_file.id
+        existing_file = db.query(IngestedFile).filter(IngestedFile.master_hash == master_hash, IngestedFile.status == "completed").first()
+        if existing_file and existing_file.physical_path:
+            physical_path_str = existing_file.physical_path
             if tmp_filepath.exists():
                 tmp_filepath.unlink(missing_ok=True)
-            logger.info("Dedup hit for job %s; reusing uploaded_files row %s", job_id, file_id)
+            logger.info("Dedup hit for job %s; reusing physical path %s", job_id, physical_path_str)
         else:
             dest_dir = UPLOAD_ROOT / FINAL_ROOT_NAME / FTP_STORAGE_DIR
             dest_dir.mkdir(parents=True, exist_ok=True)
@@ -1239,34 +1190,12 @@ def process_ftp_ingestion_job(db: Session, job_id: str) -> bool:
             final_path = dest_dir / final_filename
 
             shutil.move(str(tmp_filepath), str(final_path))
-
-            new_file = UploadedFile(
-                filename=job.filename,
-                file_size_bytes=bytes_written,
-                master_hash=master_hash,
-                physical_path=str(final_path),
-                source_type="FTP",
-            )
-            db.add(new_file)
-            db.flush()
-            file_id = new_file.id
-
-        # Insert dataset mapping
-        mapping = DatasetFolderFilesMapping(
-            dataset_id=job.dataset_id,
-            folder_id=job.folder_id,
-            file_id=file_id,
-            user_id=job.user_id,
-        )
-        db.add(mapping)
+            physical_path_str = str(final_path)
 
         # Mark completed
         job.status = "completed"
-        job.progress_percentage = 100
-        job.bytes_downloaded = bytes_written
-        if job.total_bytes == 0:
-            job.total_bytes = bytes_written
-        job.file_id = file_id
+        job.file_size_bytes = bytes_written
+        job.physical_path = physical_path_str
         job.master_hash = master_hash
         db.commit()
 
@@ -1276,13 +1205,13 @@ def process_ftp_ingestion_job(db: Session, job_id: str) -> bool:
 
         # Sync dataset status
         try:
-            dataset = db.query(Dataset).filter(Dataset.id == job.dataset_id).first()
-            if dataset is not None:
-                from services.file_services import _sync_dataset_status_from_mappings
-                _sync_dataset_status_from_mappings(db, dataset)
+            if job.dataset_id:
+                dataset = db.query(Dataset).filter(Dataset.id == job.dataset_id).first()
+                if dataset is not None:
+                    from services.file_services import _sync_dataset_status_from_mappings
+                    _sync_dataset_status_from_mappings(db, dataset)
         except Exception as exc:
             logger.warning("Failed to sync dataset status for %s: %s", job.dataset_id, exc)
-
 
         logger.info("FTP ingestion job %s completed successfully", job_id)
         return True
@@ -1307,15 +1236,8 @@ def process_ftp_ingestion_job(db: Session, job_id: str) -> bool:
 
 
 def cleanup_ftp_staging_files(max_age_seconds: int = 86400) -> int:
-    """Scan the uploads/staging directory and remove orphan .tmp and .manifest.json files older than max_age_seconds.
-
-    Args:
-        max_age_seconds (int): Maximum allowed file age in seconds (default 86,400s / 24h).
-
-    Returns:
-        int: Total number of orphan staging files deleted.
-    """
-    staging_dir = UPLOAD_ROOT / "staging"
+    """Scan the uploads/staging directory and remove orphan .tmp and .manifest.json files older than max_age_seconds."""
+    staging_dir = STAGING_ROOT
     if not staging_dir.exists():
         return 0
 
@@ -1348,17 +1270,8 @@ def get_batch_ingestion_status(
     db: Session,
     status_filter: list[str] | str | None = None,
 ) -> dict[str, Any]:
-    """Retrieve batch progress status for active or historical ingestion jobs.
-
-    Args:
-        user (User): The authenticated user.
-        db (Session): Database session.
-        status_filter (list[str] | str | None): Filter status list or comma-separated string.
-
-    Returns:
-        dict[str, Any]: Batch progress payload matching FtpBatchStatusResponse.
-    """
-    query = db.query(AsyncIngestionJob).filter(AsyncIngestionJob.user_id == user.id)
+    """Retrieve batch progress status for active or historical ingestion jobs."""
+    query = db.query(IngestedFile).filter(IngestedFile.user_id == user.id)
 
     if status_filter:
         if isinstance(status_filter, str):
@@ -1366,13 +1279,14 @@ def get_batch_ingestion_status(
         else:
             statuses = list(status_filter)
         if statuses:
-            query = query.filter(AsyncIngestionJob.status.in_(statuses))
+            query = query.filter(IngestedFile.status.in_(statuses))
 
-    jobs = query.order_by(AsyncIngestionJob.created_at.desc()).all()
+    jobs = query.order_by(IngestedFile.created_at.desc()).all()
 
     formatted_jobs = []
     for job in jobs:
-        bytes_dl = job.bytes_downloaded
+        total_bytes = job.file_size_bytes or 0
+        bytes_dl = total_bytes
         if job.status == "in_progress":
             live_bytes = redis_server.get(f"ingest:{job.id}:progress")
             if live_bytes is not None:
@@ -1380,15 +1294,15 @@ def get_batch_ingestion_status(
                     bytes_dl = int(live_bytes)
                 except (ValueError, TypeError):
                     pass
+        elif job.status == "pending":
+            bytes_dl = 0
 
-        pct = job.progress_percentage
-        if job.total_bytes > 0:
-            pct = min(100, int((bytes_dl / job.total_bytes) * 100))
-        elif job.status == "completed":
-            pct = 100
+        pct = 100 if job.status == "completed" else 0
+        if total_bytes > 0:
+            pct = min(100, int((bytes_dl / total_bytes) * 100))
 
-        filesize_str = f"{job.total_bytes / (1024 * 1024):.1f} MB" if job.total_bytes > 0 else "0.0 MB"
-        provider_str = job.provider if isinstance(job.provider, str) else job.provider.value
+        filesize_str = f"{total_bytes / (1024 * 1024):.1f} MB" if total_bytes > 0 else "0.0 MB"
+        provider_str = job.provider.value if isinstance(job.provider, IngestedFileProviderType) else str(job.provider)
 
         formatted_jobs.append({
             "job_id": job.id,
@@ -1399,7 +1313,7 @@ def get_batch_ingestion_status(
             "status": job.status,
             "progress_percentage": pct,
             "bytes_downloaded": bytes_dl,
-            "total_bytes": job.total_bytes,
+            "total_bytes": total_bytes,
             "error_message": job.error_message,
         })
 
@@ -1419,20 +1333,7 @@ def resume_failed_ftp_jobs(
     db: Session,
     job_ids: list[str],
 ) -> dict[str, Any]:
-    """Resume failed ingestion jobs using checkpoint manifests.
-
-    Args:
-        user (User): The authenticated user.
-        db (Session): Database session.
-        job_ids (list[str]): List of job UUIDs to resume.
-
-    Returns:
-        dict[str, Any]: Dict matching FtpResumeResponse schema.
-
-    Raises:
-        FtpSessionExpiredError: If Redis Vault credentials expired (410 Gone).
-        IngestionJobNotFoundError: If no matching failed jobs exist.
-    """
+    """Resume failed ingestion jobs using checkpoint manifests."""
     session_data = redis_server.get(f"ext_ftp:creds:{user.id}")
     if not session_data:
         raise FtpSessionExpiredError(
@@ -1441,11 +1342,11 @@ def resume_failed_ftp_jobs(
         )
 
     failed_jobs = (
-        db.query(AsyncIngestionJob)
+        db.query(IngestedFile)
         .filter(
-            AsyncIngestionJob.id.in_(job_ids),
-            AsyncIngestionJob.user_id == user.id,
-            AsyncIngestionJob.status == "failed",
+            IngestedFile.id.in_(job_ids),
+            IngestedFile.user_id == user.id,
+            IngestedFile.status == "failed",
         )
         .all()
     )

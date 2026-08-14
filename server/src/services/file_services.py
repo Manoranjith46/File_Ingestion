@@ -1,6 +1,5 @@
 """Business logic for chunked file upload workflows."""
 
-
 from __future__ import annotations
 
 import hashlib
@@ -11,13 +10,12 @@ from pathlib import Path
 from uuid import uuid4
 
 from sqlalchemy import func
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from config.redis_server import server as redis_server, atomic_chunk_state
 from helpers.get_env import get_env
 from models.auth_model import User
-from models.file_model import Folder, UploadedFile, UploadedFileSourceType, Dataset, DatasetFolderFilesMapping, AsyncIngestionJob
+from models.file_model import Dataset, IngestedFile, IngestedFileProviderType
 from schemas.file_schema import (
     CHUNK_SIZE_BYTES,
     UploadDeleteResponse,
@@ -43,7 +41,6 @@ from utils.errors import (
     FileNotFoundError,
     FileOwnershipError,
     FilenameCollisionError,
-    FolderNotFoundError,
     IngestionJobNotFoundError,
     InvalidDatasetStateError,
     InvalidRelativePathError,
@@ -72,9 +69,9 @@ def _ensure_storage_dirs() -> None:
     SHAREPOINT_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def get_storage_root_for_provider(source_type: str | UploadedFileSourceType | None) -> Path:
+def get_storage_root_for_provider(source_type: str | IngestedFileProviderType | None) -> Path:
     """Return the designated storage directory for a file based on its source type / provider."""
-    if isinstance(source_type, UploadedFileSourceType):
+    if isinstance(source_type, IngestedFileProviderType):
         val = source_type.value
     else:
         val = str(source_type) if source_type else "Local"
@@ -84,6 +81,8 @@ def get_storage_root_for_provider(source_type: str | UploadedFileSourceType | No
         dir_path = GDRIVE_STORAGE_DIR
     elif "sharepoint" in val_lower or "onedrive" in val_lower or "microsoft" in val_lower:
         dir_path = SHAREPOINT_STORAGE_DIR
+    elif "ftp" in val_lower:
+        dir_path = FINAL_ROOT / "FTP"
     else:
         dir_path = LOCAL_STORAGE_DIR
 
@@ -101,7 +100,6 @@ def _bitmap_key(upload_id: str) -> str:
 
 def _chunk_hashes_key(upload_id: str) -> str:
     return f"upload:{upload_id}:chunk_hashes"
-
 
 
 def _parts_dir(upload_id: str) -> Path:
@@ -122,15 +120,7 @@ def _uploaded_filename(filename: str) -> str:
 
 
 def _generate_rename_suggestion(filename: str, existing_names: set[str]) -> str:
-    """Generate a non-colliding filename by appending (1), (2), etc.
-
-    Args:
-        filename: The original filename that collides.
-        existing_names: Set of filenames already present in the scope.
-
-    Returns:
-        str: A filename guaranteed not to collide with *existing_names*.
-    """
+    """Generate a non-colliding filename by appending (1), (2), etc."""
     stem = Path(filename).stem
     suffix = Path(filename).suffix
     counter = 1
@@ -174,16 +164,7 @@ def _validate_relative_path(relative_path: str | None) -> list[str]:
 
 
 def _resolve_folder_parts(relative_path: str | None, filename: str | None = None) -> list[str]:
-    """
-    Resolve the folder segments from an upload path.
-
-    Args:
-        relative_path (str | None): The client-supplied relative path.
-        filename (str | None): The original file name, used to strip a trailing file segment.
-
-    Returns:
-        list[str]: The folder path segments.
-    """
+    """Resolve the folder segments from an upload path."""
     parts = _validate_relative_path(relative_path)
     if not parts:
         return []
@@ -194,87 +175,13 @@ def _resolve_folder_parts(relative_path: str | None, filename: str | None = None
     return parts
 
 
-def _get_folder_tree(db: Session, user: User, relative_path: str | None, filename: str | None = None) -> Folder | None:
-    parts = _resolve_folder_parts(relative_path, filename)
-    if not parts:
-        return None
-
-    parent_id: str | None = None
-    folder: Folder | None = None
-    for part in parts:
-        folder = (
-            db.query(Folder)
-            .filter(Folder.user_id == user.id, Folder.parent_id == parent_id, Folder.name == part)
-            .one_or_none()
-        )
-        if folder is None:
-            folder = Folder(user_id=user.id, name=part, parent_id=parent_id)
-            db.add(folder)
-            db.flush()
-        parent_id = folder.id
-    return folder
-
-
-def _get_folder_by_id(db: Session, user: User, folder_id: str) -> Folder:
-    """
-    Resolve a folder by ID for the current user.
-
-    Args:
-        db (Session): The active database session.
-        user (User): The authenticated user.
-        folder_id (str): The folder ID to resolve.
-
-    Returns:
-        Folder: The matching folder row.
-
-    Raises:
-        HTTPException: If the folder does not exist or does not belong to the user.
-    """
-    folder = db.query(Folder).filter(Folder.id == folder_id, Folder.user_id == user.id).one_or_none()
-    if folder is None:
-        raise FolderNotFoundError()
-    return folder
-
-
-def _collect_descendant_folder_ids(db: Session, user: User, folder_id: str) -> set[str]:
-    """
-    Collect a folder and all of its descendant folder IDs.
-
-    Args:
-        db (Session): The active database session.
-        user (User): The authenticated user.
-        folder_id (str): The root folder ID.
-
-    Returns:
-        set[str]: The folder ID set including descendants.
-    """
-    folder_ids: set[str] = {folder_id}
-    queue: list[str] = [folder_id]
-
-    while queue:
-        current_folder_id = queue.pop(0)
-        children = (
-            db.query(Folder.id)
-            .filter(Folder.user_id == user.id, Folder.parent_id == current_folder_id)
-            .all()
-        )
-        for child_id, in children:
-            if child_id not in folder_ids:
-                folder_ids.add(child_id)
-                queue.append(child_id)
-
-    return folder_ids
-
-
 def _build_tree(
     db: Session,
     user: User,
     dataset_id: str | None = None,
     folder_id: str | None = None,
 ) -> UploadsTreeResponse:
-    """
-    Construct the nested upload tree for a user, optionally filtered by dataset or folder.
-    """
+    """Construct the nested upload tree for a user."""
     dataset = None
     if dataset_id:
         try:
@@ -282,105 +189,59 @@ def _build_tree(
         except DatasetNotFoundError:
             return UploadsTreeResponse(id=str(uuid4()), type="folder", name="root", children=[])
 
-    if folder_id:
-        root_folder = _get_folder_by_id(db, user, folder_id)
-        root = UploadsTreeResponse(
-            id=root_folder.id,
-            type="folder",
-            name=root_folder.name,
-            dataset_name=dataset.name if dataset else None,
-            status=dataset.status if dataset else None,
-            children=[],
-        )
-        scoped_folder_ids = _collect_descendant_folder_ids(db, user, root_folder.id)
-    else:
-        root = UploadsTreeResponse(
-            id=str(uuid4()),
-            type="folder",
-            name="root",
-            dataset_name=dataset.name if dataset else None,
-            status=dataset.status if dataset else None,
-            children=[],
-        )
-        scoped_folder_ids = set()
-
-    mapping_query = (
-        db.query(DatasetFolderFilesMapping)
-        .filter(DatasetFolderFilesMapping.user_id == user.id)
+    root = UploadsTreeResponse(
+        id=str(uuid4()),
+        type="folder",
+        name="root",
+        dataset_name=dataset.name if dataset else None,
+        status=dataset.status if dataset else None,
+        children=[],
     )
+
+    query = db.query(IngestedFile).filter(IngestedFile.user_id == user.id)
     if dataset_id:
-        mapping_query = mapping_query.filter(DatasetFolderFilesMapping.dataset_id == dataset_id)
-    if folder_id:
-        mapping_query = mapping_query.filter(DatasetFolderFilesMapping.folder_id.in_(scoped_folder_ids))
+        query = query.filter(IngestedFile.dataset_id == dataset_id)
+    files = query.all()
 
-    mappings = mapping_query.all()
+    folder_nodes: dict[str, UploadsTreeResponse] = {"root": root}
 
-    if folder_id:
-        all_folder_ids = scoped_folder_ids
-    else:
-        folder_ids = {m.folder_id for m in mappings if m.folder_id is not None}
-        all_folder_ids = set(folder_ids)
-        for fid in list(folder_ids):
-            curr_id = fid
-            while curr_id:
-                f = db.query(Folder).filter(Folder.id == curr_id, Folder.user_id == user.id).first()
-                if f and f.parent_id:
-                    all_folder_ids.add(f.parent_id)
-                    curr_id = f.parent_id
-                else:
-                    break
+    for f in files:
+        dataset_name = dataset.name if dataset else (f.dataset.name if f.dataset else None)
+        dataset_status = dataset.status if dataset else (f.dataset.status if f.dataset else None)
+        provider_val = f.provider.value if isinstance(f.provider, IngestedFileProviderType) else str(f.provider)
 
-    folders = (
-        db.query(Folder)
-        .filter(Folder.id.in_(all_folder_ids), Folder.user_id == user.id)
-        .all()
-        if all_folder_ids
-        else []
-    )
-
-    folder_map: dict[str, UploadsTreeResponse] = {"root": root}
-    for folder in folders:
-        if folder_id and folder.id == root.id:
-            folder_map[folder.id] = root
-            continue
-        node = UploadsTreeResponse(
-            id=folder.id,
-            type="folder",
-            name=folder.name,
-            dataset_name=dataset.name if dataset else None,
-            status=dataset.status if dataset else None,
-            children=[],
-        )
-        folder_map[folder.id] = node
-
-    for folder in folders:
-        if folder_id and folder.id == root.id:
-            continue
-
-        parent_id = folder.parent_id if folder_id else (folder.parent_id or "root")
-        if parent_id in folder_map:
-            folder_map[parent_id].children = folder_map[parent_id].children or []
-            folder_map[parent_id].children.append(folder_map[folder.id])
-
-    for m in mappings:
-        uploaded_file = db.query(UploadedFile).filter(UploadedFile.id == m.file_id).first()
-        if not uploaded_file:
-            continue
-        dataset_for_mapping = db.query(Dataset).filter(Dataset.id == m.dataset_id, Dataset.is_deleted == False).one_or_none()
-        parent_id = m.folder_id or "root"
-        node = UploadsTreeResponse(
-            id=uploaded_file.id,
+        file_node = UploadsTreeResponse(
+            id=f.id,
             type="file",
-            name=uploaded_file.filename,
-            size=uploaded_file.file_size_bytes,
-            dataset_name=dataset_for_mapping.name if dataset_for_mapping else None,
-            status=dataset_for_mapping.status if dataset_for_mapping else None,
-            source_type=uploaded_file.source_type.value if uploaded_file.source_type else None,
+            name=f.filename,
+            size=f.file_size_bytes,
+            dataset_name=dataset_name,
+            status=dataset_status,
+            source_type=provider_val,
         )
-        if parent_id in folder_map:
-            folder_map[parent_id].children = folder_map[parent_id].children or []
-            if not any(c.id == node.id for c in folder_map[parent_id].children):
-                folder_map[parent_id].children.append(node)
+
+        parts = _resolve_folder_parts(f.file_path, f.filename)
+        current_node = root
+        current_path_acc = ""
+        for part in parts:
+            current_path_acc = f"{current_path_acc}/{part}"
+            if current_path_acc not in folder_nodes:
+                folder_node = UploadsTreeResponse(
+                    id=str(uuid4()),
+                    type="folder",
+                    name=part,
+                    dataset_name=dataset_name,
+                    status=dataset_status,
+                    children=[],
+                )
+                folder_nodes[current_path_acc] = folder_node
+                current_node.children = current_node.children or []
+                current_node.children.append(folder_node)
+            current_node = folder_nodes[current_path_acc]
+
+        current_node.children = current_node.children or []
+        if not any(c.id == file_node.id for c in current_node.children):
+            current_node.children.append(file_node)
 
     return root
 
@@ -406,45 +267,24 @@ def _merge_chunk_files(chunk_paths: list[Path], destination_path: Path) -> None:
 
 
 def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> UploadInitResponse:
-    """
-    Create an upload session and short-circuit when the file already exists.
-
-    Args:
-        db (Session): The active database session.
-        user (User): The authenticated user.
-        payload (UploadInitRequest): The upload initialization details.
-
-    Returns:
-        UploadInitResponse: The upload initialization details.
-
-    Raises:
-        HTTPException: If the dataset is not found, invalid, or unauthorized.
-    """
+    """Create an upload session and short-circuit when the file already exists."""
     _ensure_storage_dirs()
 
     dataset = get_dataset_by_id(db, user, payload.dataset_id)
     if dataset.status == "Completed":
         raise InvalidDatasetStateError(message="Completed datasets cannot receive new uploads")
 
-    folder = _get_folder_tree(db, user, payload.relative_path, payload.filename)
-    if folder is not None:
-        db.commit()
-
-    folder_id_for_check = folder.id if folder else None
-
     # 1. Check if exact mapping already exists (duplicate_short_circuit)
-    exists_mapping = (
-        db.query(DatasetFolderFilesMapping)
-        .join(UploadedFile)
+    exists_file = (
+        db.query(IngestedFile)
         .filter(
-            DatasetFolderFilesMapping.user_id == user.id,
-            DatasetFolderFilesMapping.dataset_id == payload.dataset_id,
-            DatasetFolderFilesMapping.folder_id == folder_id_for_check,
-            UploadedFile.master_hash == payload.master_hash,
+            IngestedFile.user_id == user.id,
+            IngestedFile.dataset_id == payload.dataset_id,
+            IngestedFile.master_hash == payload.master_hash,
         )
         .first()
     )
-    if exists_mapping is not None:
+    if exists_file is not None:
         return UploadInitResponse(
             upload_id=str(uuid4()),
             chunk_size=CHUNK_SIZE_BYTES,
@@ -452,18 +292,16 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
             status="duplicate_short_circuit",
         )
 
-    # 2. Virtual Deduplication — filename collision check for different files
-    existing_mappings = (
-        db.query(DatasetFolderFilesMapping)
-        .join(UploadedFile)
+    # 2. Virtual Deduplication — filename collision check
+    existing_files = (
+        db.query(IngestedFile)
         .filter(
-            DatasetFolderFilesMapping.dataset_id == payload.dataset_id,
-            DatasetFolderFilesMapping.folder_id == folder_id_for_check,
+            IngestedFile.dataset_id == payload.dataset_id,
         )
         .all()
     )
     existing_names: set[str] = {
-        m.file.filename for m in existing_mappings if m.file is not None and m.file.master_hash != payload.master_hash
+        f.filename for f in existing_files if f.master_hash != payload.master_hash
     }
 
     effective_filename = payload.filename
@@ -478,20 +316,19 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
                     "suggestion": suggestion,
                 },
             )
-        # auto_rename=True — use the renamed filename for the rest of the flow
         effective_filename = suggestion
 
-    # 2. Check if physical file exists globally (duplicate_suspected)
-    exists_file = (
-        db.query(UploadedFile)
-        .filter(UploadedFile.master_hash == payload.master_hash)
+    # 3. Check if physical file exists globally (duplicate_suspected)
+    global_file = (
+        db.query(IngestedFile)
+        .filter(IngestedFile.master_hash == payload.master_hash)
         .first()
     )
 
     upload_id = str(uuid4())
+    provider_str = payload.source_type or "Local"
 
-    if exists_file is not None:
-        # Save upload session metadata in Redis without creating ghost SQL mappings
+    if global_file is not None:
         redis_server.hset(
             _meta_key(upload_id),
             mapping={
@@ -500,10 +337,10 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
                 "filename": effective_filename,
                 "filesize": str(payload.filesize),
                 "master_hash": payload.master_hash,
-                "folder_id": folder.id if folder else "",
+                "relative_path": payload.relative_path or "",
                 "total_chunks": "0",
-                "linked_file_id": exists_file.id,
-                "source_type": payload.source_type or "",
+                "linked_file_id": global_file.id,
+                "source_type": provider_str,
             },
         )
         redis_server.expire(_meta_key(upload_id), SESSION_TTL_SECONDS)
@@ -515,7 +352,7 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
             status="duplicate_suspected",
         )
 
-    # 3. New file upload flow
+    # 4. New file upload flow
     total_chunks = _compute_total_chunks(payload.filesize)
     _parts_dir(upload_id).mkdir(parents=True, exist_ok=True)
 
@@ -527,9 +364,9 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
             "filename": effective_filename,
             "filesize": str(payload.filesize),
             "master_hash": payload.master_hash,
-            "folder_id": folder.id if folder else "",
+            "relative_path": payload.relative_path or "",
             "total_chunks": str(total_chunks),
-            "source_type": payload.source_type or "",
+            "source_type": provider_str,
         },
     )
     redis_server.expire(_meta_key(upload_id), SESSION_TTL_SECONDS)
@@ -545,21 +382,7 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
 
 
 def process_upload_chunk(db: Session, user: User, payload: UploadChunkRequest, chunk_bytes: bytes) -> UploadChunkResponse:
-    """
-    Process a single upload chunk atomically and lock-free.
-
-    Args:
-        db (Session): The active database session.
-        user (User): The authenticated user.
-        payload (UploadChunkRequest): The chunk payload details.
-        chunk_bytes (bytes): The raw chunk bytes.
-
-    Returns:
-        UploadChunkResponse: Details of the processed chunk.
-
-    Raises:
-        HTTPException: If the session is not found, unauthorized, or hash matches fail.
-    """
+    """Process a single upload chunk atomically and lock-free."""
     meta = redis_server.hgetall(_meta_key(payload.upload_id))
     if not meta:
         raise UploadSessionNotFoundError()
@@ -578,14 +401,12 @@ def process_upload_chunk(db: Session, user: User, payload: UploadChunkRequest, c
     hashes_key = _chunk_hashes_key(payload.upload_id)
     meta_key = _meta_key(payload.upload_id)
 
-    # Check and set chunk state atomically using the Lua script (0 = new, 1 = exists)
     already_uploaded = atomic_chunk_state(
         keys=[bitmap_key, hashes_key, meta_key],
         args=[payload.chunk_index, computed_hash, SESSION_TTL_SECONDS],
     )
 
     if already_uploaded == 0:
-        # Write the chunk to its isolated file path (lock-free)
         chunk_file_path = _chunk_path(payload.upload_id, payload.chunk_index)
         chunk_file_path.parent.mkdir(parents=True, exist_ok=True)
         chunk_file_path.write_bytes(chunk_bytes)
@@ -603,20 +424,7 @@ def process_upload_chunk(db: Session, user: User, payload: UploadChunkRequest, c
 
 
 def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> UploadFinalizeResponse:
-    """
-    Merge completed chunks into a flat physical file and create mappings.
-
-    Args:
-        db (Session): The active database session.
-        user (User): The authenticated user.
-        payload (UploadFinalizeRequest): The upload finalization details.
-
-    Returns:
-        UploadFinalizeResponse: The details of the finalized file mapping.
-
-    Raises:
-        HTTPException: If session is missing, unauthorized, incomplete, or hashes mismatch.
-    """
+    """Merge completed chunks into a flat physical file and create IngestedFile record."""
     meta = redis_server.hgetall(_meta_key(payload.upload_id))
     if not meta:
         raise UploadSessionNotFoundError()
@@ -626,58 +434,70 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
         raise ChunkValidationError(message="master_hash mismatch")
 
     dataset_id = meta["dataset_id"]
-    folder_id = meta.get("folder_id") or None
-    source_type_value = meta.get("source_type") or None
-    if folder_id == "":
-        folder_id = None
+    source_type_value = meta.get("source_type") or "Local"
+    relative_path = meta.get("relative_path") or meta["filename"]
 
-    if folder_id is not None:
-        folder = (
-            db.query(Folder)
-            .filter(Folder.id == folder_id, Folder.user_id == user.id)
-            .one_or_none()
-        )
-        if folder is None:
-            # Fallback gracefully to root dataset mapping if the folder was deleted or is missing
-            folder_id = None
+    try:
+        provider_enum = IngestedFileProviderType(source_type_value)
+    except ValueError:
+        provider_enum = IngestedFileProviderType.Local
 
     final_file_id = None
-
-    # Check if this is a suspected duplicate fast-link session
     linked_file_id = meta.get("linked_file_id")
+
     if linked_file_id:
-        # Verify the physical file exists
-        uploaded_file = db.query(UploadedFile).filter(UploadedFile.id == linked_file_id).one_or_none()
-        if uploaded_file is None:
+        existing_file = db.query(IngestedFile).filter(IngestedFile.id == linked_file_id).one_or_none()
+        if existing_file is None:
             raise FileNotFoundError(message="Linked file not found")
 
-        if source_type_value:
-            uploaded_file.source_type = UploadedFileSourceType(source_type_value)
-        final_file_id = linked_file_id
+        final_file_id = str(uuid4())
+        new_file = IngestedFile(
+            id=final_file_id,
+            user_id=user.id,
+            dataset_id=dataset_id,
+            provider=provider_enum,
+            file_path=relative_path if relative_path else meta["filename"],
+            filename=meta["filename"],
+            physical_path=existing_file.physical_path,
+            file_size_bytes=existing_file.file_size_bytes,
+            master_hash=payload.master_hash,
+            status="completed",
+        )
+        db.add(new_file)
+        db.flush()
     else:
-        # Standard upload flow
         total_chunks = int(meta["total_chunks"])
         bitmap_key = _bitmap_key(payload.upload_id)
         received_chunks = int(redis_server.bitcount(bitmap_key) or 0)
         if received_chunks != total_chunks:
             raise UploadIncompleteError()
 
-        # 1. Check if the physical file exists globally (concurrency safety)
-        uploaded_file = (
-            db.query(UploadedFile)
-            .filter(UploadedFile.master_hash == payload.master_hash)
+        global_file = (
+            db.query(IngestedFile)
+            .filter(IngestedFile.master_hash == payload.master_hash)
             .first()
         )
+        parts_dir = _parts_dir(payload.upload_id)
 
-        if uploaded_file is not None:
-            # The file already exists globally (e.g. uploaded concurrently)
-            final_file_id = uploaded_file.id
-            parts_dir = _parts_dir(payload.upload_id)
+        if global_file is not None:
+            final_file_id = str(uuid4())
+            new_file = IngestedFile(
+                id=final_file_id,
+                user_id=user.id,
+                dataset_id=dataset_id,
+                provider=provider_enum,
+                file_path=relative_path if relative_path else meta["filename"],
+                filename=meta["filename"],
+                physical_path=global_file.physical_path,
+                file_size_bytes=global_file.file_size_bytes,
+                master_hash=payload.master_hash,
+                status="completed",
+            )
+            db.add(new_file)
+            db.flush()
             shutil.rmtree(parts_dir, ignore_errors=True)
         else:
-            # Perform chunk assembly
-            target_root = get_storage_root_for_provider(source_type_value)
-            parts_dir = _parts_dir(payload.upload_id)
+            target_root = get_storage_root_for_provider(provider_enum)
             staging_file_id = str(uuid4())
             staging_path = target_root / f"{staging_file_id}.pending"
             try:
@@ -689,16 +509,19 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
                 staging_path.replace(final_path)
                 file_size_bytes = final_path.stat().st_size
 
-                # Create physical file entry
-                new_uploaded_file = UploadedFile(
+                new_file = IngestedFile(
                     id=final_file_id,
+                    user_id=user.id,
+                    dataset_id=dataset_id,
+                    provider=provider_enum,
+                    file_path=relative_path if relative_path else meta["filename"],
                     filename=meta["filename"],
+                    physical_path=str(final_path),
                     file_size_bytes=file_size_bytes,
                     master_hash=meta["master_hash"],
-                    physical_path=str(final_path),
-                    source_type=(UploadedFileSourceType(source_type_value) if source_type_value else None),
+                    status="completed",
                 )
-                db.add(new_uploaded_file)
+                db.add(new_file)
                 db.flush()
             except Exception:
                 staging_path.unlink(missing_ok=True)
@@ -706,72 +529,48 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
             finally:
                 shutil.rmtree(parts_dir, ignore_errors=True)
 
-    # 2. Link file to the mapping using ON CONFLICT DO NOTHING
-    stmt = (
-        pg_insert(DatasetFolderFilesMapping)
-        .values(
-            dataset_id=dataset_id,
-            folder_id=folder_id,
-            file_id=final_file_id,
-            user_id=user.id,
-        )
-        .on_conflict_do_nothing(
-            constraint="uq_dataset_folder_file",
-        )
-    )
-    db.execute(stmt)
-
     dataset = db.query(Dataset).filter(Dataset.id == dataset_id).one_or_none()
     if dataset is not None:
         _sync_dataset_status_from_mappings(db, dataset)
 
     db.commit()
 
-    # Clear Redis keys
     redis_server.delete(_meta_key(payload.upload_id))
     if not linked_file_id:
         redis_server.delete(_bitmap_key(payload.upload_id), _chunk_hashes_key(payload.upload_id))
 
-    return UploadFinalizeResponse(status="completed", file_id=final_file_id, folder_id=folder_id)
+    return UploadFinalizeResponse(status="completed", file_id=final_file_id, folder_id=None)
 
 
 def delete_user_upload(db: Session, user: User, upload_id: str) -> UploadDeleteResponse:
     """Delete an uploaded file and its physical storage for the authenticated user."""
-    uploaded_file = db.query(UploadedFile).filter(UploadedFile.id == upload_id).one_or_none()
-    if uploaded_file is None:
+    ingested_file = db.query(IngestedFile).filter(IngestedFile.id == upload_id).one_or_none()
+    if ingested_file is None:
         raise UploadNotFoundError()
+    if ingested_file.user_id != user.id:
+        raise UploadOwnershipError()
 
-    ownership_mapping = (
-        db.query(DatasetFolderFilesMapping)
-        .filter(DatasetFolderFilesMapping.file_id == upload_id, DatasetFolderFilesMapping.user_id == user.id)
-        .first()
-    )
-    if ownership_mapping is None:
-        raise UploadNotFoundError()
+    dataset_id = ingested_file.dataset_id
 
-    file_path = Path(uploaded_file.physical_path)
-    if file_path.exists():
-        file_path.unlink()
+    if ingested_file.physical_path:
+        ref_count = (
+            db.query(IngestedFile)
+            .filter(IngestedFile.physical_path == ingested_file.physical_path, IngestedFile.id != upload_id)
+            .count()
+        )
+        if ref_count == 0:
+            p = Path(ingested_file.physical_path)
+            if p.exists():
+                p.unlink(missing_ok=True)
 
-    affected_mappings = (
-        db.query(DatasetFolderFilesMapping)
-        .filter(DatasetFolderFilesMapping.file_id == upload_id)
-        .all()
-    )
-    affected_dataset_ids = {mapping.dataset_id for mapping in affected_mappings}
+    db.delete(ingested_file)
 
-    db.query(DatasetFolderFilesMapping).filter(
-        DatasetFolderFilesMapping.file_id == upload_id
-    ).delete(synchronize_session=False)
-    db.delete(uploaded_file)
-
-    for dataset_id in affected_dataset_ids:
+    if dataset_id:
         dataset = db.query(Dataset).filter(Dataset.id == dataset_id).one_or_none()
         if dataset is not None:
             _sync_dataset_status_from_mappings(db, dataset)
 
     db.commit()
-
     return UploadDeleteResponse(status="deleted", file_id=upload_id)
 
 
@@ -781,18 +580,7 @@ def list_user_uploads(
     dataset_id: str | None = None,
     folder_id: str | None = None,
 ) -> UploadsTreeResponse:
-    """
-    Return the authenticated user's uploaded files as a nested tree.
-
-    Args:
-        db (Session): The active database session.
-        user (User): The authenticated user.
-        dataset_id (str | None): Optional dataset ID filter.
-        folder_id (str | None): Optional folder ID filter.
-
-    Returns:
-        UploadsTreeResponse: The nested uploads tree.
-    """
+    """Return the authenticated user's uploaded files as a nested tree."""
     return _build_tree(db, user, dataset_id=dataset_id, folder_id=folder_id)
 
 
@@ -816,8 +604,8 @@ def _sync_dataset_status_from_mappings(db: Session, dataset: Dataset) -> None:
         return
 
     file_count = (
-        db.query(DatasetFolderFilesMapping)
-        .filter(DatasetFolderFilesMapping.dataset_id == dataset.id)
+        db.query(IngestedFile)
+        .filter(IngestedFile.dataset_id == dataset.id)
         .count()
     )
 
@@ -825,20 +613,7 @@ def _sync_dataset_status_from_mappings(db: Session, dataset: Dataset) -> None:
 
 
 def create_dataset(db: Session, user: User, payload: DatasetCreate) -> Dataset:
-    """
-    Create a new dataset catalog entry.
-
-    Args:
-        db (Session): The active database session.
-        user (User): The authenticated user.
-        payload (DatasetCreate): The dataset creation details.
-
-    Returns:
-        Dataset: The created dataset database record.
-
-    Raises:
-        HTTPException: If a dataset with the same name already exists.
-    """
+    """Create a new dataset catalog entry."""
     existing = (
         db.query(Dataset)
         .filter(
@@ -871,18 +646,7 @@ def get_datasets(
     limit: int = 10,
     include_completed: bool = True,
 ) -> list[Dataset]:
-    """
-    Return all active datasets belonging to the user.
-
-    Args:
-        db (Session): The active database session.
-        user (User): The authenticated user.
-        page (int): The page number for pagination.
-        limit (int): The number of datasets to return per page.
-
-    Returns:
-        list[Dataset]: The list of active dataset records.
-    """
+    """Return all active datasets belonging to the user."""
     offset = (page - 1) * limit
     query = db.query(Dataset).filter(Dataset.user_id == user.id, Dataset.is_deleted == False)
     if not include_completed:
@@ -901,20 +665,7 @@ def get_dataset_tree_for_dataset(db: Session, user: User, dataset_id: str) -> Up
 
 
 def get_dataset_by_id(db: Session, user: User, dataset_id: str) -> Dataset:
-    """
-    Retrieve an active dataset by its ID and check ownership.
-
-    Args:
-        db (Session): The active database session.
-        user (User): The authenticated user.
-        dataset_id (str): The ID of the dataset to retrieve.
-
-    Returns:
-        Dataset: The active dataset database record.
-
-    Raises:
-        HTTPException: If the dataset is not found or does not belong to the user.
-    """
+    """Retrieve an active dataset by its ID and check ownership."""
     dataset = (
         db.query(Dataset)
         .filter(Dataset.id == dataset_id, Dataset.is_deleted == False)
@@ -928,28 +679,13 @@ def get_dataset_by_id(db: Session, user: User, dataset_id: str) -> Dataset:
 
 
 def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpdate) -> Dataset:
-    """
-    Update details of an active dataset.
-
-    Args:
-        db (Session): The active database session.
-        user (User): The authenticated user.
-        dataset_id (str): The ID of the dataset to update.
-        payload (DatasetUpdate): The dataset fields to update.
-
-    Returns:
-        Dataset: The updated dataset database record.
-
-    Raises:
-        HTTPException: If the name is duplicate or update fails.
-    """
+    """Update details of an active dataset."""
     dataset = get_dataset_by_id(db, user, dataset_id)
 
     if payload.name is not None:
         name_clean = payload.name.strip()
         if not name_clean:
             raise InvalidDatasetStateError(message="Dataset name cannot be empty.")
-        # Check uniqueness if name is changing
         if name_clean.lower() != dataset.name.lower():
             existing = (
                 db.query(Dataset)
@@ -981,42 +717,16 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
         if target_dataset.status not in {"Created", "Draft"}:
             raise InvalidDatasetStateError(message="Target dataset must be in created or Draft status.")
 
-        mappings_query = (
-            db.query(DatasetFolderFilesMapping)
-            .filter(
-                DatasetFolderFilesMapping.dataset_id == dataset.id,
-                DatasetFolderFilesMapping.user_id == user.id,
-            )
+        query = db.query(IngestedFile).filter(
+            IngestedFile.dataset_id == dataset.id,
+            IngestedFile.user_id == user.id,
         )
-
         if payload.file_id is not None and payload.file_id.strip() != "":
-            mappings_query = mappings_query.filter(DatasetFolderFilesMapping.file_id == payload.file_id)
+            query = query.filter(IngestedFile.id == payload.file_id)
 
-        if payload.folder_id is not None and payload.folder_id.strip() != "":
-            folder = _get_folder_by_id(db, user, payload.folder_id)
-            if folder is None:
-                raise FolderNotFoundError()
-            folder_ids = _collect_descendant_folder_ids(db, user, folder.id)
-            mappings_query = mappings_query.filter(DatasetFolderFilesMapping.folder_id.in_(folder_ids))
-
-        mappings_to_move = mappings_query.all()
-
-        for mapping in mappings_to_move:
-            existing_target_mapping = (
-                db.query(DatasetFolderFilesMapping)
-                .filter(
-                    DatasetFolderFilesMapping.dataset_id == target_dataset.id,
-                    DatasetFolderFilesMapping.folder_id == mapping.folder_id,
-                    DatasetFolderFilesMapping.file_id == mapping.file_id,
-                )
-                .first()
-            )
-            if existing_target_mapping is None:
-                mapping.dataset_id = target_dataset.id
-                mapping.user_id = user.id
-                db.add(mapping)
-            else:
-                db.delete(mapping)
+        files_to_move = query.all()
+        for f in files_to_move:
+            f.dataset_id = target_dataset.id
 
         dataset.status = "Draft"
         _sync_dataset_status_from_mappings(db, dataset)
@@ -1044,43 +754,27 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
 
 
 def delete_dataset(db: Session, user: User, dataset_id: str) -> None:
-    """
-    Remove a dataset, all of its linked files, and the related database rows.
-
-    Args:
-        db (Session): The active database session.
-        user (User): The authenticated user.
-        dataset_id (str): The ID of the dataset to delete.
-
-    Returns:
-        None
-
-    Raises:
-        HTTPException: If the dataset does not exist or is not owned by the user.
-    """
+    """Remove a dataset and all of its linked files."""
     dataset = get_dataset_by_id(db, user, dataset_id)
 
-    mappings = (
-        db.query(DatasetFolderFilesMapping)
-        .filter(DatasetFolderFilesMapping.dataset_id == dataset_id)
+    files = (
+        db.query(IngestedFile)
+        .filter(IngestedFile.dataset_id == dataset_id)
         .all()
     )
 
-    for mapping in mappings:
-        uploaded_file = (
-            db.query(UploadedFile)
-            .filter(UploadedFile.id == mapping.file_id)
-            .one_or_none()
-        )
-        if uploaded_file is not None:
-            file_path = Path(uploaded_file.physical_path)
-            if file_path.exists():
-                file_path.unlink(missing_ok=True)
-            db.delete(uploaded_file)
-
-    db.query(DatasetFolderFilesMapping).filter(
-        DatasetFolderFilesMapping.dataset_id == dataset_id
-    ).delete(synchronize_session=False)
+    for f in files:
+        if f.physical_path:
+            ref_count = (
+                db.query(IngestedFile)
+                .filter(IngestedFile.physical_path == f.physical_path, IngestedFile.id != f.id)
+                .count()
+            )
+            if ref_count == 0:
+                p = Path(f.physical_path)
+                if p.exists():
+                    p.unlink(missing_ok=True)
+        db.delete(f)
 
     db.delete(dataset)
     db.commit()
@@ -1092,95 +786,62 @@ def attach_file_to_dataset(
     dataset_id: str,
     payload: DatasetAttachFileRequest,
 ) -> DatasetAttachFileResponse:
-    """
-    Attach an existing uploaded file to a dataset and optional folder (zero-I/O).
-
-    Args:
-        db (Session): The active database session.
-        user (User): The authenticated user.
-        dataset_id (str): The target dataset ID.
-        payload (DatasetAttachFileRequest): The attachment request schema.
-
-    Returns:
-        DatasetAttachFileResponse: The attach operation result.
-
-    Raises:
-        HTTPException: If the dataset or file is not found, or IDOR ownership check fails.
-    """
-    # 1. Enforce dataset ownership
+    """Attach an existing uploaded file to a dataset."""
     dataset = get_dataset_by_id(db, user, dataset_id)
-
-    # 2. Strict IDOR ownership check: user must own at least one mapping to this file_id
-    user_file_mapping = (
-        db.query(DatasetFolderFilesMapping)
-        .filter(
-            DatasetFolderFilesMapping.user_id == user.id,
-            DatasetFolderFilesMapping.file_id == payload.file_id,
-        )
-        .first()
-    )
-    if user_file_mapping is None:
-        file_exists = db.query(UploadedFile).filter(UploadedFile.id == payload.file_id).first()
-        if file_exists is None:
-            raise FileNotFoundError()
-        else:
-            raise FileOwnershipError()
-
     if dataset.status == "Completed":
         raise InvalidDatasetStateError(message="Completed datasets cannot be modified.")
 
-    # 3. Resolve folder structure if relative_path provided
-    folder = _get_folder_tree(db, user, payload.relative_path)
-    folder_id = folder.id if folder else None
+    user_file = (
+        db.query(IngestedFile)
+        .filter(IngestedFile.id == payload.file_id)
+        .first()
+    )
+    if user_file is None:
+        raise FileNotFoundError()
+    if user_file.user_id != user.id:
+        raise FileOwnershipError()
 
-    # 4. Check if mapping already exists
-    existing_mapping = (
-        db.query(DatasetFolderFilesMapping)
+    relative_path = payload.relative_path or user_file.file_path
+
+    existing_attach = (
+        db.query(IngestedFile)
         .filter(
-            DatasetFolderFilesMapping.dataset_id == dataset.id,
-            DatasetFolderFilesMapping.folder_id == folder_id,
-            DatasetFolderFilesMapping.file_id == payload.file_id,
+            IngestedFile.dataset_id == dataset.id,
+            IngestedFile.user_id == user.id,
+            IngestedFile.master_hash == user_file.master_hash,
+            IngestedFile.file_path == relative_path,
         )
         .first()
     )
 
-    if existing_mapping is None:
-        mapping = DatasetFolderFilesMapping(
-            dataset_id=dataset.id,
-            folder_id=folder_id,
-            file_id=payload.file_id,
+    if existing_attach is None:
+        new_attach = IngestedFile(
             user_id=user.id,
+            dataset_id=dataset.id,
+            provider=user_file.provider,
+            file_path=relative_path,
+            filename=user_file.filename,
+            physical_path=user_file.physical_path,
+            file_size_bytes=user_file.file_size_bytes,
+            master_hash=user_file.master_hash,
+            provider_hash=user_file.provider_hash,
+            status="completed",
         )
-        db.add(mapping)
-        db.commit()
+        db.add(new_attach)
 
-    file_count = (
-        db.query(DatasetFolderFilesMapping)
-        .filter(DatasetFolderFilesMapping.dataset_id == dataset.id)
-        .count()
-    )
-    if dataset.status != "Completed":
-        dataset.status = "Draft"
-        db.commit()
+    _sync_dataset_status_from_mappings(db, dataset)
+    db.commit()
 
     return DatasetAttachFileResponse(
         status="attached",
         dataset_id=dataset.id,
         file_id=payload.file_id,
-        folder_id=folder_id,
+        folder_id=None,
     )
 
 
 def get_user_integrations(user: User) -> UserIntegrationsResponse:
-    """
-    Retrieve the current cloud integration connection status for a user.
-
-    Args:
-        user (User): The authenticated user instance.
-
-    Returns:
-        UserIntegrationsResponse: Connection status flags for Google Drive and SharePoint.
-    """
+    """Retrieve the current cloud integration connection status for a user."""
     google_connected = bool(user.google_refresh_token and user.google_refresh_token.strip())
     microsoft_connected = bool(user.microsoft_refresh_token and user.microsoft_refresh_token.strip())
     return UserIntegrationsResponse(
@@ -1190,46 +851,34 @@ def get_user_integrations(user: User) -> UserIntegrationsResponse:
 
 
 def get_ingestion_job_status(db: Session, user: User, job_id: str) -> IngestionJobStatusResponse:
-    """
-    Query the status and live progress of a background cloud ingestion job.
-
-    Args:
-        db (Session): The active database session.
-        user (User): The authenticated user initiating the query.
-        job_id (str): The unique identifier of the ingestion job.
-
-    Returns:
-        IngestionJobStatusResponse: Details of the job status and progress.
-
-    Raises:
-        HTTPException: If the job is not found or does not belong to the user.
-    """
+    """Query the status and live progress of a background cloud ingestion job."""
     job = (
-        db.query(AsyncIngestionJob)
-        .filter(AsyncIngestionJob.id == job_id, AsyncIngestionJob.user_id == user.id)
+        db.query(IngestedFile)
+        .filter(IngestedFile.id == job_id, IngestedFile.user_id == user.id)
         .one_or_none()
     )
     if job is None:
         raise IngestionJobNotFoundError()
 
-    # Check live Redis progress key if present
     progress_val = redis_server.get(f"ingest:{job_id}:progress")
-    progress_pct = job.progress_percentage
+    progress_pct = 0
     if progress_val is not None:
         try:
             progress_pct = int(progress_val)
         except (ValueError, TypeError):
             pass
+    elif job.status == "completed":
+        progress_pct = 100
+
+    provider_str = job.provider.value if isinstance(job.provider, IngestedFileProviderType) else str(job.provider)
 
     return IngestionJobStatusResponse(
         job_id=job.id,
-        provider=job.provider,
+        provider=provider_str,
         filename=job.filename,
         status=job.status,
         progress_percentage=progress_pct,
         error_message=job.error_message,
-        file_id=job.file_id,
+        file_id=job.id if job.status == "completed" else None,
         master_hash=job.master_hash,
     )
-
-

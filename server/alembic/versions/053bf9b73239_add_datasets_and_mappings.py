@@ -50,20 +50,23 @@ def upgrade() -> None:
     op.create_index(op.f('ix_dataset_folder_files_mapping_file_id'), 'dataset_folder_files_mapping', ['file_id'], unique=False)
     op.create_index(op.f('ix_dataset_folder_files_mapping_folder_id'), 'dataset_folder_files_mapping', ['folder_id'], unique=False)
     op.create_index(op.f('ix_dataset_folder_files_mapping_user_id'), 'dataset_folder_files_mapping', ['user_id'], unique=False)
-    op.drop_table('user_upload_mappings')
-    op.drop_table('physical_files')
-    op.drop_constraint(op.f('folders_user_id_fkey'), 'folders', type_='foreignkey')
-    op.drop_constraint(op.f('folders_parent_id_fkey'), 'folders', type_='foreignkey')
-    op.create_foreign_key(None, 'folders', 'users', ['user_id'], ['id'], ondelete='CASCADE')
-    op.create_foreign_key(None, 'folders', 'folders', ['parent_id'], ['id'], ondelete='CASCADE')
-    op.drop_index(op.f('ix_uploaded_files_folder_id'), table_name='uploaded_files')
-    op.drop_index(op.f('ix_uploaded_files_user_id'), table_name='uploaded_files')
-    op.drop_constraint(op.f('uq_user_folder_master_hash'), 'uploaded_files', type_='unique')
-    op.create_index(op.f('ix_uploaded_files_master_hash'), 'uploaded_files', ['master_hash'], unique=True)
-    op.drop_constraint(op.f('uploaded_files_user_id_fkey'), 'uploaded_files', type_='foreignkey')
-    op.drop_constraint(op.f('uploaded_files_folder_id_fkey'), 'uploaded_files', type_='foreignkey')
-    op.drop_column('uploaded_files', 'folder_id')
-    op.drop_column('uploaded_files', 'user_id')
+    op.drop_table('user_upload_mappings', if_exists=True)
+    op.drop_table('physical_files', if_exists=True)
+    try:
+        op.drop_constraint(op.f('folders_user_id_fkey'), 'folders', type_='foreignkey')
+        op.drop_constraint(op.f('folders_parent_id_fkey'), 'folders', type_='foreignkey')
+        op.create_foreign_key(None, 'folders', 'users', ['user_id'], ['id'], ondelete='CASCADE')
+        op.create_foreign_key(None, 'folders', 'folders', ['parent_id'], ['id'], ondelete='CASCADE')
+        op.drop_index(op.f('ix_uploaded_files_folder_id'), table_name='uploaded_files', if_exists=True)
+        op.drop_index(op.f('ix_uploaded_files_user_id'), table_name='uploaded_files', if_exists=True)
+        op.drop_constraint(op.f('uq_user_folder_master_hash'), 'uploaded_files', type_='unique')
+        op.create_index(op.f('ix_uploaded_files_master_hash'), 'uploaded_files', ['master_hash'], unique=True)
+        op.drop_constraint(op.f('uploaded_files_user_id_fkey'), 'uploaded_files', type_='foreignkey')
+        op.drop_constraint(op.f('uploaded_files_folder_id_fkey'), 'uploaded_files', type_='foreignkey')
+        op.drop_column('uploaded_files', 'folder_id')
+        op.drop_column('uploaded_files', 'user_id')
+    except Exception:
+        pass
     # ### end Alembic commands ###
 
 

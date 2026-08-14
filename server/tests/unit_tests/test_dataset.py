@@ -47,9 +47,8 @@ from models.auth_model import Base as AuthBase, User  # noqa: E402
 from models.file_model import (  # noqa: E402
     Base as FileBase,
     Dataset,
-    DatasetFolderFilesMapping,
-    Folder,
-    UploadedFile,
+    IngestedFile,
+    IngestedFileProviderType,
 )
 from schemas.file_schema import (  # noqa: E402
     DatasetAttachFileRequest,
@@ -68,7 +67,6 @@ from services.file_services import (  # noqa: E402
     get_datasets,
     get_user_integrations,
     update_dataset,
-    _get_folder_tree,
     _sync_dataset_status_from_mappings,
 )
 
@@ -95,7 +93,6 @@ def _make_engine():
 def db_session() -> Generator[Session, None, None]:
     """Isolated in-memory SQLite session per test — both auth + file tables."""
     engine = _make_engine()
-    # Create both bases on the same engine
     AuthBase.metadata.create_all(bind=engine)
     FileBase.metadata.create_all(bind=engine)
     session = Session(bind=engine)
@@ -155,14 +152,18 @@ def dataset(db_session: Session, user: User) -> Dataset:
 
 
 @pytest.fixture()
-def uploaded_file(db_session: Session) -> UploadedFile:
-    """Create and return a minimal UploadedFile row (no physical I/O)."""
-    f = UploadedFile(
+def uploaded_file(db_session: Session, user: User) -> IngestedFile:
+    """Create and return a minimal IngestedFile row (no physical I/O)."""
+    f = IngestedFile(
         id="file-1",
+        user_id=user.id,
+        provider=IngestedFileProviderType.Local,
+        file_path="test.csv",
         filename="test.csv",
         file_size_bytes=1024,
         master_hash="a" * 64,
         physical_path="/dev/null/test.csv",
+        status="completed",
     )
     db_session.add(f)
     db_session.commit()
@@ -175,19 +176,14 @@ def uploaded_file(db_session: Session) -> UploadedFile:
 # ===========================================================================
 
 def _attach_file_direct(
-    db: Session, user: User, dataset: Dataset, file: UploadedFile, folder: Folder | None = None
-) -> DatasetFolderFilesMapping:
-    """Directly insert a mapping row (bypasses pg_insert ON CONFLICT DO NOTHING)."""
-    mapping = DatasetFolderFilesMapping(
-        dataset_id=dataset.id,
-        folder_id=folder.id if folder else None,
-        file_id=file.id,
-        user_id=user.id,
-    )
-    db.add(mapping)
+    db: Session, user: User, dataset: Dataset, file: IngestedFile, folder: Any = None
+) -> IngestedFile:
+    """Directly link an IngestedFile to a dataset."""
+    file.user_id = user.id
+    file.dataset_id = dataset.id
     db.commit()
-    db.refresh(mapping)
-    return mapping
+    db.refresh(file)
+    return file
 
 
 # ===========================================================================
@@ -463,8 +459,8 @@ def test_delete_dataset_cascades_mappings(
     delete_dataset(db_session, user, ds_id)
 
     remaining = (
-        db_session.query(DatasetFolderFilesMapping)
-        .filter(DatasetFolderFilesMapping.dataset_id == ds_id)
+        db_session.query(IngestedFile)
+        .filter(IngestedFile.dataset_id == ds_id)
         .all()
     )
     assert len(remaining) == 0
@@ -579,56 +575,6 @@ def test_attach_file_to_completed_dataset_raises_400(
             DatasetAttachFileRequest(file_id=uploaded_file.id),
         )
     assert exc.value.status_code == 400
-
-
-# ===========================================================================
-# U-B-27 — _get_folder_tree: creates nested folder hierarchy
-# ===========================================================================
-def test_get_folder_tree_creates_nested_folders(db_session: Session, user: User) -> None:
-    """_get_folder_tree must create and return nested folders for a relative path."""
-    folder = _get_folder_tree(db_session, user, "docs/reports/2024", filename=None)
-    db_session.commit()
-
-    assert folder is not None
-    assert folder.name == "2024"
-    assert folder.parent_id is not None
-
-    parent = db_session.query(Folder).filter(Folder.id == folder.parent_id).one()
-    assert parent.name == "reports"
-
-    grandparent = db_session.query(Folder).filter(Folder.id == parent.parent_id).one()
-    assert grandparent.name == "docs"
-    assert grandparent.parent_id is None
-
-
-# ===========================================================================
-# U-B-28 — _get_folder_tree: idempotent — second call returns existing folder
-# ===========================================================================
-def test_get_folder_tree_idempotent(db_session: Session, user: User) -> None:
-    """Calling _get_folder_tree twice with the same path must not duplicate folders."""
-    folder1 = _get_folder_tree(db_session, user, "shared/sub", filename=None)
-    db_session.commit()
-    folder2 = _get_folder_tree(db_session, user, "shared/sub", filename=None)
-    db_session.commit()
-
-    assert folder1 is not None
-    assert folder2 is not None
-    assert folder1.id == folder2.id
-
-    # Only 2 folder rows total: shared + sub
-    count = (
-        db_session.query(Folder).filter(Folder.user_id == user.id).count()
-    )
-    assert count == 2
-
-
-# ===========================================================================
-# U-B-29 — _get_folder_tree: None path → returns None (root level)
-# ===========================================================================
-def test_get_folder_tree_none_path_returns_none(db_session: Session, user: User) -> None:
-    """A None relative_path must return None (file goes to root of dataset)."""
-    result = _get_folder_tree(db_session, user, None, filename=None)
-    assert result is None
 
 
 # ===========================================================================

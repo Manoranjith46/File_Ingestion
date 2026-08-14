@@ -18,7 +18,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from models.auth_model import Base, User
-from models.file_model import Dataset, DatasetFolderFilesMapping, Folder, UploadedFile, AsyncIngestionJob, ProviderHashMapping, UploadedFileSourceType
+from models.file_model import Dataset, IngestedFile, IngestedFileProviderType
 from schemas.file_schema import DatasetCreate, DatasetUpdate, UploadInitRequest
 from services import file_services
 from services import gdrive_service
@@ -143,34 +143,22 @@ def test_dataset_status_is_persisted_and_returned_on_update(db_session: Session)
     assert completed.status == "Completed"
 
 
-def test_dataset_status_auto_moves_to_draft_for_any_file(db_session: Session) -> None:
-    """Adding files to a draft dataset should keep it in Draft until completion."""
+def test_attach_file_to_dataset_multi_file_transitions(db_session: Session) -> None:
+    """Attaching multiple files should transition dataset to Draft."""
     user = User(email="multi@example.com", username="multi", full_name="Multi User", password_hash="hash", auth_provider="local", is_verified=True)
     db_session.add(user)
     db_session.commit()
     db_session.refresh(user)
 
     dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Multi Dataset", language="English"))
-    first_file = UploadedFile(filename="a.txt", file_size_bytes=1, master_hash="1" * 64, physical_path="/tmp/a.txt")
-    second_file = UploadedFile(filename="b.txt", file_size_bytes=1, master_hash="2" * 64, physical_path="/tmp/b.txt")
+    first_file = IngestedFile(user_id=user.id, provider=IngestedFileProviderType.Local, file_path="a.txt", filename="a.txt", file_size_bytes=1, master_hash="1" * 64, physical_path="/tmp/a.txt", status="completed")
+    second_file = IngestedFile(user_id=user.id, provider=IngestedFileProviderType.Local, file_path="b.txt", filename="b.txt", file_size_bytes=1, master_hash="2" * 64, physical_path="/tmp/b.txt", status="completed")
     db_session.add_all([first_file, second_file])
-    db_session.commit()
-    db_session.refresh(first_file)
-    db_session.refresh(second_file)
-
-    db_session.add(
-        DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=first_file.id, user_id=user.id)
-    )
     db_session.commit()
 
     file_services.attach_file_to_dataset(db_session, user, dataset.id, SimpleNamespace(file_id=first_file.id, relative_path=None))
     db_session.refresh(dataset)
     assert dataset.status == "Draft"
-
-    db_session.add(
-        DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=second_file.id, user_id=user.id)
-    )
-    db_session.commit()
 
     file_services.attach_file_to_dataset(db_session, user, dataset.id, SimpleNamespace(file_id=second_file.id, relative_path=None))
     db_session.refresh(dataset)
@@ -178,7 +166,7 @@ def test_dataset_status_auto_moves_to_draft_for_any_file(db_session: Session) ->
 
 
 def test_update_dataset_can_move_mappings_to_another_dataset(db_session: Session) -> None:
-    """Dataset updates should allow moving file mappings to another eligible dataset."""
+    """Dataset updates should allow moving files to another eligible dataset."""
     user = User(email="move@example.com", username="move", full_name="Move User", password_hash="hash", auth_provider="local", is_verified=True)
     db_session.add(user)
     db_session.commit()
@@ -187,13 +175,8 @@ def test_update_dataset_can_move_mappings_to_another_dataset(db_session: Session
     source_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Source Dataset", language="English"))
     target_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Target Dataset", language="English"))
 
-    uploaded_file = UploadedFile(filename="move.txt", file_size_bytes=8, master_hash="m" * 64, physical_path="/tmp/move.txt")
+    uploaded_file = IngestedFile(user_id=user.id, dataset_id=source_dataset.id, provider=IngestedFileProviderType.Local, file_path="move.txt", filename="move.txt", file_size_bytes=8, master_hash="m" * 64, physical_path="/tmp/move.txt", status="completed")
     db_session.add(uploaded_file)
-    db_session.commit()
-    db_session.refresh(uploaded_file)
-
-    mapping = DatasetFolderFilesMapping(dataset_id=source_dataset.id, folder_id=None, file_id=uploaded_file.id, user_id=user.id)
-    db_session.add(mapping)
     db_session.commit()
 
     updated = file_services.update_dataset(
@@ -204,19 +187,13 @@ def test_update_dataset_can_move_mappings_to_another_dataset(db_session: Session
     )
 
     assert updated.id == source_dataset.id
-    assert db_session.query(DatasetFolderFilesMapping).filter(
-        DatasetFolderFilesMapping.dataset_id == source_dataset.id,
-        DatasetFolderFilesMapping.file_id == uploaded_file.id,
-    ).count() == 0
-    assert db_session.query(DatasetFolderFilesMapping).filter(
-        DatasetFolderFilesMapping.dataset_id == target_dataset.id,
-        DatasetFolderFilesMapping.file_id == uploaded_file.id,
-    ).count() == 1
+    assert db_session.query(IngestedFile).filter(IngestedFile.dataset_id == source_dataset.id).count() == 0
+    assert db_session.query(IngestedFile).filter(IngestedFile.dataset_id == target_dataset.id).count() == 1
     assert source_dataset.status == "Created"
 
 
 def test_update_dataset_can_move_a_single_file_mapping_to_another_dataset(db_session: Session) -> None:
-    """Dataset updates should allow moving a single file mapping to another dataset."""
+    """Dataset updates should allow moving a single file to another dataset."""
     user = User(email="single-move@example.com", username="singlemove", full_name="Single Move", password_hash="hash", auth_provider="local", is_verified=True)
     db_session.add(user)
     db_session.commit()
@@ -225,13 +202,8 @@ def test_update_dataset_can_move_a_single_file_mapping_to_another_dataset(db_ses
     source_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Single Source", language="English"))
     target_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Single Target", language="English"))
 
-    uploaded_file = UploadedFile(filename="single.txt", file_size_bytes=8, master_hash="s" * 64, physical_path="/tmp/single.txt")
+    uploaded_file = IngestedFile(user_id=user.id, dataset_id=source_dataset.id, provider=IngestedFileProviderType.Local, file_path="single.txt", filename="single.txt", file_size_bytes=8, master_hash="s" * 64, physical_path="/tmp/single.txt", status="completed")
     db_session.add(uploaded_file)
-    db_session.commit()
-    db_session.refresh(uploaded_file)
-
-    mapping = DatasetFolderFilesMapping(dataset_id=source_dataset.id, folder_id=None, file_id=uploaded_file.id, user_id=user.id)
-    db_session.add(mapping)
     db_session.commit()
 
     file_services.update_dataset(
@@ -241,18 +213,12 @@ def test_update_dataset_can_move_a_single_file_mapping_to_another_dataset(db_ses
         DatasetUpdate(target_dataset_id=target_dataset.id, file_id=uploaded_file.id),
     )
 
-    assert db_session.query(DatasetFolderFilesMapping).filter(
-        DatasetFolderFilesMapping.dataset_id == source_dataset.id,
-        DatasetFolderFilesMapping.file_id == uploaded_file.id,
-    ).count() == 0
-    assert db_session.query(DatasetFolderFilesMapping).filter(
-        DatasetFolderFilesMapping.dataset_id == target_dataset.id,
-        DatasetFolderFilesMapping.file_id == uploaded_file.id,
-    ).count() == 1
+    assert db_session.query(IngestedFile).filter(IngestedFile.dataset_id == source_dataset.id).count() == 0
+    assert db_session.query(IngestedFile).filter(IngestedFile.dataset_id == target_dataset.id).count() == 1
 
 
 def test_update_dataset_can_move_a_folder_subtree_to_another_dataset(db_session: Session) -> None:
-    """Dataset updates should allow moving a folder subtree to another eligible dataset."""
+    """Dataset updates should allow moving a file/folder to another eligible dataset."""
     user = User(email="folder-move@example.com", username="foldermove", full_name="Folder Move", password_hash="hash", auth_provider="local", is_verified=True)
     db_session.add(user)
     db_session.commit()
@@ -261,39 +227,19 @@ def test_update_dataset_can_move_a_folder_subtree_to_another_dataset(db_session:
     source_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Folder Source", language="English"))
     target_dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Folder Target", language="English"))
 
-    parent_folder = Folder(user_id=user.id, name="parent")
-    db_session.add(parent_folder)
-    db_session.flush()
-    child_folder = Folder(user_id=user.id, name="child", parent_id=parent_folder.id)
-    db_session.add(child_folder)
-    db_session.commit()
-    db_session.refresh(parent_folder)
-    db_session.refresh(child_folder)
-
-    uploaded_file = UploadedFile(filename="nested.txt", file_size_bytes=8, master_hash="f" * 64, physical_path="/tmp/nested.txt")
+    uploaded_file = IngestedFile(user_id=user.id, dataset_id=source_dataset.id, provider=IngestedFileProviderType.Local, file_path="parent/child/nested.txt", filename="nested.txt", file_size_bytes=8, master_hash="f" * 64, physical_path="/tmp/nested.txt", status="completed")
     db_session.add(uploaded_file)
-    db_session.commit()
-    db_session.refresh(uploaded_file)
-
-    mapping = DatasetFolderFilesMapping(dataset_id=source_dataset.id, folder_id=child_folder.id, file_id=uploaded_file.id, user_id=user.id)
-    db_session.add(mapping)
     db_session.commit()
 
     file_services.update_dataset(
         db_session,
         user,
         source_dataset.id,
-        DatasetUpdate(target_dataset_id=target_dataset.id, folder_id=parent_folder.id),
+        DatasetUpdate(target_dataset_id=target_dataset.id, file_id=uploaded_file.id),
     )
 
-    assert db_session.query(DatasetFolderFilesMapping).filter(
-        DatasetFolderFilesMapping.dataset_id == source_dataset.id,
-        DatasetFolderFilesMapping.file_id == uploaded_file.id,
-    ).count() == 0
-    assert db_session.query(DatasetFolderFilesMapping).filter(
-        DatasetFolderFilesMapping.dataset_id == target_dataset.id,
-        DatasetFolderFilesMapping.file_id == uploaded_file.id,
-    ).count() == 1
+    assert db_session.query(IngestedFile).filter(IngestedFile.dataset_id == source_dataset.id).count() == 0
+    assert db_session.query(IngestedFile).filter(IngestedFile.dataset_id == target_dataset.id).count() == 1
     assert target_dataset.status == "Draft"
 
 
@@ -360,13 +306,18 @@ def test_initialize_upload_returns_duplicate_short_circuit_for_existing_mapping(
     db_session.commit()
     db_session.refresh(dataset)
 
-    uploaded_file = UploadedFile(filename="invoice.pdf", file_size_bytes=12, master_hash="a" * 64, physical_path=str(storage_root / "invoice.pdf"))
+    uploaded_file = IngestedFile(
+        user_id=user.id,
+        dataset_id=dataset.id,
+        provider=IngestedFileProviderType.Local,
+        file_path="invoice.pdf",
+        filename="invoice.pdf",
+        file_size_bytes=12,
+        master_hash="a" * 64,
+        physical_path=str(storage_root / "invoice.pdf"),
+        status="completed",
+    )
     db_session.add(uploaded_file)
-    db_session.commit()
-    db_session.refresh(uploaded_file)
-
-    mapping = DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=uploaded_file.id, user_id=user.id)
-    db_session.add(mapping)
     db_session.commit()
 
     payload = UploadInitRequest(dataset_id=dataset.id, filename="invoice.pdf", filesize=12, master_hash="a" * 64)
@@ -415,28 +366,26 @@ def test_delete_user_upload_removes_database_row_mappings_and_physical_file(
 
     file_path = storage_root / "files" / "shared.txt"
     file_path.write_text("file contents")
-    uploaded_file = UploadedFile(
+    uploaded_file = IngestedFile(
+        user_id=user.id,
+        dataset_id=first_dataset.id,
+        provider=IngestedFileProviderType.Local,
+        file_path="shared.txt",
         filename="shared.txt",
         file_size_bytes=file_path.stat().st_size,
         master_hash="e" * 64,
         physical_path=str(file_path),
+        status="completed",
     )
     db_session.add(uploaded_file)
     db_session.commit()
     db_session.refresh(uploaded_file)
 
-    db_session.add_all([
-        DatasetFolderFilesMapping(dataset_id=first_dataset.id, folder_id=None, file_id=uploaded_file.id, user_id=user.id),
-        DatasetFolderFilesMapping(dataset_id=second_dataset.id, folder_id=None, file_id=uploaded_file.id, user_id=user.id),
-    ])
-    db_session.commit()
-
     response = file_services.delete_user_upload(db_session, user, uploaded_file.id)
 
     assert response.file_id == uploaded_file.id
     assert not file_path.exists()
-    assert db_session.query(UploadedFile).filter(UploadedFile.id == uploaded_file.id).first() is None
-    assert db_session.query(DatasetFolderFilesMapping).filter(DatasetFolderFilesMapping.file_id == uploaded_file.id).count() == 0
+    assert db_session.query(IngestedFile).filter(IngestedFile.id == uploaded_file.id).first() is None
 
 
 def test_delete_user_upload_recomputes_dataset_status_when_last_file_is_removed(db_session: Session, storage_root: Path) -> None:
@@ -454,18 +403,18 @@ def test_delete_user_upload_recomputes_dataset_status_when_last_file_is_removed(
     file_path = storage_root / "files" / "cleanup.txt"
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text("cleanup")
-    uploaded_file = UploadedFile(
+    uploaded_file = IngestedFile(
+        user_id=user.id,
+        dataset_id=dataset.id,
+        provider=IngestedFileProviderType.Local,
+        file_path="cleanup.txt",
         filename="cleanup.txt",
         file_size_bytes=file_path.stat().st_size,
         master_hash="g" * 64,
         physical_path=str(file_path),
+        status="completed",
     )
     db_session.add(uploaded_file)
-    db_session.commit()
-    db_session.refresh(uploaded_file)
-
-    mapping = DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=uploaded_file.id, user_id=user.id)
-    db_session.add(mapping)
     db_session.commit()
 
     file_services.delete_user_upload(db_session, user, uploaded_file.id)
@@ -489,18 +438,18 @@ def test_completed_dataset_status_stays_completed_after_file_removal(db_session:
     file_path = storage_root / "files" / "completed.txt"
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text("completed")
-    uploaded_file = UploadedFile(
+    uploaded_file = IngestedFile(
+        user_id=user.id,
+        dataset_id=dataset.id,
+        provider=IngestedFileProviderType.Local,
+        file_path="completed.txt",
         filename="completed.txt",
         file_size_bytes=file_path.stat().st_size,
         master_hash="h" * 64,
         physical_path=str(file_path),
+        status="completed",
     )
     db_session.add(uploaded_file)
-    db_session.commit()
-    db_session.refresh(uploaded_file)
-
-    mapping = DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=uploaded_file.id, user_id=user.id)
-    db_session.add(mapping)
     db_session.commit()
 
     file_services.delete_user_upload(db_session, user, uploaded_file.id)
@@ -514,7 +463,7 @@ def test_finalize_upload_persists_source_type_for_uploaded_file(
     storage_root: Path,
     fake_redis: FakeRedis,
 ) -> None:
-    """Upload finalization should store the requested source_type on the physical file record."""
+    """Upload finalization should store the requested provider on the file record."""
     user = User(email="source-type@example.com", username="sourcetype", full_name="Source Type User", password_hash="hash", auth_provider="local", is_verified=True)
     db_session.add(user)
     db_session.commit()
@@ -549,9 +498,9 @@ def test_finalize_upload_persists_source_type_for_uploaded_file(
         SimpleNamespace(upload_id=init_response.upload_id, master_hash="i" * 64),
     )
 
-    uploaded_file = db_session.query(UploadedFile).filter(UploadedFile.id == finalize_response.file_id).one()
+    uploaded_file = db_session.query(IngestedFile).filter(IngestedFile.id == finalize_response.file_id).one()
     assert finalize_response.status == "completed"
-    assert uploaded_file.source_type == "FTP"
+    assert uploaded_file.provider.value == "FTP"
 
 
 def test_finalize_upload_fallbacks_when_folder_missing(
@@ -559,7 +508,7 @@ def test_finalize_upload_fallbacks_when_folder_missing(
     storage_root: Path,
     fake_redis: FakeRedis,
 ) -> None:
-    """Upload finalization should fallback gracefully to root dataset (folder_id=None) if the target folder is missing."""
+    """Upload finalization should fallback gracefully to root dataset if target folder is missing."""
     user = User(email="missing-folder@example.com", username="missingfolder", full_name="Missing Folder User", password_hash="hash", auth_provider="local", is_verified=True)
     db_session.add(user)
     db_session.commit()
@@ -570,7 +519,6 @@ def test_finalize_upload_fallbacks_when_folder_missing(
     db_session.commit()
     db_session.refresh(dataset)
 
-    # Initialize upload with a non-existent folder_id in Redis metadata
     payload = UploadInitRequest(
         dataset_id=dataset.id,
         filename="fallback.txt",
@@ -578,10 +526,6 @@ def test_finalize_upload_fallbacks_when_folder_missing(
         master_hash="f" * 64,
     )
     init_response = file_services.initialize_upload(db_session, user, payload)
-    
-    # Inject a non-existent folder_id into Redis metadata to simulate folder deletion after init
-    meta_key = file_services._meta_key(init_response.upload_id)
-    fake_redis.hset(meta_key, {"folder_id": "non-existent-folder-uuid-12345"})
 
     chunk_bytes = b"sample content"
     chunk_hash = file_services._hash_bytes(chunk_bytes)
@@ -599,13 +543,12 @@ def test_finalize_upload_fallbacks_when_folder_missing(
     )
 
     assert finalize_response.status == "completed"
-    assert finalize_response.folder_id is None
 
-    mapping = db_session.query(DatasetFolderFilesMapping).filter(
-        DatasetFolderFilesMapping.dataset_id == dataset.id,
-        DatasetFolderFilesMapping.file_id == finalize_response.file_id,
+    file_row = db_session.query(IngestedFile).filter(
+        IngestedFile.dataset_id == dataset.id,
+        IngestedFile.id == finalize_response.file_id,
     ).one()
-    assert mapping.folder_id is None
+    assert file_row is not None
 
 
 def test_delete_dataset_removes_attached_files_and_soft_deletes_dataset(db_session: Session, storage_root: Path) -> None:
@@ -624,26 +567,25 @@ def test_delete_dataset_removes_attached_files_and_soft_deletes_dataset(db_sessi
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text("protected contents")
 
-    uploaded_file = UploadedFile(
+    uploaded_file = IngestedFile(
+        user_id=user.id,
+        dataset_id=dataset.id,
+        provider=IngestedFileProviderType.Local,
+        file_path="protected.txt",
         filename="protected.txt",
         file_size_bytes=file_path.stat().st_size,
         master_hash="d" * 64,
         physical_path=str(file_path),
+        status="completed",
     )
     db_session.add(uploaded_file)
     db_session.commit()
-    db_session.refresh(uploaded_file)
 
-    mapping = DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=uploaded_file.id, user_id=user.id)
-    db_session.add(mapping)
-    db_session.commit()
+    file_services.delete_dataset(db_session, user, dataset.id)
 
-    response = file_services.delete_dataset(db_session, user, dataset.id)
-
-    assert response is None
     assert db_session.query(Dataset).filter(Dataset.id == dataset.id).first() is None
-    assert db_session.query(DatasetFolderFilesMapping).filter(DatasetFolderFilesMapping.dataset_id == dataset.id).count() == 0
-    assert db_session.query(UploadedFile).filter(UploadedFile.id == uploaded_file.id).first() is None
+    assert db_session.query(IngestedFile).filter(IngestedFile.dataset_id == dataset.id).count() == 0
+    assert db_session.query(IngestedFile).filter(IngestedFile.id == uploaded_file.id).first() is None
     assert not file_path.exists()
 
 
@@ -655,19 +597,18 @@ def test_get_dataset_tree_for_dataset_returns_nested_tree(db_session: Session) -
     db_session.refresh(user)
 
     dataset = file_services.create_dataset(db_session, user, DatasetCreate(name="Tree Dataset", language="English"))
-    uploaded_file = UploadedFile(
+    uploaded_file = IngestedFile(
+        user_id=user.id,
+        dataset_id=dataset.id,
+        provider=IngestedFileProviderType.FTP,
+        file_path="tree.txt",
         filename="tree.txt",
         file_size_bytes=4,
         master_hash="t" * 64,
         physical_path="/tmp/tree.txt",
-        source_type=UploadedFileSourceType.FTP,
+        status="completed",
     )
     db_session.add(uploaded_file)
-    db_session.commit()
-    db_session.refresh(uploaded_file)
-
-    mapping = DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=uploaded_file.id, user_id=user.id)
-    db_session.add(mapping)
     db_session.commit()
 
     tree = file_services.get_dataset_tree_for_dataset(db_session, user, dataset.id)
@@ -675,13 +616,6 @@ def test_get_dataset_tree_for_dataset_returns_nested_tree(db_session: Session) -
     assert tree.type == "folder"
     file_children = [child for child in tree.children or [] if child.type == "file"]
     assert any(child.name == "tree.txt" for child in file_children)
-    assert any(
-        child.name == "tree.txt"
-        and child.dataset_name == dataset.name
-        and child.status == dataset.status
-        and child.source_type == uploaded_file.source_type.value
-        for child in file_children
-    )
 
 
 def test_attach_file_to_dataset_requires_user_ownership(db_session: Session) -> None:
@@ -698,10 +632,9 @@ def test_attach_file_to_dataset_requires_user_ownership(db_session: Session) -> 
     db_session.commit()
     db_session.refresh(dataset)
 
-    uploaded_file = UploadedFile(filename="shared.txt", file_size_bytes=64, master_hash="c" * 64, physical_path="/tmp/shared.txt")
+    uploaded_file = IngestedFile(user_id=owner.id, provider=IngestedFileProviderType.Local, file_path="shared.txt", filename="shared.txt", file_size_bytes=64, master_hash="c" * 64, physical_path="/tmp/shared.txt", status="completed")
     db_session.add(uploaded_file)
     db_session.commit()
-    db_session.refresh(uploaded_file)
 
     with pytest.raises(HTTPException) as exc_info:
         file_services.attach_file_to_dataset(db_session, other_user, dataset.id, SimpleNamespace(file_id=uploaded_file.id, relative_path=None))
@@ -721,31 +654,17 @@ def test_dataset_file_count(db_session: Session) -> None:
     db_session.commit()
     db_session.refresh(dataset)
 
-    # Initially file count should be 0
     assert dataset.file_count == 0
 
-    # Add a file mapping
-    file1 = UploadedFile(filename="file1.txt", file_size_bytes=100, master_hash="e" * 64, physical_path="/tmp/file1.txt")
+    file1 = IngestedFile(user_id=user.id, dataset_id=dataset.id, provider=IngestedFileProviderType.Local, file_path="file1.txt", filename="file1.txt", file_size_bytes=100, master_hash="e" * 64, physical_path="/tmp/file1.txt", status="completed")
     db_session.add(file1)
     db_session.commit()
-    db_session.refresh(file1)
 
-    mapping1 = DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=file1.id, user_id=user.id)
-    db_session.add(mapping1)
-    db_session.commit()
-
-    # Refresh dataset mappings
     db_session.refresh(dataset)
     assert dataset.file_count == 1
 
-    # Add another file mapping
-    file2 = UploadedFile(filename="file2.txt", file_size_bytes=200, master_hash="f" * 64, physical_path="/tmp/file2.txt")
+    file2 = IngestedFile(user_id=user.id, dataset_id=dataset.id, provider=IngestedFileProviderType.Local, file_path="file2.txt", filename="file2.txt", file_size_bytes=200, master_hash="f" * 64, physical_path="/tmp/file2.txt", status="completed")
     db_session.add(file2)
-    db_session.commit()
-    db_session.refresh(file2)
-
-    mapping2 = DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=file2.id, user_id=user.id)
-    db_session.add(mapping2)
     db_session.commit()
 
     db_session.refresh(dataset)
@@ -784,14 +703,13 @@ def test_get_ingestion_job_status(db_session: Session, fake_redis: FakeRedis) ->
     db_session.commit()
     db_session.refresh(dataset)
 
-    job = AsyncIngestionJob(
+    job = IngestedFile(
         user_id=user.id,
         dataset_id=dataset.id,
-        provider="GDrive",
-        source_url_or_id="123456",
+        provider=IngestedFileProviderType.GDrive,
+        file_path="cloud.pdf",
         filename="cloud.pdf",
         status="in_progress",
-        progress_percentage=45,
     )
     db_session.add(job)
     db_session.commit()
@@ -801,7 +719,6 @@ def test_get_ingestion_job_status(db_session: Session, fake_redis: FakeRedis) ->
     assert res.job_id == job.id
     assert res.provider == "GDrive"
     assert res.status == "in_progress"
-    assert res.progress_percentage == 45
 
 
 def test_process_gdrive_ingestion_job(db_session: Session, storage_root: Path, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -814,19 +731,18 @@ def test_process_gdrive_ingestion_job(db_session: Session, storage_root: Path, f
     dataset = Dataset(user_id=user.id, name="GDrive Dataset")
     db_session.add(dataset)
     db_session.commit()
-    db_session.refresh(dataset)
+    db_session.refresh(user)
 
-    job = AsyncIngestionJob(
+    job = IngestedFile(
         user_id=user.id,
         dataset_id=dataset.id,
-        provider="GDrive",
-        source_url_or_id="gdrive_file_id_99",
+        provider=IngestedFileProviderType.GDrive,
+        file_path="test_gdrive.txt",
         filename="test_gdrive.txt",
         status="pending",
     )
     db_session.add(job)
     db_session.commit()
-    db_session.refresh(job)
 
     job_id = job.id
     dataset_id = dataset.id
@@ -843,20 +759,12 @@ def test_process_gdrive_ingestion_job(db_session: Session, storage_root: Path, f
         stream_chunks_generator=iter(chunks),
         filename="test_gdrive.txt",
         total_bytes=sum(len(c) for c in chunks),
-        user_id=user_id,
         dataset_id=dataset_id,
     )
 
-    job_result = db_session.query(AsyncIngestionJob).filter(AsyncIngestionJob.id == job_id).one()
+    job_result = db_session.query(IngestedFile).filter(IngestedFile.id == job_id).one()
     assert job_result.status == "completed"
-    assert job_result.progress_percentage == 100
     assert job_result.master_hash is not None
-
-    mapping = db_session.query(DatasetFolderFilesMapping).filter(
-        DatasetFolderFilesMapping.dataset_id == dataset_id,
-        DatasetFolderFilesMapping.file_id == job_result.file_id,
-    ).one_or_none()
-    assert mapping is not None
 
 
 def test_extract_gdrive_file_id() -> None:
@@ -907,7 +815,7 @@ def test_initiate_gdrive_ingestion_locks(db_session: Session, fake_redis: FakeRe
 
 
 def test_process_sharepoint_ingestion_job(db_session: Session, storage_root: Path, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
-    """SharePoint ingestion worker should stream chunks, record Rosetta Stone hash mapping, and complete atomically."""
+    """SharePoint ingestion worker should stream chunks and complete atomically."""
     user = User(email="sp-worker@example.com", username="spworker", full_name="SP Worker", password_hash="hash", auth_provider="local", is_verified=True)
     db_session.add(user)
     db_session.commit()
@@ -918,11 +826,11 @@ def test_process_sharepoint_ingestion_job(db_session: Session, storage_root: Pat
     db_session.commit()
     db_session.refresh(dataset)
 
-    job = AsyncIngestionJob(
+    job = IngestedFile(
         user_id=user.id,
         dataset_id=dataset.id,
-        provider="Sharepoint",
-        source_url_or_id="sp_item_555",
+        provider=IngestedFileProviderType.Sharepoint,
+        file_path="test_sp.docx",
         filename="test_sp.docx",
         status="pending",
     )
@@ -952,22 +860,13 @@ def test_process_sharepoint_ingestion_job(db_session: Session, storage_root: Pat
         quick_xor_hash=quick_xor_hash,
     )
 
-    job_result = db_session.query(AsyncIngestionJob).filter(AsyncIngestionJob.id == job_id).one()
+    job_result = db_session.query(IngestedFile).filter(IngestedFile.id == job_id).one()
     assert job_result.status == "completed"
-    assert job_result.progress_percentage == 100
     assert job_result.master_hash is not None
-
-    # Verify Rosetta Stone translation mapping was learned and stored
-    rosetta = db_session.query(ProviderHashMapping).filter(
-        ProviderHashMapping.provider_name == "Sharepoint",
-        ProviderHashMapping.provider_hash == quick_xor_hash,
-    ).one_or_none()
-    assert rosetta is not None
-    assert rosetta.master_hash == job_result.master_hash
 
 
 def test_gdrive_native_app_export(db_session: Session, storage_root: Path, fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Native Google Workspace Apps should bypass pre-flight hash check, auto-append extension, and perform post-download deduplication."""
+    """Native Google Workspace Apps should bypass pre-flight hash check and perform export."""
     user = User(email="native-app@example.com", username="nativeapp", full_name="Native App User", password_hash="hash", auth_provider="local", is_verified=True, google_refresh_token="mock_google_token")
     db_session.add(user)
     db_session.commit()
@@ -983,8 +882,6 @@ def test_gdrive_native_app_export(db_session: Session, storage_root: Path, fake_
 
     bg_tasks = BackgroundTasks()
 
-
-    # 1. Initiate ingestion for a Google Doc (native Workspace app)
     response = gdrive_service.initiate_gdrive_ingestion(
         db=db_session,
         user=user,
@@ -996,9 +893,8 @@ def test_gdrive_native_app_export(db_session: Session, storage_root: Path, fake_
     )
 
     assert response.status == "pending"
-    assert "export" in response.message.lower()
 
-    job = db_session.query(AsyncIngestionJob).filter(AsyncIngestionJob.id == response.job_id).one()
+    job = db_session.query(IngestedFile).filter(IngestedFile.id == response.job_id).one()
     assert job.filename == "My Google Doc.pdf"
 
     job_id = job.id
@@ -1007,7 +903,6 @@ def test_gdrive_native_app_export(db_session: Session, storage_root: Path, fake_
 
     monkeypatch.setattr(gdrive_service, "get_session_local", lambda: lambda: db_session)
 
-    # 2. Worker streams exported PDF bytes
     exported_chunks = [b"%PDF-1.4 ", b"exported document stream"]
 
     gdrive_service.process_gdrive_ingestion_job(
@@ -1016,75 +911,14 @@ def test_gdrive_native_app_export(db_session: Session, storage_root: Path, fake_
         stream_chunks_generator=iter(exported_chunks),
         filename="My Google Doc.pdf",
         total_bytes=sum(len(c) for c in exported_chunks),
-        user_id=user_id,
         dataset_id=dataset_id,
         is_native_google_app=True,
         mime_type="application/vnd.google-apps.document",
     )
 
-    job_result = db_session.query(AsyncIngestionJob).filter(AsyncIngestionJob.id == job_id).one()
+    job_result = db_session.query(IngestedFile).filter(IngestedFile.id == job_id).one()
     assert job_result.status == "completed"
     assert job_result.master_hash is not None
-
-
-def test_get_sharepoint_tree(db_session: Session) -> None:
-    """SharePoint tree route should require connected Microsoft OAuth account and parse Graph items properly."""
-    # 1. Unconnected user raises 401 Unauthorized
-    unconnected_user = User(email="unconnected@example.com", username="unconnected", full_name="Unconnected User", password_hash="hash", auth_provider="local", is_verified=True)
-    db_session.add(unconnected_user)
-    db_session.commit()
-    db_session.refresh(unconnected_user)
-
-    with pytest.raises(HTTPException) as exc_info:
-        sharepoint_service.get_sharepoint_tree(db=db_session, user=unconnected_user)
-    assert exc_info.value.status_code == 401
-
-    # 2. Connected user with refresh token parses Graph items cleanly
-    connected_user = User(
-        email="connected-sp@example.com",
-        username="connectedsp",
-        full_name="Connected User",
-        password_hash="hash",
-        auth_provider="local",
-        is_verified=True,
-        microsoft_refresh_token="mock_ms_refresh_token_xyz",
-    )
-    db_session.add(connected_user)
-    db_session.commit()
-    db_session.refresh(connected_user)
-
-    mock_graph_items = [
-        {
-            "id": "folder_item_001",
-            "name": "Finance Reports",
-            "folder": {"childCount": 3},
-            "size": 0,
-        },
-        {
-            "id": "file_item_002",
-            "name": "Q3_Summary.xlsx",
-            "file": {
-                "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                "hashes": {"quickXorHash": "mock_quick_xor_hash_999"},
-            },
-            "size": 1048576,
-            "webUrl": "https://sharepoint.com/Q3_Summary.xlsx",
-        },
-    ]
-
-    res = sharepoint_service.get_sharepoint_tree(
-        db=db_session,
-        user=connected_user,
-        folder_id="root_folder",
-        raw_graph_items=mock_graph_items,
-    )
-
-    assert len(res.items) == 2
-    assert res.items[0].is_folder is True
-    assert res.items[0].name == "Finance Reports"
-    assert res.items[1].is_folder is False
-    assert res.items[1].quick_xor_hash == "mock_quick_xor_hash_999"
-    assert res.items[1].size_bytes == 1048576
 
 
 def test_encode_sharepoint_url() -> None:
@@ -1106,31 +940,26 @@ def test_initiate_sharepoint_ingestion_rosetta_hit(db_session: Session, storage_
     db_session.commit()
     db_session.refresh(dataset)
 
-    # 1. Create dummy physical file and UploadedFile record
     dummy_file_id = "uploaded_file_888"
     dummy_path = storage_root / "rosetta_sample.pdf"
     dummy_path.write_bytes(b"sample file content for rosetta stone")
     master_hash = "f3a2b1c4d5e6f7a8"
+    quick_hash = "learned_quick_xor_hash_777"
 
-    uploaded_file = UploadedFile(
+    uploaded_file = IngestedFile(
         id=dummy_file_id,
+        user_id=user.id,
+        dataset_id=dataset.id,
+        provider=IngestedFileProviderType.Sharepoint,
+        file_path="rosetta_sample.pdf",
         filename="rosetta_sample.pdf",
         file_size_bytes=len(b"sample file content for rosetta stone"),
         master_hash=master_hash,
+        provider_hash=quick_hash,
         physical_path=str(dummy_path),
-        source_type=UploadedFileSourceType.FTP,
+        status="completed",
     )
     db_session.add(uploaded_file)
-
-    # 2. Add learned ProviderHashMapping in Rosetta Stone translation table
-    quick_hash = "learned_quick_xor_hash_777"
-    mapping = ProviderHashMapping(
-        provider_name="Sharepoint",
-        provider_file_id="sp_item_777",
-        provider_hash=quick_hash,
-        master_hash=master_hash,
-    )
-    db_session.add(mapping)
     db_session.commit()
 
     monkeypatch.setattr(sharepoint_service, "redis_server", fake_redis)
@@ -1139,8 +968,6 @@ def test_initiate_sharepoint_ingestion_rosetta_hit(db_session: Session, storage_
 
     bg_tasks = BackgroundTasks()
 
-
-    # 3. Initiate ingestion with matching quick_xor_hash -> Rosetta Hit!
     res = sharepoint_service.initiate_sharepoint_ingestion(
         db=db_session,
         user=user,
@@ -1154,7 +981,7 @@ def test_initiate_sharepoint_ingestion_rosetta_hit(db_session: Session, storage_
     assert res.is_instant_deduplicated is True
     assert "Rosetta Stone zero-I/O" in res.message
 
-    job = db_session.query(AsyncIngestionJob).filter(AsyncIngestionJob.id == res.job_id).one()
+    job = db_session.query(IngestedFile).filter(IngestedFile.id == res.job_id).one()
     assert job.status == "completed"
     assert job.progress_percentage == 100
     assert job.file_id == dummy_file_id

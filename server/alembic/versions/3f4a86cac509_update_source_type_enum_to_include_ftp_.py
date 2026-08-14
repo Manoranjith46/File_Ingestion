@@ -20,14 +20,13 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Update source_type enum to include FTP, Local, GDrive, Sharepoint"""
-    # 1. Commit the active Alembic transaction so we can alter the ENUM
-    op.execute("COMMIT")
-    
-    # 2. Add values safely using the exact ENUM name from the database
-    op.execute("ALTER TYPE uploaded_file_source_type ADD VALUE IF NOT EXISTS 'FTP'")
-    op.execute("ALTER TYPE uploaded_file_source_type ADD VALUE IF NOT EXISTS 'Local'")
-    op.execute("ALTER TYPE uploaded_file_source_type ADD VALUE IF NOT EXISTS 'GDrive'")
-    op.execute("ALTER TYPE uploaded_file_source_type ADD VALUE IF NOT EXISTS 'Sharepoint'")
+    bind = op.get_bind()
+    if bind.dialect.name == "postgresql":
+        op.execute("COMMIT")
+        op.execute("ALTER TYPE uploaded_file_source_type ADD VALUE IF NOT EXISTS 'FTP'")
+        op.execute("ALTER TYPE uploaded_file_source_type ADD VALUE IF NOT EXISTS 'Local'")
+        op.execute("ALTER TYPE uploaded_file_source_type ADD VALUE IF NOT EXISTS 'GDrive'")
+        op.execute("ALTER TYPE uploaded_file_source_type ADD VALUE IF NOT EXISTS 'Sharepoint'")
 
 
 def downgrade() -> None:

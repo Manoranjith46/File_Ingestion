@@ -30,12 +30,10 @@ os.environ.setdefault("ENCRYPTION_KEY", "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmN
 
 from models.auth_model import Base as AuthBase, User
 from models.file_model import (
-    AsyncIngestionJob,
     Base as FileBase,
     Dataset,
-    DatasetFolderFilesMapping,
-    Folder,
-    UploadedFile,
+    IngestedFile,
+    IngestedFileProviderType,
 )
 from services import ext_ftp_service
 from services.ext_ftp_service import (
@@ -51,34 +49,25 @@ from utils.errors import (
 
 
 class FakeRedis:
-    def __init__(self) -> None:
-        self._hashes: dict[str, dict] = {}
-        self._strings: dict[str, str] = {}
+    def __init__(self):
+        self._data: dict[str, str] = {}
 
-    def hset(self, key, mapping=None, **kw):
-        d = self._hashes.setdefault(key, {})
-        if mapping:
-            d.update(mapping)
-        d.update(kw)
+    def get(self, key: str) -> str | None:
+        return self._data.get(key)
 
-    def hgetall(self, key):
-        return dict(self._hashes.get(key, {}))
+    def set(self, key: str, value: str, ex: int | None = None, nx: bool = False) -> bool:
+        if nx and key in self._data:
+            return False
+        self._data[key] = str(value)
+        return True
 
-    def set(self, key, value, **kw):
-        self._strings[key] = str(value)
-
-    def get(self, key):
-        return self._strings.get(key)
-
-    def delete(self, *keys):
+    def delete(self, *keys: str) -> int:
+        count = 0
         for k in keys:
-            self._hashes.pop(k, None)
-            self._strings.pop(k, None)
-
-
-@pytest.fixture()
-def fake_redis():
-    return FakeRedis()
+            if k in self._data:
+                del self._data[k]
+                count += 1
+        return count
 
 
 @pytest.fixture()
@@ -91,7 +80,14 @@ def db_session() -> Generator[Session, None, None]:
         yield session
     finally:
         session.close()
+        AuthBase.metadata.drop_all(bind=engine)
+        FileBase.metadata.drop_all(bind=engine)
         engine.dispose()
+
+
+@pytest.fixture()
+def fake_redis() -> FakeRedis:
+    return FakeRedis()
 
 
 @pytest.fixture()
@@ -147,12 +143,17 @@ def test_ftp_init_filename_collision_409(
     _seed_active_session(fake_redis, user.id)
 
     # Seed existing file in dataset
-    uf = UploadedFile(filename="existing.csv", file_size_bytes=1024, master_hash="a" * 64, physical_path="/dev/null")
+    uf = IngestedFile(
+        user_id=user.id,
+        dataset_id=dataset.id,
+        provider=IngestedFileProviderType.FTP,
+        file_path="existing.csv",
+        filename="existing.csv",
+        file_size_bytes=1024,
+        master_hash="a" * 64,
+        status="completed",
+    )
     db_session.add(uf)
-    db_session.flush()
-
-    mapping = DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=uf.id, user_id=user.id)
-    db_session.add(mapping)
     db_session.commit()
 
     with patch.object(ext_ftp_service, "redis_server", fake_redis):
@@ -176,12 +177,17 @@ def test_ftp_init_filename_collision_auto_rename(
     """Queueing a file with collision when auto_rename=True renames job to existing (1).csv."""
     _seed_active_session(fake_redis, user.id)
 
-    uf = UploadedFile(filename="existing.csv", file_size_bytes=1024, master_hash="a" * 64, physical_path="/dev/null")
+    uf = IngestedFile(
+        user_id=user.id,
+        dataset_id=dataset.id,
+        provider=IngestedFileProviderType.FTP,
+        file_path="existing.csv",
+        filename="existing.csv",
+        file_size_bytes=1024,
+        master_hash="a" * 64,
+        status="completed",
+    )
     db_session.add(uf)
-    db_session.flush()
-
-    mapping = DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=uf.id, user_id=user.id)
-    db_session.add(mapping)
     db_session.commit()
 
     with patch.object(ext_ftp_service, "redis_server", fake_redis):
@@ -207,25 +213,23 @@ def test_get_batch_ingestion_status_reads_redis_progress(
     db_session: Session, user: User, dataset: Dataset, fake_redis: FakeRedis
 ):
     """get_batch_ingestion_status returns jobs and reads live Redis bytes for in_progress jobs."""
-    job1 = AsyncIngestionJob(
+    job1 = IngestedFile(
         user_id=user.id,
         dataset_id=dataset.id,
-        provider="FTP",
-        source_url_or_id="/remote/file1.bin",
+        provider=IngestedFileProviderType.FTP,
+        file_path="/remote/file1.bin",
         filename="file1.bin",
         status="in_progress",
-        bytes_downloaded=1000,
-        total_bytes=1000000,
+        file_size_bytes=1000000,
     )
-    job2 = AsyncIngestionJob(
+    job2 = IngestedFile(
         user_id=user.id,
         dataset_id=dataset.id,
-        provider="FTP",
-        source_url_or_id="/remote/file2.bin",
+        provider=IngestedFileProviderType.FTP,
+        file_path="/remote/file2.bin",
         filename="file2.bin",
         status="completed",
-        bytes_downloaded=500000,
-        total_bytes=500000,
+        file_size_bytes=500000,
     )
     db_session.add_all([job1, job2])
     db_session.commit()
@@ -256,11 +260,11 @@ def test_resume_failed_ftp_jobs_success(
     """Resuming failed jobs resets status to pending and queues background workers."""
     _seed_active_session(fake_redis, user.id)
 
-    job = AsyncIngestionJob(
+    job = IngestedFile(
         user_id=user.id,
         dataset_id=dataset.id,
-        provider="FTP",
-        source_url_or_id="/remote/failed.bin",
+        provider=IngestedFileProviderType.FTP,
+        file_path="/remote/failed.bin",
         filename="failed.bin",
         status="failed",
         error_message="Connection lost",
@@ -285,11 +289,11 @@ def test_resume_failed_ftp_jobs_session_expired_410(
     db_session: Session, user: User, dataset: Dataset, fake_redis: FakeRedis
 ):
     """Resuming failed jobs when Redis Vault session expired raises FtpSessionExpiredError (410 Gone)."""
-    job = AsyncIngestionJob(
+    job = IngestedFile(
         user_id=user.id,
         dataset_id=dataset.id,
-        provider="FTP",
-        source_url_or_id="/remote/failed.bin",
+        provider=IngestedFileProviderType.FTP,
+        file_path="/remote/failed.bin",
         filename="failed.bin",
         status="failed",
     )

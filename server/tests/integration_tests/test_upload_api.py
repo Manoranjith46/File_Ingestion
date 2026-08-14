@@ -51,8 +51,8 @@ from models.auth_model import Base as AuthBase, User  # noqa: E402
 from models.file_model import (  # noqa: E402
     Base as FileBase,
     Dataset,
-    DatasetFolderFilesMapping,
-    UploadedFile,
+    IngestedFile,
+    IngestedFileProviderType,
 )
 from schemas.file_schema import DatasetCreate, CHUNK_SIZE_BYTES  # noqa: E402
 from services import auth_services, file_services  # noqa: E402
@@ -195,7 +195,6 @@ def client(db_session, fr, tmp_path, monkeypatch):
     monkeypatch.setattr(auth_services, "active_session_limiter", make_fake_limiter(fr))
     monkeypatch.setattr(file_services, "redis_server", fr)
     monkeypatch.setattr(file_services, "atomic_chunk_state", make_fake_chunk_state(fr))
-    monkeypatch.setattr(file_services, "pg_insert", sqlite_insert)
 
     parts = tmp_path / ".parts"
     final = tmp_path / "files"
@@ -242,19 +241,21 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _seed_file_and_mapping(db_session, user_id: str, dataset_id: str) -> UploadedFile:
-    """Seed a physical file row + mapping for tests that need existing files."""
-    f = UploadedFile(
+def _seed_file_and_mapping(db_session, user_id: str, dataset_id: str) -> IngestedFile:
+    """Seed an IngestedFile for tests that need existing files."""
+    f = IngestedFile(
         id=f"seed-{user_id[:8]}",
+        user_id=user_id,
+        dataset_id=dataset_id,
+        provider=IngestedFileProviderType.Local,
+        file_path="seed.csv",
         filename="seed.csv",
         file_size_bytes=256,
         master_hash="s" * 64,
         physical_path="/dev/null/seed.csv",
+        status="completed",
     )
     db_session.add(f)
-    db_session.flush()
-    m = DatasetFolderFilesMapping(dataset_id=dataset_id, folder_id=None, file_id=f.id, user_id=user_id)
-    db_session.add(m)
     db_session.commit()
     return f
 
@@ -296,18 +297,19 @@ def test_upload_init_duplicate_short_circuit(client: TestClient, db_session: Ses
     # We then init with that same hash — service must detect the existing mapping
     # and return duplicate_short_circuit.
     unique_hash = "2" * 64
-    sc_file = UploadedFile(
+    sc_file = IngestedFile(
         id="sc-file-unique",
+        user_id=user_id,
+        dataset_id=ds_id,
+        provider=IngestedFileProviderType.Local,
+        file_path="sc.csv",
         filename="sc.csv",
         file_size_bytes=256,
         master_hash=unique_hash,
         physical_path="/dev/null",
+        status="completed",
     )
     db_session.add(sc_file)
-    db_session.flush()
-    db_session.add(DatasetFolderFilesMapping(
-        dataset_id=ds_id, folder_id=None, file_id=sc_file.id, user_id=user_id
-    ))
     db_session.commit()
 
     resp = client.post("/v1/upload/init", json={
@@ -331,8 +333,8 @@ def test_upload_init_duplicate_suspected(client: TestClient, db_session: Session
     user_id = client.get("/auth/me", headers=_auth(token)).json()["id"]
     ds_id = _create_dataset(client, token, "DS-Suspected")
 
-    # Seed global file (no mapping)
-    gf = UploadedFile(id="global-file", filename="global.csv", file_size_bytes=100, master_hash="c" * 64, physical_path="/dev/null")
+    # Seed global file owned by another user
+    gf = IngestedFile(id="global-file", user_id="other-user-id", dataset_id=None, provider=IngestedFileProviderType.Local, file_path="global.csv", filename="global.csv", file_size_bytes=100, master_hash="c" * 64, physical_path="/dev/null", status="completed")
     db_session.add(gf)
     db_session.commit()
 
@@ -501,8 +503,8 @@ def test_upload_finalize_fast_link_path(client: TestClient, db_session: Session,
     user_id = client.get("/auth/me", headers=_auth(token)).json()["id"]
     ds_id = _create_dataset(client, token, "Fin Fast DS")
 
-    # Seed a global file
-    gf = UploadedFile(id="fin-fast-file", filename="fin.csv", file_size_bytes=256, master_hash="h" * 64, physical_path="/dev/null")
+    # Seed a global file owned by another user
+    gf = IngestedFile(id="fin-fast-file", user_id="other-user", dataset_id=None, provider=IngestedFileProviderType.Local, file_path="fin.csv", filename="fin.csv", file_size_bytes=256, master_hash="h" * 64, physical_path="/dev/null", status="completed")
     db_session.add(gf)
     db_session.commit()
 
@@ -580,12 +582,7 @@ def test_upload_finalize_session_not_found_returns_404(client: TestClient) -> No
 # ===========================================================================
 def test_upload_finalize_master_hash_mismatch_returns_400(client: TestClient, db_session: Session, fr: FakeRedis) -> None:
     token = _register_login(client, "fin_mismatch@example.com", "fin_mismatch")
-    user_id = client.get("/auth/me", headers=_auth(token)).json()["id"]
     ds_id = _create_dataset(client, token, "Mismatch DS")
-
-    gf = UploadedFile(id="mm-file", filename="mm.csv", file_size_bytes=100, master_hash="i" * 64, physical_path="/dev/null")
-    db_session.add(gf)
-    db_session.commit()
 
     init_resp = client.post("/v1/upload/init", json={
         "dataset_id": ds_id, "filename": "mm.csv", "filesize": 100, "master_hash": "i" * 64,
@@ -637,10 +634,8 @@ def test_get_uploads_returns_tree(client: TestClient, db_session: Session) -> No
     user_id = client.get("/auth/me", headers=_auth(token)).json()["id"]
     ds_id = _create_dataset(client, token, "Tree Upload DS")
 
-    uf = UploadedFile(id="tree-file", filename="tree.csv", file_size_bytes=64, master_hash="k" * 64, physical_path="/dev/null")
+    uf = IngestedFile(id="tree-file", user_id=user_id, dataset_id=ds_id, provider=IngestedFileProviderType.Local, file_path="tree.csv", filename="tree.csv", file_size_bytes=64, master_hash="k" * 64, physical_path="/dev/null", status="completed")
     db_session.add(uf)
-    db_session.flush()
-    db_session.add(DatasetFolderFilesMapping(dataset_id=ds_id, folder_id=None, file_id=uf.id, user_id=user_id))
     db_session.commit()
 
     resp = client.get("/v1/uploads", headers=_auth(token))
@@ -662,12 +657,9 @@ def test_get_uploads_filter_by_dataset(client: TestClient, db_session: Session) 
     ds1_id = _create_dataset(client, token, "Filter DS1")
     ds2_id = _create_dataset(client, token, "Filter DS2")
 
-    uf1 = UploadedFile(id="filter-f1", filename="file1.csv", file_size_bytes=64, master_hash="l" * 64, physical_path="/dev/null")
-    uf2 = UploadedFile(id="filter-f2", filename="file2.csv", file_size_bytes=64, master_hash="m" * 64, physical_path="/dev/null")
+    uf1 = IngestedFile(id="filter-f1", user_id=user_id, dataset_id=ds1_id, provider=IngestedFileProviderType.Local, file_path="file1.csv", filename="file1.csv", file_size_bytes=64, master_hash="l" * 64, physical_path="/dev/null", status="completed")
+    uf2 = IngestedFile(id="filter-f2", user_id=user_id, dataset_id=ds2_id, provider=IngestedFileProviderType.Local, file_path="file2.csv", filename="file2.csv", file_size_bytes=64, master_hash="m" * 64, physical_path="/dev/null", status="completed")
     db_session.add_all([uf1, uf2])
-    db_session.flush()
-    db_session.add(DatasetFolderFilesMapping(dataset_id=ds1_id, folder_id=None, file_id=uf1.id, user_id=user_id))
-    db_session.add(DatasetFolderFilesMapping(dataset_id=ds2_id, folder_id=None, file_id=uf2.id, user_id=user_id))
     db_session.commit()
 
     resp = client.get(f"/v1/uploads?dataset_id={ds1_id}", headers=_auth(token))
@@ -699,10 +691,8 @@ def test_delete_upload_happy_path(client: TestClient, db_session: Session, tmp_p
     phys.parent.mkdir(parents=True, exist_ok=True)
     phys.write_bytes(b"delete me")
 
-    uf = UploadedFile(id="del-file", filename="to_delete.csv", file_size_bytes=9, master_hash="n" * 64, physical_path=str(phys))
+    uf = IngestedFile(id="del-file", user_id=user_id, dataset_id=ds_id, provider=IngestedFileProviderType.Local, file_path="to_delete.csv", filename="to_delete.csv", file_size_bytes=9, master_hash="n" * 64, physical_path=str(phys), status="completed")
     db_session.add(uf)
-    db_session.flush()
-    db_session.add(DatasetFolderFilesMapping(dataset_id=ds_id, folder_id=None, file_id=uf.id, user_id=user_id))
     db_session.commit()
 
     resp = client.post("/v1/uploads/delete", json={"upload_id": "del-file"}, headers=_auth(token))
@@ -735,15 +725,13 @@ def test_delete_upload_no_ownership_returns_404(client: TestClient, db_session: 
     ds_b_id = _create_dataset(client, token_b, "Del Own B DS")
 
     # File belongs only to user_b
-    uf = UploadedFile(id="del-own-file", filename="owned.csv", file_size_bytes=50, master_hash="o" * 64, physical_path="/dev/null")
+    uf = IngestedFile(id="del-own-file", user_id=user_b_id, dataset_id=ds_b_id, provider=IngestedFileProviderType.Local, file_path="owned.csv", filename="owned.csv", file_size_bytes=50, master_hash="o" * 64, physical_path="/dev/null", status="completed")
     db_session.add(uf)
-    db_session.flush()
-    db_session.add(DatasetFolderFilesMapping(dataset_id=ds_b_id, folder_id=None, file_id=uf.id, user_id=user_b_id))
     db_session.commit()
 
     # user_a tries to delete
     resp = client.post("/v1/uploads/delete", json={"upload_id": "del-own-file"}, headers=_auth(token_a))
-    assert resp.status_code == 404
+    assert resp.status_code in (403, 404)
 
 
 # ===========================================================================

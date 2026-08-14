@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from models.auth_model import User
-from models.file_model import AsyncIngestionJob, Dataset, DatasetFolderFilesMapping, UploadedFile
+from models.file_model import Dataset, IngestedFile, IngestedFileProviderType
 from services import ext_ftp_service
 
 
@@ -54,12 +54,17 @@ def test_ftp_init_collision_409_api(mock_probe, client: TestClient):
     db: Session = next(app.dependency_overrides[get_db]())
     user = db.query(User).filter(User.email == "ftp_gaps_api@example.com").first()
 
-    uf = UploadedFile(filename="data_export.csv", file_size_bytes=2048, master_hash="b" * 64, physical_path="/dev/null")
+    uf = IngestedFile(
+        user_id=user.id,
+        dataset_id=dataset_id,
+        provider=IngestedFileProviderType.FTP,
+        file_path="data_export.csv",
+        filename="data_export.csv",
+        file_size_bytes=2048,
+        master_hash="b" * 64,
+        status="completed",
+    )
     db.add(uf)
-    db.flush()
-
-    mapping = DatasetFolderFilesMapping(dataset_id=dataset_id, folder_id=None, file_id=uf.id, user_id=user.id)
-    db.add(mapping)
     db.commit()
 
     init_res = client.post(
@@ -96,12 +101,17 @@ def test_ftp_init_collision_auto_rename_api(mock_probe, client: TestClient):
     db: Session = next(app.dependency_overrides[get_db]())
     user = db.query(User).filter(User.email == "ftp_gaps_api@example.com").first()
 
-    uf = UploadedFile(filename="report.pdf", file_size_bytes=1024, master_hash="c" * 64, physical_path="/dev/null")
+    uf = IngestedFile(
+        user_id=user.id,
+        dataset_id=dataset_id,
+        provider=IngestedFileProviderType.FTP,
+        file_path="report.pdf",
+        filename="report.pdf",
+        file_size_bytes=1024,
+        master_hash="c" * 64,
+        status="completed",
+    )
     db.add(uf)
-    db.flush()
-
-    mapping = DatasetFolderFilesMapping(dataset_id=dataset_id, folder_id=None, file_id=uf.id, user_id=user.id)
-    db.add(mapping)
     db.commit()
 
     init_res = client.post(
@@ -163,11 +173,11 @@ def test_ftp_resume_success_202_api(mock_probe, client: TestClient):
     db.add(ds)
     db.commit()
 
-    failed_job = AsyncIngestionJob(
+    failed_job = IngestedFile(
         user_id=user.id,
         dataset_id=ds.id,
-        provider="FTP",
-        source_url_or_id="/remote/failed_api.csv",
+        provider=IngestedFileProviderType.FTP,
+        file_path="/remote/failed_api.csv",
         filename="failed_api.csv",
         status="failed",
         error_message="Stream severed",

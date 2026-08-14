@@ -41,10 +41,8 @@ from models.auth_model import Base as AuthBase, User  # noqa: E402
 from models.file_model import (  # noqa: E402
     Base as FileBase,
     Dataset,
-    DatasetFolderFilesMapping,
-    Folder,
-    UploadedFile,
-    UploadedFileSourceType,
+    IngestedFile,
+    IngestedFileProviderType,
 )
 from schemas.file_schema import UploadInitRequest  # noqa: E402
 from services import file_services  # noqa: E402
@@ -193,13 +191,16 @@ def _seed_existing_file(
     folder: Folder | None,
     filename: str,
     master_hash: str,
-) -> UploadedFile:
-    """Insert an UploadedFile + DatasetFolderFilesMapping to simulate a prior upload."""
-    uf = UploadedFile(
+) -> IngestedFile:
+    """Insert an IngestedFile + DatasetFolderFilesMapping to simulate a prior upload."""
+    uf = IngestedFile(
         filename=filename,
         file_size_bytes=1024,
         master_hash=master_hash,
         physical_path=f"/dev/null/{filename}",
+        provider=IngestedFileProviderType.Local,
+        user_id=user.id,
+        dataset_id=dataset.id
     )
     db_session.add(uf)
     db_session.flush()
@@ -501,27 +502,27 @@ class TestFilenameCollision:
 
 
 class TestEnumStandardization:
-    """Test that the UploadedFileSourceType enum contains the standardized values."""
+    """Test that the IngestedFileProviderType enum contains the standardized values."""
 
     def test_local_enum_member_exists(self) -> None:
-        """'Local' is a valid member of UploadedFileSourceType."""
-        assert UploadedFileSourceType.Local.value == "Local"
+        """'Local' is a valid member of IngestedFileProviderType."""
+        assert IngestedFileProviderType.Local.value == "Local"
 
     def test_ftp_enum_member_exists(self) -> None:
-        """'FTP' is a valid member of UploadedFileSourceType."""
-        assert UploadedFileSourceType.FTP.value == "FTP"
+        """'FTP' is a valid member of IngestedFileProviderType."""
+        assert IngestedFileProviderType.FTP.value == "FTP"
 
     def test_gdrive_enum_member_exists(self) -> None:
-        """'GDrive' is a valid member of UploadedFileSourceType."""
-        assert UploadedFileSourceType.GDrive.value == "GDrive"
+        """'GDrive' is a valid member of IngestedFileProviderType."""
+        assert IngestedFileProviderType.GDrive.value == "GDrive"
 
     def test_sharepoint_enum_member_exists(self) -> None:
-        """'Sharepoint' is a valid member of UploadedFileSourceType."""
-        assert UploadedFileSourceType.Sharepoint.value == "Sharepoint"
+        """'Sharepoint' is a valid member of IngestedFileProviderType."""
+        assert IngestedFileProviderType.Sharepoint.value == "Sharepoint"
 
     def test_all_four_members(self) -> None:
         """Exactly four members exist in the enum."""
-        members = [m.value for m in UploadedFileSourceType]
+        members = [m.value for m in IngestedFileProviderType]
         assert sorted(members) == sorted(["FTP", "Local", "GDrive", "Sharepoint"])
 
     def test_local_in_pydantic_schema(self) -> None:

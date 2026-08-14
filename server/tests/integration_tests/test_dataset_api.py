@@ -46,9 +46,8 @@ from models.auth_model import Base as AuthBase, User  # noqa: E402
 from models.file_model import (  # noqa: E402
     Base as FileBase,
     Dataset,
-    DatasetFolderFilesMapping,
-    Folder,
-    UploadedFile,
+    IngestedFile,
+    IngestedFileProviderType,
 )
 from services import auth_services  # noqa: E402
 from services import file_services  # noqa: E402
@@ -98,24 +97,26 @@ class FakeRedis:
     def setbit(self, key, offset, value): pass
 
 
-def make_fake_limiter(fake_redis: FakeRedis):
-    def _limiter(keys, args):
-        key = keys[0]; now = int(args[0]); sid = args[1]
-        max_sessions = int(args[2]); ttl = int(args[3])
-        fake_redis.zremrangebyscore(key, float("-inf"), now - ttl)
-        fake_redis.zadd(key, {sid: float(now)})
-        card = fake_redis.zcard(key)
-        if card > max_sessions:
-            fake_redis.zremrangebyrank(key, 0, card - max_sessions - 1)
-        return 1
-    return _limiter
+def make_fake_limiter(redis_stub: FakeRedis):
+    class FakeLimiter:
+        def enforce_active_session_limit(self, user_id: str, current_token_jti: str) -> None:
+            pass
+        def register_active_session(self, user_id: str, token_jti: str) -> None:
+            pass
+        def remove_session(self, user_id: str, token_jti: str) -> None:
+            pass
+    return FakeLimiter()
 
 
-def make_fake_chunk_state(fake_redis: FakeRedis):
-    """Fake atomic_chunk_state Lua script."""
-    def _chunk_state(keys, args):
-        return 0  # always "new chunk"
-    return _chunk_state
+def make_fake_chunk_state(redis_stub: FakeRedis):
+    class FakeChunkState:
+        def get_uploaded_chunks(self, upload_id: str) -> set[int]:
+            return set()
+        def record_chunk(self, upload_id: str, part_number: int) -> None:
+            pass
+        def clear(self, upload_id: str) -> None:
+            pass
+    return FakeChunkState()
 
 
 # ===========================================================================
@@ -196,14 +197,18 @@ def _auth_header(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _seed_uploaded_file(db_session: Session) -> UploadedFile:
-    """Seed an UploadedFile row without physical I/O."""
-    f = UploadedFile(
+def _seed_uploaded_file(db_session: Session, user_id: str = "user-1") -> IngestedFile:
+    """Seed an IngestedFile row without physical I/O."""
+    f = IngestedFile(
         id="seed-file-1",
+        user_id=user_id,
+        provider=IngestedFileProviderType.Local,
+        file_path="seed.csv",
         filename="seed.csv",
         file_size_bytes=512,
         master_hash="b" * 64,
         physical_path="/dev/null/seed.csv",
+        status="completed",
     )
     db_session.add(f)
     db_session.commit()
@@ -211,17 +216,13 @@ def _seed_uploaded_file(db_session: Session) -> UploadedFile:
     return f
 
 
-def _seed_mapping(db_session: Session, user_id: str, dataset_id: str, file_id: str, folder_id: str | None = None) -> DatasetFolderFilesMapping:
-    """Directly insert a DatasetFolderFilesMapping (bypasses pg_insert ON CONFLICT DO NOTHING)."""
-    mapping = DatasetFolderFilesMapping(
-        dataset_id=dataset_id,
-        folder_id=folder_id,
-        file_id=file_id,
-        user_id=user_id,
-    )
-    db_session.add(mapping)
-    db_session.commit()
-    return mapping
+def _seed_mapping(db_session: Session, user_id: str, dataset_id: str, file_id: str, folder_id: str | None = None) -> IngestedFile:
+    """Link IngestedFile to a dataset."""
+    f = db_session.query(IngestedFile).filter(IngestedFile.id == file_id).first()
+    if f:
+        f.dataset_id = dataset_id
+        db_session.commit()
+    return f
 
 
 # ===========================================================================

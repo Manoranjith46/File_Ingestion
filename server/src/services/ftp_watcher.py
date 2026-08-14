@@ -19,10 +19,10 @@ from helpers.get_env import get_env
 from models.auth_model import User
 from models.file_model import (
     Dataset,
-    DatasetFolderFilesMapping,
-    UploadedFile,
-    UploadedFileSourceType,
+    IngestedFile,
+    IngestedFileProviderType,
 )
+from services.file_services import _sync_dataset_status_from_mappings
 
 logger = logging.getLogger(__name__)
 
@@ -171,16 +171,17 @@ def _ingest_ftp_file(username: str | None, filepath: Path) -> None:
         file_size = filepath.stat().st_size
         original_name = filepath.name
 
-        # 3. Deduplication check (zero I/O) --------------------------------
+        # 3. Deduplication check & file handling ----------------------------
         existing_file = (
-            db.query(UploadedFile)
-            .filter(UploadedFile.master_hash == master_hash)
+            db.query(IngestedFile)
+            .filter(IngestedFile.master_hash == master_hash, IngestedFile.status == "completed")
             .first()
         )
 
-        if existing_file is not None:
-            # Duplicate – reuse existing file_id, remove the dropzone copy.
-            file_id = existing_file.id
+        dataset = _get_or_create_ftp_dataset(db, user.id)
+
+        if existing_file is not None and existing_file.physical_path:
+            physical_path_str = existing_file.physical_path
             try:
                 filepath.unlink()
             except OSError as err:
@@ -190,68 +191,37 @@ def _ingest_ftp_file(username: str | None, filepath: Path) -> None:
                     err,
                 )
             logger.info(
-                "FTP watcher: duplicate detected for '%s' (hash=%s) – reusing file_id=%s",
+                "FTP watcher: duplicate detected for '%s' (hash=%s) – reusing physical_path",
                 original_name,
                 master_hash,
-                file_id,
             )
         else:
-            # New file – move to final FTP storage directory.
             FTP_FINAL_ROOT.mkdir(parents=True, exist_ok=True)
             dest = _get_unique_filename(FTP_FINAL_ROOT, original_name)
             shutil.move(str(filepath), str(dest))
-
-            new_file = UploadedFile(
-                filename=original_name,
-                file_size_bytes=file_size,
-                master_hash=master_hash,
-                physical_path=str(dest),
-                source_type=UploadedFileSourceType.FTP,
-            )
-            db.add(new_file)
-            db.flush()
-            file_id = new_file.id
+            physical_path_str = str(dest)
             logger.info(
-                "FTP watcher: ingested new file '%s' → %s (file_id=%s)",
+                "FTP watcher: ingested new file '%s' → %s",
                 original_name,
                 dest,
-                file_id,
             )
 
-        # 4. Dataset & mapping ---------------------------------------------
-        dataset = _get_or_create_ftp_dataset(db, user.id)
-
-        # Check if mapping already exists to prevent duplicates when folder_id is None
-        existing_mapping = (
-            db.query(DatasetFolderFilesMapping)
-            .filter(
-                DatasetFolderFilesMapping.dataset_id == dataset.id,
-                DatasetFolderFilesMapping.folder_id.is_(None),
-                DatasetFolderFilesMapping.file_id == file_id,
-                DatasetFolderFilesMapping.user_id == user.id,
-            )
-            .first()
+        # 4. Insert IngestedFile record -------------------------------------
+        ingested_file = IngestedFile(
+            user_id=user.id,
+            dataset_id=dataset.id,
+            provider=IngestedFileProviderType.FTP,
+            file_path=original_name,
+            filename=original_name,
+            physical_path=physical_path_str,
+            file_size_bytes=file_size,
+            master_hash=master_hash,
+            status="completed",
         )
+        db.add(ingested_file)
+        db.flush()
 
-        if existing_mapping is None:
-            stmt = (
-                pg_insert(DatasetFolderFilesMapping)
-                .values(
-                    dataset_id=dataset.id,
-                    folder_id=None,
-                    file_id=file_id,
-                    user_id=user.id,
-                )
-                .on_conflict_do_nothing(
-                    constraint="uq_dataset_folder_file",
-                )
-            )
-            db.execute(stmt)
-
-        # Update dataset status to Draft when files are linked.
-        if dataset.status == "Created":
-            dataset.status = "Draft"
-
+        _sync_dataset_status_from_mappings(db, dataset)
         db.commit()
 
     except Exception:

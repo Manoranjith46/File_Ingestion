@@ -50,9 +50,8 @@ from models.auth_model import Base as AuthBase, User  # noqa: E402
 from models.file_model import (  # noqa: E402
     Base as FileBase,
     Dataset,
-    DatasetFolderFilesMapping,
-    Folder,
-    UploadedFile,
+    IngestedFile,
+    IngestedFileProviderType,
 )
 from schemas.file_schema import (  # noqa: E402
     DatasetCreate,
@@ -255,13 +254,17 @@ def dataset(db_session: Session, user: User) -> Dataset:
 
 
 @pytest.fixture()
-def uploaded_file(db_session: Session) -> UploadedFile:
-    f = UploadedFile(
+def uploaded_file(db_session: Session, user: User) -> IngestedFile:
+    f = IngestedFile(
         id="phys-file-m3",
+        user_id=user.id,
+        provider=IngestedFileProviderType.Local,
+        file_path="data.csv",
         filename="data.csv",
         file_size_bytes=1024,
         master_hash="a" * 64,
         physical_path="/dev/null/data.csv",
+        status="completed",
     )
     db_session.add(f)
     db_session.commit()
@@ -771,34 +774,28 @@ def test_finalize_upload_incomplete_raises_409(
 # delete_user_upload TESTS
 # ===========================================================================
 
+# ===========================================================================
+# delete_user_upload TESTS
+# ===========================================================================
+
 # U-C-22 — delete_user_upload: happy path
 def test_delete_user_upload_happy_path(
-    db_session: Session, user: User, dataset: Dataset, uploaded_file: UploadedFile,
+    db_session: Session, user: User, dataset: Dataset, uploaded_file: IngestedFile,
     fake_redis: FakeRedis, monkeypatch: pytest.MonkeyPatch, tmp_upload_dir: Path
 ) -> None:
-    """Deleting an owned file should remove the mapping and the UploadedFile row."""
-    # Create a real temp file for the physical_path
+    """Deleting an owned file should remove the IngestedFile row."""
     phys = tmp_upload_dir / "files" / "data.csv"
     phys.write_bytes(b"content")
     uploaded_file.physical_path = str(phys)
-    db_session.commit()
-
-    # Attach file to dataset
-    mapping = DatasetFolderFilesMapping(
-        dataset_id=dataset.id, folder_id=None,
-        file_id=uploaded_file.id, user_id=user.id
-    )
-    db_session.add(mapping)
+    uploaded_file.dataset_id = dataset.id
     db_session.commit()
 
     result = delete_user_upload(db_session, user, uploaded_file.id)
     assert result.status == "deleted"
     assert result.file_id == uploaded_file.id
 
-    # File should be removed from DB
-    gone = db_session.query(UploadedFile).filter(UploadedFile.id == uploaded_file.id).one_or_none()
+    gone = db_session.query(IngestedFile).filter(IngestedFile.id == uploaded_file.id).one_or_none()
     assert gone is None
-    # Physical file should be removed
     assert not phys.exists()
 
 
@@ -813,21 +810,12 @@ def test_delete_user_upload_not_found_raises_404(
 
 # U-C-24 — delete_user_upload: file exists but no ownership mapping → 404
 def test_delete_user_upload_no_ownership_mapping_raises_404(
-    db_session: Session, user: User, other_user: User, dataset: Dataset, uploaded_file: UploadedFile
+    db_session: Session, user: User, other_user: User, dataset: Dataset, uploaded_file: IngestedFile
 ) -> None:
     """File exists but the requesting user has no mapping to it → 404."""
-    # Only other_user has a mapping
-    other_ds = create_dataset(db_session, other_user, DatasetCreate(name="Other DS", language="English"))
-    mapping = DatasetFolderFilesMapping(
-        dataset_id=other_ds.id, folder_id=None,
-        file_id=uploaded_file.id, user_id=other_user.id
-    )
-    db_session.add(mapping)
-    db_session.commit()
-
     # user tries to delete other_user's file
     with pytest.raises(HTTPException) as exc:
-        delete_user_upload(db_session, user, uploaded_file.id)
+        delete_user_upload(db_session, other_user, uploaded_file.id)
     assert exc.value.status_code == 404
 
 
@@ -847,14 +835,10 @@ def test_list_user_uploads_empty(db_session: Session, user: User) -> None:
 
 # U-C-26 — list_user_uploads: file at root level
 def test_list_user_uploads_file_at_root(
-    db_session: Session, user: User, dataset: Dataset, uploaded_file: UploadedFile
+    db_session: Session, user: User, dataset: Dataset, uploaded_file: IngestedFile
 ) -> None:
     """A file without folder should appear as direct child of root in tree."""
-    mapping = DatasetFolderFilesMapping(
-        dataset_id=dataset.id, folder_id=None,
-        file_id=uploaded_file.id, user_id=user.id
-    )
-    db_session.add(mapping)
+    uploaded_file.dataset_id = dataset.id
     db_session.commit()
 
     result = list_user_uploads(db_session, user)
@@ -865,25 +849,17 @@ def test_list_user_uploads_file_at_root(
 
 # U-C-27 — list_user_uploads: file in subfolder
 def test_list_user_uploads_file_in_folder(
-    db_session: Session, user: User, dataset: Dataset, uploaded_file: UploadedFile
+    db_session: Session, user: User, dataset: Dataset, uploaded_file: IngestedFile
 ) -> None:
-    """A file with a folder mapping should appear under that folder in tree."""
-    folder = Folder(user_id=user.id, name="reports", parent_id=None)
-    db_session.add(folder)
-    db_session.flush()
-
-    mapping = DatasetFolderFilesMapping(
-        dataset_id=dataset.id, folder_id=folder.id,
-        file_id=uploaded_file.id, user_id=user.id
-    )
-    db_session.add(mapping)
+    """A file with virtual folder path should appear under that folder in tree."""
+    uploaded_file.dataset_id = dataset.id
+    uploaded_file.file_path = "reports/data.csv"
     db_session.commit()
 
     result = list_user_uploads(db_session, user)
     children = result.children or []
     folder_nodes = [c for c in children if c.type == "folder"]
     assert any(f.name == "reports" for f in folder_nodes)
-    # Check files are inside the folder node
     reports_node = next(c for c in children if c.type == "folder" and c.name == "reports")
     inner_files = [c for c in (reports_node.children or []) if c.type == "file"]
     assert any(f.name == "data.csv" for f in inner_files)
@@ -891,18 +867,25 @@ def test_list_user_uploads_file_in_folder(
 
 # U-C-28 — list_user_uploads: filtered by dataset_id
 def test_list_user_uploads_filter_by_dataset(
-    db_session: Session, user: User, dataset: Dataset, uploaded_file: UploadedFile
+    db_session: Session, user: User, dataset: Dataset, uploaded_file: IngestedFile
 ) -> None:
     """Filtering by dataset_id returns only files in that dataset."""
     ds2 = create_dataset(db_session, user, DatasetCreate(name="DS2", language="English"))
 
-    uf2 = UploadedFile(id="file-m3-2", filename="other.csv", file_size_bytes=512, master_hash="i" * 64, physical_path="/dev/null")
+    uf2 = IngestedFile(
+        id="file-m3-2",
+        user_id=user.id,
+        dataset_id=ds2.id,
+        provider=IngestedFileProviderType.Local,
+        file_path="other.csv",
+        filename="other.csv",
+        file_size_bytes=512,
+        master_hash="i" * 64,
+        physical_path="/dev/null",
+        status="completed",
+    )
+    uploaded_file.dataset_id = dataset.id
     db_session.add(uf2)
-    db_session.flush()
-
-    # uploaded_file → dataset, uf2 → ds2
-    db_session.add(DatasetFolderFilesMapping(dataset_id=dataset.id, folder_id=None, file_id=uploaded_file.id, user_id=user.id))
-    db_session.add(DatasetFolderFilesMapping(dataset_id=ds2.id, folder_id=None, file_id=uf2.id, user_id=user.id))
     db_session.commit()
 
     result = list_user_uploads(db_session, user, dataset_id=dataset.id)
