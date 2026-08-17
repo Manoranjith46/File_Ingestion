@@ -1,0 +1,1228 @@
+# Frontend Integration Guide
+
+This document reflects the current code in `server/src` exactly as implemented right now. It includes a few route and model quirks that the frontend must know about.
+
+Implementation notes:
+- `POST /auth/login` is defined once in `server/src/routes/auth_routes.py`; the auth router is mounted under both `/auth` and `/v1/auth`.
+- `UploadedFile` in `server/src/models/file_model.py` does not currently define `user_id` or `folder_id`, even though older migrations and one delete service path reference them.
+- FastAPI default error payloads are used; custom error envelopes are not implemented.
+- **(2026-08-07)** Startup helper logs were updated to plain text in `server/src/config/redis_server.py`, `server/src/config/database.py`, and `server/src/helpers/get_env.py` for Windows console compatibility.
+- **(v3.1)** `auth_router` is now mounted under **both** `/auth` and `/v1/auth` in `main.py`. All auth endpoints are accessible via either prefix (e.g. `POST /auth/login` and `POST /v1/auth/login` resolve to the same handler).
+- **(v3.1)** `UploadedFile` model now includes a `source_type` column (`Enum: FTP | GDrive | Sharepoint`, nullable).
+- **(v3.1)** Google OAuth scopes now include `https://www.googleapis.com/auth/drive.readonly` in addition to `openid`, `email`, `profile`.
+- **(Module 1 Tested 2026-07-30)** `_ensure_utc()` helper added to `auth_services.py`. Expiry comparisons in `verify_otp` and `reset_password` now normalise DB-returned naive datetimes to UTC-aware before comparison. This is a no-op on PostgreSQL but fixes `TypeError` when using SQLite or any tz-naive driver.
+- **(Module 1 Tested 2026-07-30)** All 13 auth route handlers confirmed via 51 tests (29 unit + 22 integration) — 100% pass rate. Confirmed behaviors: OTP flow (hardcoded `"123456"` in dev), `HttpOnly` cookie path `/auth` for refresh token, `Authorization` header set on login/verify/refresh responses, `is_verified=False` enforced on unverified login attempts.
+- **(Module 2 Tested 2026-07-30)** All 5 dataset route handlers confirmed via 71 tests (46 unit + 25 integration) — 100% pass rate. Confirmed behaviors: case-insensitive duplicate name check; `status` field normalizes (`created`→`Created`, `in progress`→`Draft`); `DELETE /v1/datasets/{id}` performs hard delete (not soft-delete) cascading to all mapping rows; `POST /v1/datasets/{id}/files` enforces strict IDOR — file must be owned by the requesting user via an existing `DatasetFolderFilesMapping`; attaching to a Completed dataset returns 400.
+- **(Module 2 Tested 2026-07-30)** `_get_folder_tree()` is idempotent — repeated calls with the same path do not create duplicate `Folder` rows. Path security: absolute paths and `..` traversal segments are rejected with 400.
+- **(Module 3 Tested 2026-07-30)** All 5 upload route handlers confirmed via 60 tests (35 unit + 25 integration) — 100% pass rate after one test-defect fix. Confirmed behaviors: `POST /v1/upload/init` returns exactly one of `{created, duplicate_suspected, duplicate_short_circuit}` based on file hash existence and existing mappings; `POST /v1/upload/chunk` uses multipart/form-data with atomic Lua bitmap state (prevents duplicate chunk processing); `POST /v1/upload/finalize` enforces 409 when bitcount < total_chunks; master_hash is verified at both init and finalize; wrong-user sessions return 403; ghost sessions return 404.
+- **(Module 3 Tested 2026-07-30)** `pg_insert(...).on_conflict_do_nothing()` in `finalize_upload` is PostgreSQL-specific — successfully patched with a SQLite-compatible wrapper in all tests without changing production code. Full end-to-end upload round-trip (init → chunk → finalize → visible in GET /v1/uploads tree) confirmed working.
+- **(v4.0)** FTP Bulk Ingestion added via `ftp_watcher.py` background daemon thread. No new HTTP endpoints — ingestion is triggered automatically by polling `uploads/ftp_dropzone/{username}/` every 10 seconds. Files are moved to `uploads/files/FTP/`, deduplicated via SHA-256 `master_hash`, and linked to an auto-created `"FTP Drops"` dataset per user. The watcher uses `source_type='FTP'` on the `uploaded_files` row.
+- **(v3.3 Component 1 Tested 2026-08-10)** External FTP Pull Ingestion Gatekeeper added: `POST /v1/ingest/ftp/connect` and `POST /v1/ingest/ftp/disconnect`. Features: AES-256 Fernet password encryption, Redis credential vault (`ext_ftp:creds:{user_id}`, 1800s idle TTL), sliding-window rate limiting (5 req / 5 min), `ftplib.FTP_TLS` connection probe with `allow_insecure` fallback, and dual-path disconnect (graceful draining vs force nuke with reference-counted physical file cleanup). Confirmed via 39 unit/integration tests (188/188 total suite pass rate).
+- **(v3.3 Component 2 Tested 2026-08-10)** External FTP Pull Ingestion Navigator added: `GET /v1/ingest/ftp/tree`. Features: Lazy remote FTP directory exploration via `ftplib.FTP.mlsd`, ISO 8601 UTC timestamp conversion (`YYYY-MM-DDTHH:MM:SSZ`), parent path computation, folder-first sorting, and instant control connection cleanup (`ftp.quit()`). Confirmed via unit & integration tests (199/199 total suite pass rate).
+- **(v3.3 Component 3 Tested 2026-08-10)** External FTP Pull Ingestion Dispatcher added: `POST /v1/ingest/ftp/init`. Features: Database columns `bytes_downloaded` and `total_bytes` on `AsyncIngestionJob`, Alembic migration `f979e65675e6`, Two-Tier Semaphores (`HostSemaphore` and `UserSemaphore` via Redis), draining session queue lock (409 Conflict), dataset/folder IDOR validation (404/403), recursive folder item expansion, and `202 Accepted` response returning queued jobs list. Confirmed via 204 unit & integration tests (204/204 total suite pass rate).
+- **(v3.3 Component 4 Tested 2026-08-10)** External FTP Pull Ingestion Engine & Medic implemented: `process_ftp_ingestion_job(job_id)`. Features: Streaming background worker (`RETR`), Checkpoint Manifest system (`.manifest.json`) supporting range resume via FTP `REST {offset}` without disk re-reads, Session Heartbeat background thread renewing 1800s idle TTL in Redis every 15s during active downloads, Stall Detection (180s zero-byte timeout), SHA-256 deduplication against `UploadedFile`, physical file movement to `uploads/files/FTP/`, dataset mapping insertion, and dataset status synchronization. Confirmed via 205 unit & integration tests (205/205 total suite pass rate).
+- **(v3.3 Component 5 Tested 2026-08-10)** External FTP Pull Ingestion Cleanup & DevOps Release: Implemented `cleanup_ftp_staging_files(max_age_seconds=86400)` in `ext_ftp_service.py` to purge orphan `.tmp` and `.manifest.json` staging files older than 24 hours. Wired into `cleanup_scheduler.py` background loop (`_cleanup_loop()`). Full project test suite: **206/206 passed in 37.15s (100% pass rate)**.
+
+
+
+
+
+## Section 1: All API Endpoints & Request/Response Schemas
+
+### Standard error shape
+
+All `HTTPException` responses in the current code return the default FastAPI shape:
+
+```json
+{
+  "detail": "Error message"
+}
+```
+
+Validation errors return FastAPI's default 422 payload shape:
+
+```json
+{
+  "detail": [
+    {
+      "loc": ["body", "field_name"],
+      "msg": "...",
+      "type": "..."
+    }
+  ]
+}
+```
+
+### Shared schemas used by multiple endpoints
+
+#### `PublicUserSchema`
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `id` | `str` | Yes | None |
+| `email` | `str` | Yes | None |
+| `username` | `str \| None` | No | `null` |
+| `full_name` | `str \| None` | No | `null` |
+| `role` | `str` | Yes | None |
+| `is_verified` | `bool` | Yes | None |
+| `auth_provider` | `str` | Yes | None |
+
+#### `TokenPairResponse`
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `message` | `str` | No | `Authentication successful` |
+| `user` | `PublicUserSchema` | Yes | None |
+
+#### `RegistrationResponse`
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `user` | `PublicUserSchema` | Yes | None |
+| `message` | `str` | No | `Registration successful` |
+
+#### `OtpChallengeResponse`
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `email` | `str` | Yes | None |
+| `message` | `str` | No | `OTP created` |
+
+#### `PasswordResetChallengeResponse`
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `email` | `str` | Yes | None |
+| `message` | `str` | No | `Password reset created` |
+
+#### `MessageResponse`
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `message` | `str` | Yes | None |
+
+#### `UploadTreeNode` / `UploadsTreeResponse`
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `id` | `str` | Yes | None |
+| `type` | `str` | Yes | None |
+| `name` | `str` | Yes | None |
+| `size` | `int \| None` | No | `null` |
+| `children` | `list[UploadTreeNode] \| None` | No | `null` |
+
+#### `DatasetResponse`
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `id` | `str` | Yes | None |
+| `user_id` | `str` | Yes | None |
+| `name` | `str` | Yes | None |
+| `description` | `str \| None` | No | `null` |
+| `status` | `str` | No | `created` |
+| `source_type` | `str \| None` | No | `null` |
+| `content_type` | `str \| None` | No | `null` |
+| `format` | `str \| None` | No | `null` |
+| `language` | `str \| None` | No | `null` |
+| `created_at` | `datetime` | Yes | None |
+| `updated_at` | `datetime` | Yes | None |
+| `file_count` | `int` | Yes | None |
+
+#### `DatasetAttachFileResponse`
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `status` | `str` | Yes | None |
+| `dataset_id` | `str` | Yes | None |
+| `file_id` | `str` | Yes | None |
+| `folder_id` | `str \| None` | No | `null` |
+
+#### File ingestion constants
+
+| Constant | Value |
+|---|---|
+| `CHUNK_SIZE_BYTES` | `5242880` |
+
+### Health
+
+#### `GET /v1/health`
+
+| Item | Details |
+|---|---|
+| Required headers | None |
+| Query params | None |
+| Path params | None |
+| Request body | None |
+| Success response | `200 OK` with `{"status": "Application is running successfully :)"}` |
+| Error responses | None in the route code |
+
+### Authentication
+
+#### `POST /auth/signup/init`
+
+| Item | Details |
+|---|---|
+| Required headers | `Content-Type: application/json` |
+| Query params | None |
+| Path params | None |
+| Request body | `RegisterRequest` |
+| Success response | `200 OK` with `RegistrationResponse` |
+| Error responses | `409` for duplicate email/username, default FastAPI validation errors (`422`) |
+
+`RegisterRequest`
+
+| Field | Type | Required | Default | Constraints |
+|---|---|---:|---|---|
+| `email` | `EmailStr` | Yes | None | min length 5, max length 255 |
+| `username` | `str \| None` | No | `null` | min length 3, max length 64 |
+| `full_name` | `str \| None` | No | `null` | max length 255 |
+| `password` | `str` | Yes | None | min length 8, max length 128 |
+
+`RegistrationResponse`
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `user` | `PublicUserSchema` | Yes | None |
+| `message` | `str` | No | `Registration successful` |
+
+Standard error details:
+- `409` `Email already exists`
+- `409` `Username already exists`
+- `404` can occur during OTP creation if the user record is unexpectedly missing after creation, but the route deletes the user and re-raises in that case.
+
+#### `POST /auth/login`
+
+There are two handlers registered on this exact path in the current code.
+
+1. Credential login handler with `LoginRequest`.
+2. OTP verification handler with `OtpVerifyRequest`.
+
+Because both are mounted on the same method/path, the frontend should treat this as a code defect and not rely on a stable separation here. The credential login behavior is the one intended for sign-in; the OTP verification handler is also present in code but conflicts with the same URL.
+
+Credential login handler:
+
+| Item | Details |
+|---|---|
+| Required headers | `Content-Type: application/json` |
+| Query params | None |
+| Path params | None |
+| Request body | `LoginRequest` |
+| Success response | `200 OK` with `TokenPairResponse`; also sets `Authorization` response header and `refresh_token` cookie |
+| Error responses | `401` invalid credentials, `403` user not verified, `422` validation errors |
+
+`LoginRequest`
+
+| Field | Type | Required | Default | Constraints |
+|---|---|---:|---|---|
+| `identifier` | `str \| None` | No | `null` | min length 3, max length 255 |
+| `username` | `str \| None` | No | `null` | min length 3, max length 255 |
+| `password` | `str` | Yes | None | min length 8, max length 128 |
+
+The model normalizes `username` into `identifier` when `identifier` is missing.
+
+OTP verification handler that is also registered on `POST /auth/login`:
+
+| Item | Details |
+|---|---|
+| Required headers | `Content-Type: application/json` |
+| Query params | None |
+| Path params | None |
+| Request body | `OtpVerifyRequest` |
+| Success response | `200 OK` with `TokenPairResponse`; also sets `Authorization` response header and `refresh_token` cookie |
+| Error responses | `400`, `404`, `429`, `422` depending on OTP state |
+
+`OtpVerifyRequest`
+
+| Field | Type | Required | Default | Constraints |
+|---|---|---:|---|---|
+| `email` | `EmailStr` | Yes | None | min length 5, max length 255 |
+| `otp_code` | `str` | Yes | None | min length 4, max length 12 |
+
+#### `POST /auth/signup/verify`
+
+| Item | Details |
+|---|---|
+| Required headers | `Content-Type: application/json` |
+| Query params | None |
+| Path params | None |
+| Request body | `OtpVerifyRequest` |
+| Success response | `200 OK` with `TokenPairResponse`; also sets `Authorization` response header and `refresh_token` cookie |
+| Error responses | `400`, `404`, `429`, `422` |
+
+`TokenPairResponse` body shape:
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `message` | `str` | No | `Authentication successful` |
+| `user` | `PublicUserSchema` | Yes | None |
+
+Relevant errors from the underlying service:
+- `404` `User not found`
+- `400` `No active OTP challenge`
+- `400` `OTP has expired`
+- `429` `OTP attempts exceeded`
+- `400` `Invalid OTP code`
+
+#### `POST /auth/logout`
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>` |
+| Query params | None |
+| Path params | None |
+| Request body | None |
+| Success response | `200 OK` with `MessageResponse`; clears `refresh_token` cookie when present |
+| Error responses | `401` missing access token, plus JWT/token errors from auth helpers |
+
+`MessageResponse`
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `message` | `str` | Yes | None |
+
+#### `POST /auth/refresh`
+
+| Item | Details |
+|---|---|
+| Required headers | None from the route itself; browser requests must include cookies (`credentials: include`) |
+| Query params | None |
+| Path params | None |
+| Request body | None |
+| Success response | `200 OK` with `TokenPairResponse`; also sets a new `refresh_token` cookie and `Authorization` response header |
+| Error responses | `401` missing refresh token, invalid/expired/revoked refresh token, or evicted session |
+
+#### `GET /auth/me`
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>` |
+| Query params | None |
+| Path params | None |
+| Request body | None |
+| Success response | `200 OK` with `PublicUserSchema` |
+| Error responses | `401` missing/invalid token |
+
+#### `POST /auth/password-reset/request`
+
+| Item | Details |
+|---|---|
+| Required headers | `Content-Type: application/json` |
+| Query params | None |
+| Path params | None |
+| Request body | `PasswordResetRequest` |
+| Success response | `200 OK` with `PasswordResetChallengeResponse` |
+| Error responses | `404` user not found, `422` validation errors |
+
+`PasswordResetRequest`
+
+| Field | Type | Required | Default | Constraints |
+|---|---|---:|---|---|
+| `email` | `EmailStr` | Yes | None | min length 5, max length 255 |
+
+#### `POST /auth/password-reset/verify`
+
+| Item | Details |
+|---|---|
+| Required headers | `Content-Type: application/json` |
+| Query params | None |
+| Path params | None |
+| Request body | `PasswordResetConfirmRequest` |
+| Success response | `200 OK` with `MessageResponse` |
+| Error responses | `400`, `404`, `422` |
+
+`PasswordResetConfirmRequest`
+
+| Field | Type | Required | Default | Constraints |
+|---|---|---:|---|---|
+| `email` | `EmailStr` | Yes | None | min length 5, max length 255 |
+| `reset_token` | `str` | Yes | None | min length 16, max length 255 |
+| `new_password` | `str` | Yes | None | min length 8, max length 128 |
+
+#### `GET /auth/google`
+
+#### `GET /auth/google/login`
+
+These are both decorators on the same handler.
+
+**(v3.1)** Also accessible via `GET /v1/auth/google/login` due to dual-mount.
+
+| Item | Details |
+|---|---|
+| Required headers | None |
+| Query params | None |
+| Path params | None |
+| Request body | None |
+| Success response | `302 Found` redirect to Google OAuth consent URL; sets `google_oauth_state` cookie |
+| Error responses | `503` if Google config is missing |
+
+**(v3.1)** OAuth scopes requested: `openid`, `email`, `profile`, `https://www.googleapis.com/auth/drive.readonly`
+
+Cookie set by this handler:
+
+| Cookie | Value | HttpOnly | Path | SameSite | Secure |
+|---|---|---:|---|---|---:|
+| `google_oauth_state` | random OAuth state | Yes | `/` **(v3.1)** | `lax` | `false` |
+
+#### `GET /auth/google/callback`
+
+**(v3.1)** Also accessible via `GET /v1/auth/google/callback` due to dual-mount. The handler dynamically resolves the incoming URL as `redirect_uri` for Google token exchange.
+
+| Item | Details |
+|---|---|
+| Required headers | None |
+| Query params | `code` (optional in signature, required by logic), `state` (optional in signature, required by logic) |
+| Cookie params | `google_oauth_state` cookie via `Cookie(alias="google_oauth_state")` |
+| Path params | None |
+| Request body | None |
+| Success response | `302 Found` redirect to frontend callback URL with query string `status=success&is_new_user=true|false`; sets `refresh_token` cookie and deletes `google_oauth_state` cookie |
+| Error responses | `400` missing code, `400` invalid OAuth state, Google OAuth exchange errors from the service |
+
+**(v3.1)** On successful login, saves `user.google_refresh_token` to PostgreSQL and applies `clock_skew_in_seconds=10` during ID token verification.
+
+Redirect target shape:
+
+```text
+{FRONTEND_URL}/auth/google/callback?status=success&is_new_user=true|false
+```
+
+Cookie set by this handler:
+
+| Cookie | Value | HttpOnly | Path | SameSite | Secure |
+|---|---|---:|---|---|---:|
+| `refresh_token` | refresh JWT | Yes | `/` **(v3.1)** | `lax` | `false` |
+
+#### `GET /auth/microsoft`
+
+#### `GET /auth/microsoft/login` **(v3.1)**
+
+These are both decorators on the same handler. Accessible via `GET /auth/microsoft/login` or `GET /v1/auth/microsoft/login` due to dual-mount.
+
+| Item | Details |
+|---|---|
+| Required headers | None |
+| Query params | None |
+| Path params | None |
+| Request body | None |
+| Success response | `302 Found` redirect to Microsoft OAuth consent URL (`https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize`); sets `microsoft_oauth_state` cookie |
+| Error responses | `503` if Microsoft config is missing |
+
+OAuth scopes requested: `offline_access`, `User.Read`, `Files.Read.All`, `Sites.Read.All`
+
+Cookie set by this handler:
+
+| Cookie | Value | HttpOnly | Path | SameSite | Secure |
+|---|---|---:|---|---|---:|
+| `microsoft_oauth_state` | random OAuth state | Yes | `/` | `lax` | `false` |
+
+#### `GET /auth/microsoft/callback` **(v3.1)**
+
+Accessible via `GET /auth/microsoft/callback` or `GET /v1/auth/microsoft/callback` due to dual-mount.
+
+| Item | Details |
+|---|---|
+| Required headers | None |
+| Query params | `code` (required), `state` (required) |
+| Cookie params | `microsoft_oauth_state` cookie via `Cookie(alias="microsoft_oauth_state")` |
+| Path params | None |
+| Request body | None |
+| Success response | `302 Found` redirect to frontend callback URL (`/auth/microsoft/callback?status=success&is_new_user=true|false`); sets `refresh_token` cookie and deletes `microsoft_oauth_state` cookie |
+| Error responses | `400` missing code, `400` invalid OAuth state, Microsoft OAuth exchange errors from the service |
+
+On successful login, saves `user.microsoft_refresh_token` to PostgreSQL.
+
+Redirect target shape:
+
+```text
+{FRONTEND_URL}/auth/microsoft/callback?status=success&is_new_user=true|false
+```
+
+Cookie set by this handler:
+
+| Cookie | Value | HttpOnly | Path | SameSite | Secure |
+|---|---|---:|---|---|---:|
+| `refresh_token` | refresh JWT | Yes | `/` | `lax` | `false` |
+
+#### `GET /v1/audit-logs`
+
+- Description: Return the current user's activity logs and aggregate counts.
+- Request Headers: `Authorization: Bearer <access_token>`
+- Query params:
+  - `sort`: Optional. Values: `timestamp`, `status`, `user_id`, `username`, `method`. Default: `timestamp`.
+  - `limit`: Optional. Integer between 1 and 100. Default: `50`.
+  - `date_range`: Optional. Values: `Today`, `Yesterday`, `Last 7 Days`, `Last 30 Days`.
+  - `status`: Optional. Values: `success`, `failed`.
+- Request Body: None
+- Response Success (200 OK):
+JSON
+
+{
+  "items": [
+    {
+      "id": "audit-log-id",
+      "request_id": "req-123",
+      "user_id": "user-abc",
+      "username": "jdoe",
+      "method": "POST",
+      "status": 200,
+      "timestamp": "2026-08-08T12:34:56Z",
+      "action": "Login"
+    }
+  ],
+  "count": {
+    "total": 123,
+    "success": 120,
+    "failed": 3
+  },
+  "sort": "timestamp",
+  "limit": 50
+}
+
+- Notes:
+  - Filters are optional. If no filters are provided, the endpoint returns all logs for the authenticated user.
+  - `success` means `status < 400`; `failed` means `status >= 400`.
+
+#### Activity Log Action Mapping
+
+**Authentication**
+- `POST /auth/login` → `Login`
+- `POST /auth/signup/verify` → `Account Created`
+- `POST /auth/password-reset/verify` → `Password Changed`
+
+**Dataset**
+- `POST /v1/datasets` → `Dataset Created`
+- `PATCH /v1/datasets/{id}` → `Dataset Updated`
+- `DELETE /v1/datasets/{id}` → `Dataset Deleted`
+
+**File**
+- `POST /v1/upload/finalize` → `File Uploaded`
+- `POST /v1/uploads/delete` → `File Deleted`
+- `[Move endpoint]` → `File Moved`
+
+**Google Drive**
+- `GET /auth/google/callback` → `Google Drive Connected`
+- `DELETE /auth/google/logout` → `Google Drive Disconnected`
+- `POST /v1/ingest/gdrive/init` → `Google Drive File Imported`
+- `POST /v1/ingest/gdrive/url` → `Google Drive URL Imported`
+
+**SharePoint**
+- `GET /auth/microsoft/callback` → `SharePoint Connected`
+- `DELETE /auth/microsoft/logout` → `SharePoint Disconnected`
+- `POST /v1/ingest/sharepoint/init` → `SharePoint File Imported`
+- `POST /v1/ingest/sharepoint/url` → `SharePoint URL Imported`
+
+**FTP**
+- `POST /v1/ftp/signup` → `FTP Connected`
+- `POST /v1/ftp/logout` → `FTP Disconnected`
+
+### File ingestion and dataset endpoints
+
+#### `POST /v1/upload/init`
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>`, `Content-Type: application/json` |
+| Query params | None |
+| Path params | None |
+| Request body | `UploadInitRequest` |
+| Success response | `200 OK` with `UploadInitResponse` |
+| Error responses | `401`, `403`, `404`, `409`, `422` |
+
+`UploadInitRequest`
+
+| Field | Type | Required | Default | Constraints |
+|---|---|---:|---|---|
+| `dataset_id` | `str` | Yes | None | min length 1 |
+| `filename` | `str` | Yes | None | min length 1, max length 255 |
+| `filesize` | `int` | Yes | None | greater than 0 |
+| `master_hash` | `str` | Yes | None | length exactly 64 |
+| `relative_path` | `str \| None` | No | `null` | min length 0, max length 500 |
+
+`UploadInitResponse`
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `upload_id` | `str` | Yes | None |
+| `chunk_size` | `int` | No | `5242880` |
+| `total_chunks` | `int` | Yes | None |
+| `status` | `str` | Yes | None |
+
+Relevant status values from the service:
+- `created`
+- `In Progress`
+- `completed`
+- `duplicate_short_circuit`
+- `duplicate_suspected`
+
+#### `POST /v1/upload/chunk`
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>`, `Content-Type: multipart/form-data` |
+| Query params | None |
+| Path params | None |
+| Request body | multipart form-data |
+| Success response | `200 OK` with `UploadChunkResponse` |
+| Error responses | `401`, `403`, `404`, `400`, `422` |
+
+Multipart form fields:
+
+| Field | Type | Required | Default | Constraints |
+|---|---|---:|---|---|
+| `upload_id` | `str` | Yes | None | min length 1 |
+| `chunk_index` | `int` | Yes | None | greater than or equal to 0 |
+| `chunk_hash` | `str` | Yes | None | length exactly 64 |
+| `chunk_file` | `UploadFile` | Yes | None | file upload |
+
+`UploadChunkResponse`
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `status` | `str` | Yes | None |
+| `upload_id` | `str` | Yes | None |
+| `chunk_index` | `int` | Yes | None |
+| `bytes_received` | `int` | Yes | None |
+| `received_chunks` | `int` | Yes | None |
+| `total_chunks` | `int` | Yes | None |
+| `chunk_size` | `int` | No | `5242880` |
+| `complete` | `bool` | Yes | None |
+
+#### `POST /v1/upload/finalize`
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>`, `Content-Type: application/json` |
+| Query params | None |
+| Path params | None |
+| Request body | `UploadFinalizeRequest` |
+| Success response | `200 OK` with `UploadFinalizeResponse` |
+| Error responses | `401`, `403`, `400`, `404`, `409`, `422` |
+
+`UploadFinalizeRequest`
+
+| Field | Type | Required | Default | Constraints |
+|---|---|---:|---|---|
+| `upload_id` | `str` | Yes | None | min length 1 |
+| `master_hash` | `str` | Yes | None | length exactly 64 |
+
+`UploadFinalizeResponse`
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `status` | `str` | Yes | None |
+| `file_id` | `str` | Yes | None |
+| `folder_id` | `str \| None` | No | `null` |
+
+Relevant service output values:
+- `status="completed"` on successful finalization
+- `status="In Progress"` while chunk uploads are still being processed
+- on incomplete upload the service raises `409 Upload is incomplete`
+
+#### `GET /v1/uploads`
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>` |
+| Query params | `dataset_id: str | None`, `folder_id: str | None` |
+| Path params | None |
+| Request body | None |
+| Success response | `200 OK` with `UploadsTreeResponse` |
+| Error responses | `401`, `403`, `404` if the optional dataset filter is invalid |
+
+Query parameters:
+
+| Name | Type | Required | Default | Constraints |
+|---|---|---:|---|---|
+| `dataset_id` | `str \| None` | No | `null` | none in route layer |
+| `folder_id` | `str \| None` | No | `null` | none in route layer |
+
+`UploadsTreeResponse` is a recursive tree rooted at a synthetic folder node:
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `id` | `str` | Yes | None |
+| `type` | `str` | Yes | None |
+| `name` | `str` | Yes | None |
+| `size` | `int \| None` | No | `null` |
+| `children` | `list[UploadTreeNode] \| None` | No | `null` |
+
+#### `POST /v1/uploads/delete`
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>`, `Content-Type: application/json` |
+| Query params | None |
+| Path params | None |
+| Request body | `UploadDeleteRequest` |
+| Success response | `200 OK` with `UploadDeleteResponse` |
+| Error responses | `401`, `404` |
+
+`UploadDeleteRequest`
+
+| Field | Type | Required | Default | Constraints |
+|---|---|---:|---|---|
+| `upload_id` | `str` | Yes | None | min length 1 |
+
+`UploadDeleteResponse`
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `status` | `str` | Yes | None |
+| `file_id` | `str` | Yes | None |
+
+#### `POST /v1/datasets`
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>`, `Content-Type: application/json` |
+| Query params | None |
+| Path params | None |
+| Request body | `DatasetCreate` |
+| Success response | `201 Created` with `DatasetResponse` |
+| Error responses | `401`, `409`, `422` |
+
+`DatasetCreate`
+
+| Field | Type | Required | Default | Constraints |
+|---|---|---:|---|---|
+| `name` | `str` | Yes | None | min length 1, max length 255 |
+| `status` | `str \| None` | No | `created` | max length 50 |
+| `description` | `str \| None` | No | `null` | max length 500 |
+| `source_type` | `str \| None` | No | `null` | max length 255 |
+| `content_type` | `str \| None` | No | `null` | max length 255 |
+| `format` | `str \| None` | No | `null` | max length 255 |
+| `language` | `str \| None` | No | `null` | max length 255 |
+
+#### `GET /v1/datasets`
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>` |
+| Query params | `page`, `limit` |
+| Path params | None |
+| Request body | None |
+| Success response | `200 OK` with `list[DatasetResponse]` |
+| Error responses | `401` |
+
+Query parameters:
+
+| Name | Type | Required | Default | Constraints |
+|---|---|---:|---|---|
+| `page` | `int` | No | `1` | none in route layer |
+| `limit` | `int` | No | `10` | none in route layer |
+
+#### `GET /v1/datasets/{dataset_id}`
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>` |
+| Query params | None |
+| Path params | `dataset_id: str` |
+| Request body | None |
+| Success response | `200 OK` with `DatasetResponse` |
+| Error responses | `401`, `403`, `404` |
+
+Path parameter:
+
+| Name | Type | Required | Constraints |
+|---|---|---:|---|
+| `dataset_id` | `str` | Yes | none in route layer |
+
+#### `PATCH /v1/datasets/{dataset_id}`
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>`, `Content-Type: application/json` |
+| Query params | None |
+| Path params | `dataset_id: str` |
+| Request body | `DatasetUpdate` |
+| Success response | `200 OK` with `DatasetResponse` |
+| Error responses | `401`, `403`, `400`, `404`, `409`, `422` |
+
+`DatasetUpdate`
+
+| Field | Type | Required | Default | Constraints |
+|---|---|---:|---|---|
+| `name` | `str \| None` | No | `null` | min length 1, max length 255 |
+| `status` | `str \| None` | No | `null` | max length 50 |
+| `description` | `str \| None` | No | `null` | max length 500 |
+| `source_type` | `str \| None` | No | `null` | max length 255 |
+| `content_type` | `str \| None` | No | `null` | max length 255 |
+| `format` | `str \| None` | No | `null` | max length 255 |
+| `language` | `str \| None` | No | `null` | max length 255 |
+
+Note: Dataset `status` can only transition forward in sequence: `created` -> `In Progress` -> `completed`.
+
+#### `DELETE /v1/datasets/{dataset_id}`
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>` |
+| Query params | None |
+| Path params | `dataset_id: str` |
+| Request body | None |
+| Success response | `200 OK` with `{"status": "deleted", "dataset_id": "..."}` |
+| Error responses | `401`, `403`, `404`, `409` |
+
+#### `POST /v1/datasets/{dataset_id}/files`
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>`, `Content-Type: application/json` |
+| Query params | None |
+| Path params | `dataset_id: str` |
+| Request body | `DatasetAttachFileRequest` |
+| Success response | `200 OK` with `DatasetAttachFileResponse` |
+| Error responses | `401`, `403`, `404`, `422` |
+
+`DatasetAttachFileRequest`
+
+| Field | Type | Required | Default | Constraints |
+|---|---|---:|---|---|
+| `file_id` | `str` | Yes | None | min length 1 |
+| `relative_path` | `str \| None` | No | `null` | max length 500 |
+
+### Route-specific response payload examples
+
+```json
+{
+  "message": "Logged out successfully"
+}
+```
+
+```json
+{
+  "status": "deleted",
+  "dataset_id": "dataset-uuid"
+}
+```
+
+```json
+{
+  "status": "attached",
+  "dataset_id": "dataset-uuid",
+  "file_id": "file-uuid",
+  "folder_id": null
+}
+```
+
+## Section 2: Database Schema (SQLAlchemy Models)
+
+The current SQLAlchemy models live in `server/src/models/auth_model.py` and `server/src/models/file_model.py`.
+
+### `users`
+
+| Column | Type | Constraints |
+|---|---|---|
+| `id` | `String(36)` | Primary Key, default `generate_user_id()` |
+| `email` | `String(255)` | `Unique`, `Index`, `Nullable=False` |
+| `username` | `String(64)` | `Unique`, `Index`, `Nullable=True` |
+| `full_name` | `String(255)` | `Nullable=True` |
+| `password_hash` | `String(255)` | `Nullable=False` |
+| `role` | `String(50)` | default `user`, `Nullable=False` |
+| `is_verified` | `Boolean` | default `False`, `Nullable=False` |
+| `auth_provider` | `String(50)` | default `local`, `Nullable=False` |
+| `google_subject` | `String(255)` | `Unique`, `Index`, `Nullable=True` |
+| `google_refresh_token` | `Text` | `Nullable=True` **(v3.1)** — Populated on Google OAuth callback |
+| `microsoft_refresh_token` | `Text` | `Nullable=True` **(v3.1)** — Populated on Microsoft OAuth callback |
+| `token_version` | `Integer` | default `0`, `Nullable=False` |
+| `otp_code_hash` | `Text` | `Nullable=True` |
+| `otp_code_expires_at` | `DateTime(timezone=True)` | `Nullable=True` |
+| `otp_attempts` | `Integer` | default `0`, `Nullable=False` |
+| `password_reset_token_hash` | `Text` | `Nullable=True` |
+| `password_reset_expires_at` | `DateTime(timezone=True)` | `Nullable=True` |
+| `last_login_at` | `DateTime(timezone=True)` | `Nullable=True` |
+| `created_at` | `DateTime(timezone=True)` | default `func.now()`, `Nullable=False` |
+| `updated_at` | `DateTime(timezone=True)` | default `func.now()`, `onupdate=func.now()`, `Nullable=False` |
+
+Relationships:
+- No explicit ORM relationships are declared on `User` in the current model code.
+- Other tables reference `users.id` with `ON DELETE CASCADE`.
+
+### `datasets`
+
+| Column | Type | Constraints |
+|---|---|---|
+| `id` | `String(36)` | Primary Key, default `generate_uuid()` |
+| `user_id` | `String(36)` | Foreign Key to `users.id`, `ON DELETE CASCADE`, `Nullable=False`, `Index` |
+| `name` | `String(255)` | `Nullable=False` |
+| `description` | `String(500)` | `Nullable=True` |
+| `status` | `String(50)` | default `created`, `Nullable=False` |
+| `source_type` | `String(255)` | `Nullable=True` |
+| `content_type` | `String(255)` | `Nullable=True` |
+| `format` | `String(255)` | `Nullable=True` |
+| `language` | `String(255)` | `Nullable=True` |
+| `is_deleted` | `Boolean` | default `False`, `Nullable=False` |
+| `created_at` | `DateTime(timezone=True)` | default `func.now()`, `Nullable=False` |
+| `updated_at` | `DateTime(timezone=True)` | default `func.now()`, `onupdate=func.now()`, `Nullable=False` |
+
+Properties / Relationships:
+- `file_count` property: returns `len(self.mappings)`
+- `user = relationship("User")`
+- `mappings = relationship("DatasetFolderFilesMapping", back_populates="dataset", cascade="all, delete-orphan")`
+
+### `folders`
+
+| Column | Type | Constraints |
+|---|---|---|
+| `id` | `String(36)` | Primary Key, default `generate_uuid()` |
+| `user_id` | `String(36)` | Foreign Key to `users.id`, `ON DELETE CASCADE`, `Nullable=False`, `Index` |
+| `name` | `String(255)` | `Nullable=False` |
+| `parent_id` | `String(36)` | Foreign Key to `folders.id`, `ON DELETE CASCADE`, `Nullable=True`, `Index` |
+| `created_at` | `DateTime(timezone=True)` | default `func.now()`, `Nullable=False` |
+
+Table constraints:
+- `UniqueConstraint("user_id", "parent_id", "name", name="uq_user_parent_name")`
+
+Relationships:
+- `parent = relationship("Folder", remote_side=[id], back_populates="children")`
+- `children = relationship("Folder", back_populates="parent", cascade="all, delete-orphan")`
+- `mappings = relationship("DatasetFolderFilesMapping", back_populates="folder", cascade="all, delete-orphan")`
+
+### `uploaded_files`
+
+| Column | Type | Constraints |
+|---|---|---|
+| `id` | `String(36)` | Primary Key, default `generate_uuid()` |
+| `filename` | `String(255)` | `Nullable=False` |
+| `file_size_bytes` | `BigInteger` | `Nullable=False` |
+| `master_hash` | `String(64)` | `Unique`, `Index`, `Nullable=False` |
+| `physical_path` | `String(500)` | `Nullable=False` |
+| `source_type` | `Enum(FTP, GDrive, Sharepoint)` | `Nullable=True` **(v3.1)** — Tracks the origin provider. Set to `'FTP'` by `ftp_watcher.py`, `'GDrive'`/`'Sharepoint'` by cloud services, `NULL` for local HTTP uploads. |
+| `uploaded_at` | `DateTime(timezone=True)` | default `func.now()`, `Nullable=False` |
+
+Relationships:
+- `mappings = relationship("DatasetFolderFilesMapping", back_populates="file", cascade="all, delete-orphan")`
+
+Important model note:
+- The current ORM model does not define `user_id` or `folder_id` on `UploadedFile`, even though older migrations created those columns and one service path still references `uploaded_file.user_id`.
+
+### `dataset_folder_files_mapping`
+
+| Column | Type | Constraints |
+|---|---|---|
+| `id` | `String(36)` | Primary Key, default `generate_uuid()` |
+| `dataset_id` | `String(36)` | Foreign Key to `datasets.id`, `ON DELETE CASCADE`, `Nullable=False`, `Index` |
+| `folder_id` | `String(36)` | Foreign Key to `folders.id`, `ON DELETE CASCADE`, `Nullable=True`, `Index` |
+| `file_id` | `String(36)` | Foreign Key to `uploaded_files.id`, `ON DELETE CASCADE`, `Nullable=False`, `Index` |
+| `user_id` | `String(36)` | Foreign Key to `users.id`, `ON DELETE CASCADE`, `Nullable=False`, `Index` |
+| `created_at` | `DateTime(timezone=True)` | default `func.now()`, `Nullable=False` |
+
+Table constraints:
+- `UniqueConstraint("dataset_id", "folder_id", "file_id", name="uq_dataset_folder_file")`
+
+Relationships:
+- `dataset = relationship("Dataset", back_populates="mappings")`
+- `folder = relationship("Folder", back_populates="mappings")`
+- `file = relationship("UploadedFile", back_populates="mappings")`
+- `user = relationship("User")`
+
+### Historical migration tables not present in current ORM models
+
+The Alembic history still contains earlier tables such as `physical_files`, `user_upload_mappings`, `upload_requests`, and `upload_responses`, but they are not part of the current SQLAlchemy model set used by `Base.metadata.create_all()`.
+
+## Section 3: Authentication & Token Header Protocol
+
+### Access token delivery
+
+- The access token is returned in the `Authorization` **response header** on successful login, refresh, OTP verification, and Google callback session creation.
+- The header value is formatted as:
+
+```text
+Authorization: Bearer <access_token>
+```
+
+- The token is **not** returned in the JSON body.
+- The FastAPI CORS configuration exposes the `Authorization` response header to browsers.
+
+### Refresh token delivery
+
+- The refresh token is delivered as an `HttpOnly` cookie named `refresh_token`.
+- Cookie attributes in the current code:
+
+| Attribute | Value |
+|---|---|
+| `HttpOnly` | `true` |
+| `Path` | `/` **(v3.1)** — Changed from `/auth` to `/` for dual-mount compatibility |
+| `SameSite` | `lax` |
+| `Secure` | `false` |
+
+- The frontend must use browser credentialed requests (`credentials: 'include'` or equivalent) when calling endpoints that rely on the refresh cookie, especially `POST /auth/refresh` and the Google callback flow.
+
+### Protected endpoint authorization rule
+
+- Protected endpoints require the access token in the request header exactly as `Authorization: Bearer <access_token>`.
+- The code checks that the header exists and starts with `Bearer ` before stripping the token value.
+- If the access token is missing or invalid, the backend returns `401` with a default JSON error payload.
+
+### Token contents
+
+#### Access token claims
+
+The access token is a custom signed JWT containing these claims:
+
+| Claim | Meaning |
+|---|---|
+| `sub` | User ID |
+| `email` | User email |
+| `username` | Username or `null` |
+| `role` | User role |
+| `token_type` | Always `access` |
+| `token_version` | Token revocation/version counter |
+| `iat` | Issued-at Unix timestamp |
+| `exp` | Expiration Unix timestamp |
+
+#### Refresh token claims
+
+| Claim | Meaning |
+|---|---|
+| `sub` | User ID |
+| `email` | User email |
+| `token_type` | Always `refresh` |
+| `token_version` | Token revocation/version counter |
+| `sid` | Session ID |
+| `iat` | Issued-at Unix timestamp |
+| `exp` | Expiration Unix timestamp |
+
+### Frontend handling summary
+
+- Send `Authorization: Bearer <access_token>` on all protected calls.
+- Keep browser cookies enabled for refresh flows.
+- Persist the access token client-side if you need to call protected endpoints directly from React state.
+- Re-fetch a new token pair from `POST /auth/refresh` when the access token expires.
+
+
+
+
+
+### Google Picker Token Endpoint **(v3.1)**
+
+#### `GET /v1/users/me/google-token`
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>` |
+| Query params | None |
+| Path params | None |
+| Request body | None |
+| Success response | `200 OK` with `{"access_token": "<short-lived Google OAuth2 access token>"}` |
+| Error responses | `400` Google account not connected, `401` missing/invalid access token, `500` Google token refresh failure |
+
+Response body:
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `access_token` | `str` | Yes | None |
+
+Notes:
+- Exchanges the user's stored `google_refresh_token` for a fresh short-lived access token via Google OAuth2.
+- Used by the frontend to initialize the Google Picker API (`setOAuthToken`).
+- Returns `400` if the user has not connected their Google account.
+
+
+### Cloud Ingestion & Polling Endpoints **(v3.1)**
+
+#### `GET /v1/users/me/integrations` **(v3.1)**
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>` |
+| Query params | None |
+| Path params | None |
+| Request body | None |
+| Success response | `200 OK` with `UserIntegrationsResponse` |
+| Error responses | `401` missing/invalid access token |
+
+Response body (`UserIntegrationsResponse`):
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `google_connected` | `bool` | Yes | `false` |
+| `microsoft_connected` | `bool` | Yes | `false` |
+
+---
+
+#### `GET /v1/ingest/status/{job_id}` **(v3.1)**
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>` |
+| Query params | None |
+| Path params | `job_id: str` |
+| Request body | None |
+| Success response | `200 OK` with `IngestionJobStatusResponse` |
+| Error responses | `401`, `403` IDOR ownership violation, `404` job ID not found |
+
+Response body (`IngestionJobStatusResponse`):
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `job_id` | `str` | Yes | None |
+| `provider` | `str` | Yes | None |
+| `filename` | `str` | Yes | None |
+| `status` | `str` | Yes | None (`pending`, `in_progress`, `completed`, `failed`) |
+| `progress_percentage` | `int` | Yes | `0` |
+| `error_message` | `str \| None` | No | `null` |
+| `file_id` | `str \| None` | No | `null` |
+| `master_hash` | `str \| None` | No | `null` |
+
+---
+
+#### `POST /v1/ingest/gdrive/init` **(v3.1)**
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>`, `Content-Type: application/json` |
+| Query params | None |
+| Path params | None |
+| Request body | `GDriveIngestInitRequest` |
+| Success response | `200 OK` with `GDriveIngestResponse` |
+| Error responses | `401`, `404` dataset not found, `409` concurrent lock in progress |
+
+Request body (`GDriveIngestInitRequest`):
+
+| Field | Type | Required | Default | Constraints |
+|---|---|---:|---|---|
+| `dataset_id` | `str` | Yes | None | min length 1 |
+| `file_id` | `str` | Yes | None | min length 1 |
+| `filename` | `str \| None` | No | `null` | max length 255 |
+| `mime_type` | `str \| None` | No | `null` | max length 255 |
+| `folder_id` | `str \| None` | No | `null` | max length 36 |
+
+Response body (`GDriveIngestResponse`):
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `job_id` | `str` | Yes | None |
+| `status` | `str` | Yes | None |
+| `message` | `str` | Yes | None |
+
+---
+
+#### `POST /v1/ingest/gdrive/url` **(v3.1)**
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>`, `Content-Type: application/json` |
+| Query params | None |
+| Path params | None |
+| Request body | `GDriveIngestUrlRequest` |
+| Success response | `200 OK` with `GDriveIngestResponse` |
+| Error responses | `400` invalid Google URL, `401`, `404` dataset not found, `409` lock |
+
+Request body (`GDriveIngestUrlRequest`):
+
+| Field | Type | Required | Default | Constraints |
+|---|---|---:|---|---|
+| `dataset_id` | `str` | Yes | None | min length 1 |
+| `gdrive_url` | `str` | Yes | None | min length 1 |
+| `filename` | `str \| None` | No | `null` | max length 255 |
+| `mime_type` | `str \| None` | No | `null` | max length 255 |
+| `folder_id` | `str \| None` | No | `null` | max length 36 |
+
+---
+
+#### `GET /v1/ingest/sharepoint/tree` **(v3.1)**
+
+| Item | Details |
+|---|---|
+| Required headers | `Authorization: Bearer <access_token>` |
+| Query params | `folder_id: str | None`, `drive_id: str | None`, `site_id: str | None` |
+| Path params | None |
+| Request body | None |
+| Success response | `200 OK` with `SharepointTreeResponse` |
+| Error responses | `401` Microsoft account not connected |
+
+Response body (`SharepointTreeResponse`):
+
+| Field | Type | Required | Default |
+|---|---|---:|---|
+| `items` | `list[SharepointItem]` | Yes | None |
+| `drive_id` | `str \| None` | No | `null` |
+| `parent_folder_id` | `str \| None` | No | `null` |
+
+---
+
+#### `POST /v1/ingest/sharepoint/init` & `POST /v1/ingest/sharepoint/url` (MODIFIED)
+
+- Description: Accepts SharePoint item IDs or shared URLs (encoded via Base64 u! format).
+- Request Headers: Authorization: Bearer <access_token>, Content-Type: application/json
+
+- Request Body (init):
+JSON
+
+{
+
+  "dataset_id": "uuid",
+
+  "item_id": "item_id_string",
+
+  "quick_xor_hash": "base64_hash==",
+
+  "folder_id": "uuid",
+
+  "filename": "data.csv"
+
+}
+
+- Request Body (url):
+JSON
+
+{
+
+  "dataset_id": "uuid",
+
+  "sharepoint_url": "https://company.sharepoint.com/:x:/g/...",
+
+  "quick_xor_hash": null,
+
+  "folder_id": "uuid",
+
+  "filename": "data.csv"
+
+}
+
+- Response Success (200 OK):
+JSON
+
+{
+
+  "job_id": "uuid",
+
+  "status": "completed",
+
+  "message": "Instant zero-I/O mapping created via Rosetta Stone",
+
+  "is_instant_deduplicated": true
+
+}
+
+- Expected Errors:
+
+
+
+#### `DELETE /auth/google/logout` & `DELETE /auth/microsoft/logout`
+
+- Description: Disconnect the authenticated user's cloud integration by clearing the stored OAuth refresh token for Google or Microsoft.
+- Request Headers: Authorization: Bearer <access_token>
+- Request Body: None
+- Response Success (200 OK):
+JSON
+
+{
+
+  "message": "Google integration disconnected"
+
+}
+
+or
+
+{
+
+  "message": "Microsoft integration disconnected"
+
+}
+
+- Expected Errors:
+  - `401` Missing or invalid access token
+  - `403` Not authorized to disconnect another user's integration (if implemented)
+  - `404` User not found (if token subject is invalid)

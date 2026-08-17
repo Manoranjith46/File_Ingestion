@@ -117,6 +117,79 @@ def _stream_sharepoint_download(file_id_or_url: str, access_token: str, download
             yield chunk
 
 
+def get_sharepoint_tree(
+    db: Session,
+    user: User,
+    folder_id: str | None = None,
+    drive_id: str | None = None,
+    site_id: str | None = None,
+) -> SharepointTreeResponse:
+    """Browse Microsoft SharePoint / OneDrive directory tree via Graph API.
+
+    Args:
+        db: Active database session.
+        user: Authenticated user.
+        folder_id: Optional folder ID to list children of.
+        drive_id: Optional drive ID to target.
+        site_id: Optional site ID to target.
+
+    Returns:
+        SharepointTreeResponse with items list.
+    """
+    access_token = get_user_microsoft_access_token(user)
+    headers = {"Authorization": f"Bearer {access_token}"}
+
+    # Build the Graph API URL based on supplied parameters
+    if site_id and drive_id and folder_id:
+        url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/items/{folder_id}/children"
+    elif drive_id and folder_id:
+        url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/items/{folder_id}/children"
+    elif drive_id:
+        url = f"https://graph.microsoft.com/v1.0/drives/{drive_id}/root/children"
+    elif folder_id:
+        url = f"https://graph.microsoft.com/v1.0/me/drive/items/{folder_id}/children"
+    else:
+        url = "https://graph.microsoft.com/v1.0/me/drive/root/children"
+
+    try:
+        resp = http_requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+    except http_requests.exceptions.HTTPError:
+        raise IntegrationRequestError(
+            message="Failed to browse SharePoint directory. Please check your permissions or re-connect your account."
+        )
+
+    data = resp.json()
+    items: list[SharepointItem] = []
+
+    for item in data.get("value", []):
+        is_folder = "folder" in item
+        quick_xor = None
+        if "file" in item and "hashes" in item.get("file", {}):
+            quick_xor = item["file"]["hashes"].get("quickXorHash")
+
+        items.append(
+            SharepointItem(
+                id=item["id"],
+                name=item.get("name", ""),
+                is_folder=is_folder,
+                mime_type=item.get("file", {}).get("mimeType") if not is_folder else None,
+                size_bytes=item.get("size", 0),
+                quick_xor_hash=quick_xor,
+                web_url=item.get("webUrl"),
+                parent_id=item.get("parentReference", {}).get("id"),
+            )
+        )
+
+    parent_ref = data.get("value", [{}])[0].get("parentReference", {}) if data.get("value") else {}
+
+    return SharepointTreeResponse(
+        items=items,
+        drive_id=parent_ref.get("driveId") or drive_id,
+        parent_folder_id=folder_id,
+    )
+
+
 def initiate_sharepoint_ingestion(
     db: Session,
     user: User,

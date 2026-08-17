@@ -1,0 +1,1818 @@
+# File Ingestion Server — Architecture & Execution Flow
+
+---
+
+## Table of Contents
+
+1. [High-Level Project Flow & Architecture](#1-high-level-project-flow--architecture)
+2. [Global Middlewares & Authentication](#2-global-middlewares--authentication)
+3. [Endpoints Overview (Table)](#3-endpoints-overview-table)
+4. [Deep-Dive Endpoint Execution Flows](#4-deep-dive-endpoint-execution-flows)
+   - [Authentication Endpoints](#41-authentication-endpoints)
+   - [File Ingestion Endpoints](#42-file-ingestion-endpoints)
+5. [Core Data Models / Database Interactions](#5-core-data-models--database-interactions)
+
+---
+
+## 1. High-Level Project Flow & Architecture
+
+### 1.1 What the Project Does
+
+This is a **chunked file ingestion and dataset management API** built with **FastAPI** and **Python**. It provides:
+
+- **User Authentication** — Local registration with OTP email verification, login with JWT access/refresh tokens, Google OAuth 2.0 sign-in, password reset flows, and session management backed by Redis.
+- **Chunked File Uploads** — A three-phase upload protocol (initialize → upload chunks → finalize) that supports SHA-256 integrity verification, server-side deduplication (both short-circuit and suspected-duplicate linking), and automatic cleanup of abandoned sessions.
+- **Dataset & Folder Management** — CRUD operations for logical datasets, a virtual folder tree derived from client-supplied relative paths, and file-to-dataset attachment with zero-I/O linking for deduplicates.
+
+### 1.2 Core Architecture Pattern
+
+The project follows a **Layered Architecture** pattern with clear separation of concerns:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      FastAPI Application                    │
+│                        (main.py)                            │
+├─────────────────────────────────────────────────────────────┤
+│  MIDDLEWARE LAYER                                           │
+│  └── CORSMiddleware (allow_origins, credentials, methods)   │
+├──────────────────────┬──────────────────────────────────────┤
+│  ROUTE LAYER         │  ROUTE LAYER                        │
+│  auth_routes.py      │  file_routes.py                     │
+│  prefix: /auth       │  prefix: /v1                        │
+├──────────────────────┼──────────────────────────────────────┤
+│  SCHEMA LAYER        │  SCHEMA LAYER                       │
+│  auth_schema.py      │  file_schema.py                     │
+│  (Pydantic models)   │  (Pydantic models)                  │
+├──────────────────────┼──────────────────────────────────────┤
+│  SERVICE LAYER       │  SERVICE LAYER                      │
+│  auth_services.py    │  file_services.py                   │
+│                      │  cleanup_scheduler.py               │
+│                      │  ftp_watcher.py                     │
+│                      │  audit_worker.py                    │
+├──────────────────────┴──────────────────────────────────────┤
+│  MIDDLEWARE LAYER (per-request)                             │
+│  AuditMiddleware (audit_middleware.py) — captures every     │
+│  request/response and publishes to the Redis audit stream   │
+├─────────────────────────────────────────────────────────────┤
+│  HELPER LAYER                                               │
+│  jwt.py (hashing, token signing/verification)               │
+│  get_env.py (environment variable loading)                  │
+├─────────────────────────────────────────────────────────────┤
+│  MODEL LAYER                                                │
+│  auth_model.py (User)                                       │
+│  file_model.py (Dataset, Folder, UploadedFile, Mapping)     │
+├─────────────────────────────────────────────────────────────┤
+│  DATA LAYER                                                 │
+│  ┌────────────────┐  ┌──────────────────────────────────┐   │
+│  │ PostgreSQL      │  │ Redis                            │   │
+│  │ (SQLAlchemy +   │  │ (Session limiter, upload state,  │   │
+│  │  Alembic)       │  │  bitmap tracking, Lua scripts)   │   │
+│  └────────────────┘  └──────────────────────────────────┘   │
+├─────────────────────────────────────────────────────────────┤
+│  FILESYSTEM                                                 │
+│  uploads/.parts/{upload_id}/       (temporary chunk storage) │
+│  uploads/files/Local|GDrive|SP/    (final assembled files)   │
+│  uploads/files/FTP/                (FTP-ingested files)      │
+│  uploads/ftp_dropzone/{username}/  (FTP incoming dropzone)   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 1.3 Request Journey
+
+A standard authenticated request traverses the system as follows:
+
+```
+Client Request
+     │
+     ▼
+┌─ CORSMiddleware ─────────────────────────────────────────┐
+│  Validates Origin, injects CORS headers                  │
+└──────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─ FastAPI Router ─────────────────────────────────────────┐
+│  Matches the URL prefix (/auth or /v1) and HTTP method   │
+└──────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─ Route Handler ──────────────────────────────────────────┐
+│  1. Pydantic schema validates request body/params        │
+│  2. Depends(get_db) yields a scoped SQLAlchemy session   │
+│  3. _resolve_current_user() extracts & verifies the      │
+│     Bearer token from the Authorization header           │
+└──────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─ Service Layer ──────────────────────────────────────────┐
+│  Business logic: DB queries, Redis state management,     │
+│  file I/O, hashing, token operations                     │
+└──────────────────────────────────────────────────────────┘
+     │
+     ▼
+┌─ Data Layer ─────────────────────────────────────────────┐
+│  PostgreSQL (SQLAlchemy ORM)  +  Redis (state/sessions)  │
+│  + Filesystem (uploads/.parts, uploads/files)            │
+└──────────────────────────────────────────────────────────┘
+     │
+     ▼
+  JSON Response (or RedirectResponse for OAuth)
+```
+
+### 1.4 Application Startup (Lifespan)
+
+When the FastAPI app starts, the `lifespan` context manager in `main.py` executes:
+
+1. **`redis_server_status()`** — Pings Redis to verify connectivity.
+2. **`Check_db_Connection()`** — Opens a test connection to PostgreSQL.
+3. **`start_cleanup_scheduler()`** — Launches a daemon thread that periodically purges abandoned upload part directories (default every 300s).
+4. **`start_ftp_watcher()`** — Launches a daemon thread that polls `uploads/ftp_dropzone/` for completed FTP file drops (default every 10s).
+5. **`start_audit_worker()`** — Creates the Redis consumer group (`audit-consumer-group`) on the audit stream (with `mkstream=True`) and spawns an asyncio task (`_drain_audit_stream()`) that continuously reads batched audit events from Redis and persists them to the `audit_logs` table.
+6. **`Base.metadata.create_all(bind=get_engine())`** — Ensures all SQLAlchemy tables exist (safe no-op if already present).
+
+---
+
+## 2. Global Middlewares & Authentication
+
+### 2.1 CORSMiddleware
+
+Configured in `main.py` as the first global middleware:
+
+| Setting              | Value                                                                 |
+|----------------------|-----------------------------------------------------------------------|
+| `allow_origins`      | Comma-separated URLs from `FRONTEND_URL` env var + `http://localhost:5173` |
+| `allow_credentials`  | `True`                                                                |
+| `allow_methods`      | `["*"]` (all HTTP methods)                                            |
+| `allow_headers`      | `["*"]` (all headers)                                                 |
+| `expose_headers`     | `["Authorization"]` (so the client can read the access token header)  |
+
+### 2.1.1 AuditMiddleware
+
+A second global middleware (`audit_middleware.py`) is registered after `CORSMiddleware`. It captures every HTTP request/response cycle and publishes a structured audit event to a **Redis Stream** (`audit_stream_name`).
+
+**Per-request audit payload:**
+
+| Field          | Source                                          |
+|----------------|-------------------------------------------------|
+| `request_id`   | `uuid4()` generated per request                |
+| `method`       | HTTP method (`GET`, `POST`, etc.)               |
+| `path`         | Request URL path                                |
+| `status_code`  | HTTP response status code                       |
+| `duration_ms`  | Elapsed time from request start to response     |
+| `ip_address`   | Client IP from `X-Forwarded-For` or direct      |
+| `user_agent`   | `User-Agent` request header                     |
+| `user_id`      | Extracted from the `Authorization` Bearer token (if present) |
+
+If the Redis publish fails (e.g., Redis is down), the middleware swallows the exception to avoid blocking the HTTP response.
+
+### 2.2 Authentication Mechanism
+
+The project uses a **custom HMAC SHA-256 JWT implementation** (no third-party JWT library). Authentication is **not** implemented as a global middleware but instead enforced **per-route** using inline header extraction.
+
+#### Token Types
+
+| Token           | Algorithm   | Secret Env Var             | Default TTL | Delivery Mechanism                     |
+|-----------------|-------------|----------------------------|-------------|-----------------------------------------|
+| Access Token    | HS256 HMAC  | `JWT_SECRET_KEY`           | 15 minutes  | `Authorization` response header         |
+| Refresh Token   | HS256 HMAC  | `JWT_REFRESH_SECRET_KEY`   | 7 days      | `HttpOnly` cookie (`refresh_token`)     |
+
+#### Access Token Claims
+
+```json
+{
+  "sub": "<user_id>",
+  "email": "<user_email>",
+  "username": "<username>",
+  "role": "<user_role>",
+  "token_type": "access",
+  "token_version": "<int>",
+  "iat": "<unix_timestamp>",
+  "exp": "<unix_timestamp>"
+}
+```
+
+#### Refresh Token Claims
+
+```json
+{
+  "sub": "<user_id>",
+  "email": "<user_email>",
+  "token_type": "refresh",
+  "token_version": "<int>",
+  "sid": "<session_id_hex>",
+  "iat": "<unix_timestamp>",
+  "exp": "<unix_timestamp>"
+}
+```
+
+#### Authentication Flow (Per-Request)
+
+1. Route handler reads the `Authorization` header.
+2. Validates it starts with `Bearer `.
+3. Strips the prefix and calls `get_current_user(db, access_token)` in `auth_services.py`.
+4. `decode_access_token()` in `jwt.py`:
+   - Splits the token into header, payload, and signature.
+   - Recomputes the HMAC SHA-256 signature and performs a constant-time comparison.
+   - Validates the `token_type` claim is `"access"`.
+   - Checks the `exp` claim against the current UTC time.
+5. Looks up the user in PostgreSQL by `payload["sub"]`.
+6. Compares `user.token_version` to `payload["token_version"]` — if mismatched, the token has been revoked.
+
+### 2.3 Session Management with Redis
+
+Active sessions are tracked in Redis using a **Sorted Set (ZSET)** per user:
+
+- **Key**: `user:sessions:{user_id}`
+- **Members**: Session IDs (`sid` — a `secrets.token_hex(16)` value)
+- **Scores**: Unix timestamps of when the session was created.
+
+A registered **Lua script** (`ACTIVE_SESSION_LIMITER_LUA`) atomically:
+1. Removes expired entries from the ZSET.
+2. Adds the new session.
+3. Evicts the oldest sessions if the count exceeds `MAX_ACTIVE_SESSIONS` (default: 3).
+4. Refreshes the TTL.
+
+### 2.4 Password Hashing
+
+- **Algorithm**: PBKDF2 with HMAC-SHA256
+- **Iterations**: 120,000 (configurable for production)
+- **Salt**: 16 random bytes (per-password)
+- **Storage Format**: `pbkdf2_sha256${iterations}${b64url_salt}${b64url_hash}`
+
+### 2.5 Background Cleanup Scheduler
+
+A daemon thread (`cleanup_scheduler.py`) runs every `UPLOAD_CLEANUP_INTERVAL_SECONDS` (default: 300s):
+
+1. Iterates all directories under `uploads/.parts/`.
+2. For each directory named after an `upload_id`, checks if `upload:{upload_id}:meta` still exists in Redis.
+3. If the Redis key has expired (session abandoned), the directory and related bitmap/hash keys are purged.
+
+### 2.6 FTP Dropzone Watcher (v4.0)
+
+A daemon thread (`ftp_watcher.py`) runs every `FTP_POLL_INTERVAL_SECONDS` (default: 10s). It implements the **s2s (server-to-server)** ingestion flow for files dropped via FTP (e.g., FileZilla → alpine-ftp-server → shared Docker volume).
+
+**Ingestion Flow Categories:**
+
+| Category | Label | Path | Example |
+|----------|-------|------|---------|
+| Local HTTP upload | c2s | Client → Server | Browser chunked upload |
+| Cloud provider | c2s2s | Client → Google/Microsoft → Server | OAuth-based streaming |
+| FTP drop | s2s | Server → Server | FileZilla → shared volume |
+
+**Infrastructure:**
+- The `alpine-ftp-server` Docker container and the FastAPI container share the `uploads-data` volume.
+- FTP users map to `{username}` in the PostgreSQL `users` table.
+- Files land at `uploads/ftp_dropzone/{username}/`.
+
+**Scan Cycle:**
+
+```
+uploads/ftp_dropzone/
+    │
+    ├── alice/
+    │   ├── report.pdf          ← ready (mtime > 5s ago)
+    │   └── data.csv.filepart   ← SKIPPED (incomplete extension)
+    │
+    └── bob/
+        └── photo.jpg           ← SKIPPED (mtime < 5s ago, still writing)
+```
+
+1. Iterate each `{username}/` subdirectory under `uploads/ftp_dropzone/`.
+2. For each file, apply safety checks:
+   - **Skip** if extension is `.filepart` or `.tmp` (incomplete FTP transfer marker).
+   - **Skip** if file `mtime` is within the last `FTP_SAFETY_DELAY_SECONDS` (default: 5s) — guarantees the FTP client has finished writing.
+3. For each completed file, execute `_ingest_ftp_file(username, filepath)`.
+
+**Per-File Ingestion (`_ingest_ftp_file`):**
+
+```
+_ingest_ftp_file(username, filepath)
+     │
+     ├─ Open standalone DB session (get_session_local()())
+     │
+     ├─ 1. Resolve User
+     │   └─ SELECT * FROM users WHERE username = {username}
+     │   └─ If not found → log error, return (skip file)
+     │
+     ├─ 2. Compute SHA-256 + capture file size
+     │   └─ hashlib.sha256(), 8 MiB read buffer (chunked I/O)
+     │   └─ filepath.stat().st_size
+     │
+     ├─ 3. Deduplication Check (Zero I/O)
+     │   └─ SELECT * FROM uploaded_files WHERE master_hash = {hash}
+     │   │
+     │   ├─ [DUPLICATE — hash already in DB]
+     │   │   ├─ filepath.unlink()  ← delete the dropzone copy
+     │   │   └─ Reuse existing file_id (no filesystem write)
+     │   │
+     │   └─ [NEW FILE — hash not seen before]
+     │       ├─ FTP_FINAL_ROOT.mkdir(parents=True, exist_ok=True)
+     │       ├─ _get_unique_filename() → appends (1), (2), etc. on collision
+     │       ├─ shutil.move(dropzone_path → uploads/files/FTP/{filename})
+     │       ├─ INSERT INTO uploaded_files
+     │       │     (filename, file_size_bytes, master_hash,
+     │       │      physical_path, source_type='FTP')
+     │       └─ db.flush() → assigns new file_id
+     │
+     ├─ 4. Get or Create "FTP Drops" Dataset
+     │   └─ SELECT datasets WHERE user_id={id} AND lower(name)='ftp drops'
+     │                           AND is_deleted=False
+     │   └─ If not found → INSERT dataset
+     │                      (name='FTP Drops', status='Draft',
+     │                       description='Auto-created dataset…')
+     │                      + db.flush()
+     │
+     ├─ 5. Duplicate Mapping Check
+     │   └─ SELECT DatasetFolderFilesMapping
+     │          WHERE dataset_id={id} AND folder_id IS NULL
+     │            AND file_id={file_id} AND user_id={user_id}
+     │   └─ If mapping already exists → skip insert (idempotent)
+     │
+     ├─ 6. Insert Mapping (only if not already present)
+     │   └─ pg_insert(DatasetFolderFilesMapping)
+     │          .values(dataset_id, folder_id=None, file_id, user_id)
+     │          .on_conflict_do_nothing(constraint='uq_dataset_folder_file')
+     │
+     ├─ 7. Dataset Status Promotion
+     │   └─ If dataset.status == 'Created' → set status = 'Draft'
+     │
+     └─ 8. db.commit()  (or db.rollback() + log on any exception)
+        └─ finally: db.close()
+```
+
+**Error Isolation:** Each file is processed in its own `try/except` block with an independent DB session. A single bad file never crashes the watcher or blocks other files.
+
+**Environment Variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FTP_STORAGE_DIR` | `FTP` | Subdirectory name under `files/` for FTP storage |
+| `FTP_DROPZONE_PATH` | `ftp_dropzone` | Subdirectory under `UPLOAD_STORAGE_DIR` for incoming FTP files |
+| `FTP_POLL_INTERVAL_SECONDS` | `10` | How often the watcher scans the dropzone |
+| `FTP_SAFETY_DELAY_SECONDS` | `5` | Minimum file age (seconds since last modification) before ingestion |
+
+---
+
+## 3. Endpoints Overview (Table)
+
+| HTTP Method | Endpoint URL                     | Handler Name                          | Brief Description                                               |
+|-------------|----------------------------------|---------------------------------------|-----------------------------------------------------------------|
+| `POST`      | `/auth/signup/init`              | `register()`                          | Register a new local user and issue the first OTP challenge     |
+| `POST`      | `/auth/signup/verify`            | `verify_signup_endpoint()`            | Verify OTP and establish a verified login session               |
+| `POST`      | `/auth/login`                    | `login()`                             | Authenticate a verified local user and return token pair        |
+| `POST`      | `/auth/logout`                   | `logout()`                            | Invalidate the current session and clear refresh cookie         |
+| `POST`      | `/auth/refresh`                  | `refresh()`                           | Rotate the refresh token and return a fresh token pair          |
+| `GET`       | `/auth/me`                       | `me()`                                | Return the authenticated user's public profile                  |
+| `POST`      | `/auth/password-reset/request`   | `request_password_reset_endpoint()`   | Create a password reset challenge for an email address          |
+| `POST`      | `/auth/password-reset/verify`    | `reset_password_endpoint()`           | Update a user's password after verifying the reset token        |
+| `GET`       | `/auth/google`                   | `google_login()`                      | Redirect to Google's OAuth consent screen                       |
+| `GET`       | `/auth/google/login`             | `google_login()`                      | Alias redirect to Google's OAuth consent screen                 |
+| `GET`       | `/auth/google/callback`          | `google_callback()`                   | Handle Google's OAuth callback and redirect to frontend         |
+| `GET`       | `/v1/health`                     | `health_check()`                      | Lightweight health check for uptime monitoring                  |
+| `POST`      | `/v1/upload/init`                | `upload_init()`                       | Initialize a chunked file upload session                        |
+| `POST`      | `/v1/upload/chunk`               | `upload_chunk()`                      | Process a single uploaded chunk                                 |
+| `POST`      | `/v1/upload/finalize`            | `upload_finalize()`                   | Finalize a completed upload and persist the assembled file      |
+| `GET`       | `/v1/uploads`                    | `uploads()`                           | Return the authenticated user's upload tree                     |
+| `POST`      | `/v1/uploads/delete`             | `delete_upload()`                     | Delete a single upload and its physical file                    |
+| `POST`      | `/v1/datasets`                   | `create_new_dataset()`                | Create a new dataset under the authenticated user               |
+| `GET`       | `/v1/datasets`                   | `list_datasets()`                     | List all active datasets with pagination                        |
+| `GET`       | `/v1/datasets/{dataset_id}`      | `get_dataset_by_id_route()`           | Retrieve a single dataset by ID                                 |
+| `PATCH`     | `/v1/datasets/{dataset_id}`      | `modify_dataset()`                    | Update metadata of an existing dataset                          |
+| `DELETE`    | `/v1/datasets/{dataset_id}`      | `remove_dataset()`                    | Soft-delete a dataset (only if no files attached)               |
+| `POST`      | `/v1/datasets/{dataset_id}/files`| `attach_file()`                       | Attach an existing uploaded file to a dataset (zero-I/O)        |
+
+---
+
+## 4. Deep-Dive Endpoint Execution Flows
+
+---
+
+### 4.1 Authentication Endpoints
+
+---
+
+#### `POST` `/auth/signup/init`
+
+- **Purpose:** Register a new local user account and automatically create the first OTP verification challenge.
+
+- **Request:**
+  - **Headers:** None required.
+  - **Body Payload:**
+    ```json
+    {
+      "email": "user@example.com",
+      "username": "johndoe",          // optional, 3-64 chars
+      "full_name": "John Doe",        // optional
+      "password": "securePass123"     // 8-128 chars
+    }
+    ```
+    Validated by `RegisterRequest` Pydantic schema. Email is stripped, normalized via `email-validator`, and optionally checked for deliverability. Username and full_name are stripped of whitespace.
+
+- **Execution Flow:**
+  1. FastAPI deserializes and validates the body against `RegisterRequest`.
+  2. `Depends(get_db)` yields a scoped SQLAlchemy `Session`.
+  3. Route handler calls `create_user(db, payload)` in `auth_services.py`.
+  4. `create_user()` normalizes the email to lowercase and strips whitespace.
+  5. Queries the `users` table to check for duplicate email (`409 Conflict` if found).
+  6. Queries the `users` table to check for duplicate username (`409 Conflict` if found).
+  7. Hashes the password with PBKDF2-SHA256 (120k iterations, random 16-byte salt).
+  8. Creates a new `User` row with `auth_provider="local"`, `is_verified=False`.
+  9. Commits and refreshes the user from the database (populates `id`, timestamps).
+  10. Route handler then calls `request_otp(db, OtpRequest(email=user.email))`.
+  11. `request_otp()` generates a 6-digit OTP code (hardcoded `"123456"` in dev).
+  12. Hashes the OTP using the same PBKDF2 scheme and stores `otp_code_hash`, `otp_code_expires_at`, resets `otp_attempts` to 0 on the user row.
+  13. Commits the OTP state. If OTP creation fails, the user row is deleted and the exception re-raised.
+  14. Returns `RegistrationResponse` with the public user profile.
+
+- **External Dependencies:** None (OTP is logged to console in dev mode, no email service integrated).
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    {
+      "user": {
+        "id": "uuid",
+        "email": "user@example.com",
+        "username": "johndoe",
+        "full_name": "John Doe",
+        "role": "user",
+        "is_verified": false,
+        "auth_provider": "local"
+      },
+      "message": "Registration successful"
+    }
+    ```
+  - **Errors:**
+    - `409 Conflict` — Email or username already exists.
+    - `422 Unprocessable Entity` — Validation failure (invalid email, password too short, etc.).
+
+---
+
+#### `POST` `/auth/signup/verify`
+
+- **Purpose:** Verify the OTP code submitted after registration and establish the user's first authenticated session.
+
+- **Request:**
+  - **Headers:** None required.
+  - **Body Payload:**
+    ```json
+    {
+      "email": "user@example.com",
+      "otp_code": "123456"           // 4-12 chars
+    }
+    ```
+    Validated by `OtpVerifyRequest`.
+
+- **Execution Flow:**
+  1. Validates body via `OtpVerifyRequest` schema.
+  2. Calls `verify_otp(db, payload)`.
+  3. Normalizes the email and queries `users` table by email (`404` if not found).
+  4. Checks for an active OTP challenge (`otp_code_hash` must not be null).
+  5. Checks OTP expiry against current UTC time (`400` if expired).
+  6. Checks `otp_attempts >= 5` (`429 Too Many Requests` if exceeded).
+  7. Increments `otp_attempts` and verifies the submitted OTP against the stored hash using `verify_secret()`.
+  8. If valid: sets `is_verified=True`, clears OTP state, increments `token_version`.
+  9. Calls `issue_token_pair(db, user)`:
+     - Increments `token_version`, updates `last_login_at`.
+     - Creates a signed access token with user claims.
+     - Generates a session ID (`sid`), runs `ACTIVE_SESSION_LIMITER_LUA` in Redis to enforce the max-sessions cap.
+     - Creates a signed refresh token with the `sid`.
+  10. Sets the `refresh_token` as an `HttpOnly` cookie on path `/auth`.
+  11. Sets the `Authorization` header with the `Bearer` access token.
+  12. Returns `TokenPairResponse`.
+
+- **External Dependencies:** Redis (session limiter Lua script).
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    {
+      "message": "Authentication successful",
+      "user": { "id": "...", "email": "...", "username": "...", "full_name": "...", "role": "user", "is_verified": true, "auth_provider": "local" }
+    }
+    ```
+    Plus `Authorization` header and `Set-Cookie: refresh_token`.
+  - **Errors:**
+    - `404 Not Found` — User not found.
+    - `400 Bad Request` — No active OTP / OTP expired / Invalid OTP code.
+    - `429 Too Many Requests` — OTP attempt limit exceeded (5 max).
+
+---
+
+#### `POST` `/auth/login`
+
+- **Purpose:** Authenticate a verified local user with email/username + password and return a fresh token pair.
+
+- **Request:**
+  - **Headers:** None required.
+  - **Body Payload:**
+    ```json
+    {
+      "identifier": "user@example.com",  // or username; 3-255 chars
+      "password": "securePass123"
+    }
+    ```
+    Validated by `LoginRequest`. If `identifier` is absent but `username` is present, `username` is promoted to `identifier` via a model validator.
+
+- **Execution Flow:**
+  1. Validates body via `LoginRequest`.
+  2. Calls `authenticate_user(db, payload)`.
+  3. `_find_user_by_identifier()` determines if the identifier is an email (contains `@`) or username and queries accordingly (case-insensitive).
+  4. Verifies the password with `verify_password()` — `401` if wrong.
+  5. Checks `user.is_verified` — `403` if the account has not been OTP-verified.
+  6. Updates `last_login_at` and commits.
+  7. Calls `issue_token_pair(db, user)` (same as described above).
+  8. Sets the refresh token cookie and Authorization header.
+  9. Returns `TokenPairResponse`.
+
+- **External Dependencies:** Redis (session limiter Lua script).
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    {
+      "message": "Authentication successful",
+      "user": { "id": "...", "email": "...", "username": "...", ... }
+    }
+    ```
+    Plus `Authorization` header and `Set-Cookie: refresh_token`.
+  - **Errors:**
+    - `401 Unauthorized` — Invalid login credentials.
+    - `403 Forbidden` — User account is not verified.
+    - `422 Unprocessable Entity` — Validation failure.
+
+---
+
+#### `POST` `/auth/logout`
+
+- **Purpose:** Invalidate the current user session, increment the token version (revokes all existing tokens), and clear the refresh token cookie.
+
+- **Request:**
+  - **Headers:** `Authorization: Bearer <access_token>` (required).
+  - **Cookie:** `refresh_token` (optional, used for targeted session revocation).
+  - **Body Payload:** None.
+
+- **Execution Flow:**
+  1. Validates the `Authorization` header is present and starts with `Bearer `.
+  2. Extracts the access token and calls `get_current_user(db, access_token)`.
+  3. Decodes and verifies the access token (signature, type, expiry, token_version).
+  4. Calls `revoke_session(db, user, refresh_token)`.
+  5. Increments `user.token_version` (invalidates all existing tokens).
+  6. If a `refresh_token` cookie is present:
+     - Decodes it and extracts the `sid`.
+     - Removes the specific `sid` from the Redis ZSET `user:sessions:{user_id}`.
+     - If decoding fails, deletes the entire ZSET.
+  7. If no refresh token, deletes the entire session ZSET in Redis.
+  8. Deletes the `refresh_token` cookie from the response.
+
+- **External Dependencies:** Redis (ZSET session management).
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    { "message": "Logged out successfully" }
+    ```
+  - **Errors:**
+    - `401 Unauthorized` — Missing or invalid access token.
+
+---
+
+#### `POST` `/auth/refresh`
+
+- **Purpose:** Rotate a refresh token and return a fresh access token + refresh token pair without requiring the user to re-enter credentials.
+
+- **Request:**
+  - **Headers:** None required (uses cookie).
+  - **Cookie:** `refresh_token` (required).
+  - **Body Payload:** None.
+
+- **Execution Flow:**
+  1. Reads the `refresh_token` from the cookie — `401` if missing.
+  2. Calls `resolve_refresh_user(db, refresh_token)`.
+  3. Decodes the refresh token using `decode_refresh_token()` (uses `JWT_REFRESH_SECRET_KEY`, validates `token_type="refresh"` and expiry).
+  4. Looks up the user by `payload["sub"]` — `401` if not found.
+  5. Compares `user.token_version` to the token's `token_version` — `401` if revoked.
+  6. Validates the `sid` exists in the Redis ZSET `user:sessions:{user_id}` — `401` if evicted.
+  7. Calls `issue_token_pair(db, user)` to generate a new pair.
+  8. Sets the new refresh token cookie and Authorization header.
+
+- **External Dependencies:** Redis (ZSET session validation + Lua session limiter).
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    {
+      "message": "Authentication successful",
+      "user": { ... }
+    }
+    ```
+    Plus new `Authorization` header and `Set-Cookie: refresh_token`.
+  - **Errors:**
+    - `401 Unauthorized` — Missing refresh token / Invalid signature / Expired / Revoked / Session evicted.
+
+---
+
+#### `GET` `/auth/me`
+
+- **Purpose:** Return the authenticated user's public profile data.
+
+- **Request:**
+  - **Headers:** `Authorization: Bearer <access_token>` (required).
+  - **Body Payload:** None.
+
+- **Execution Flow:**
+  1. Extracts and validates the bearer token from the `Authorization` header.
+  2. Calls `get_current_user(db, access_token)` — decodes, verifies signature, checks expiry and token_version.
+  3. Calls `create_public_user(user)` which converts the SQLAlchemy `User` to `PublicUserSchema` via `model_validate()`.
+
+- **External Dependencies:** None.
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    {
+      "id": "uuid",
+      "email": "user@example.com",
+      "username": "johndoe",
+      "full_name": "John Doe",
+      "role": "user",
+      "is_verified": true,
+      "auth_provider": "local"
+    }
+    ```
+  - **Errors:**
+    - `401 Unauthorized` — Missing or invalid access token.
+
+---
+
+#### `POST` `/auth/password-reset/request`
+
+- **Purpose:** Create a password reset challenge by generating a secure reset token for the given email address.
+
+- **Request:**
+  - **Headers:** None required (unauthenticated).
+  - **Body Payload:**
+    ```json
+    {
+      "email": "user@example.com"
+    }
+    ```
+    Validated by `PasswordResetRequest`.
+
+- **Execution Flow:**
+  1. Validates body via `PasswordResetRequest`.
+  2. Calls `request_password_reset(db, payload)`.
+  3. Normalizes the email and queries the `users` table — `404` if not found.
+  4. Generates a cryptographically random reset token using `secrets.token_urlsafe(32)`.
+  5. Computes the expiry time using `PASSWORD_RESET_EXPIRE_MINUTES` (default: 15).
+  6. Hashes the reset token with PBKDF2 and stores `password_reset_token_hash` and `password_reset_expires_at` on the user row.
+  7. Returns the plaintext reset token to the caller.
+
+- **External Dependencies:** None (no email dispatch in current implementation).
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    {
+      "email": "user@example.com",
+      "reset_token": "url-safe-random-string",
+      "message": "Password reset challenge created"
+    }
+    ```
+  - **Errors:**
+    - `404 Not Found` — User not found.
+    - `422 Unprocessable Entity` — Invalid email format.
+
+---
+
+#### `POST` `/auth/password-reset/verify`
+
+- **Purpose:** Update a user's password after verifying the reset token.
+
+- **Request:**
+  - **Headers:** None required (unauthenticated).
+  - **Body Payload:**
+    ```json
+    {
+      "email": "user@example.com",
+      "reset_token": "url-safe-random-string",   // 16-255 chars
+      "new_password": "newSecurePass456"           // 8-128 chars
+    }
+    ```
+    Validated by `PasswordResetConfirmRequest`.
+
+- **Execution Flow:**
+  1. Validates body via `PasswordResetConfirmRequest`.
+  2. Calls `reset_password(db, payload)`.
+  3. Normalizes the email and queries the `users` table — `404` if not found.
+  4. Checks for an active reset challenge (`password_reset_token_hash` must not be null).
+  5. Checks if the reset token has expired — `400` if expired.
+  6. Verifies the submitted `reset_token` against the stored hash — `400` if invalid.
+  7. Hashes the `new_password` with PBKDF2 and updates `password_hash`.
+  8. Clears `password_reset_token_hash` and `password_reset_expires_at`.
+  9. Increments `token_version` (invalidates all existing sessions).
+  10. Commits and refreshes.
+
+- **External Dependencies:** None.
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    { "message": "Password updated successfully" }
+    ```
+  - **Errors:**
+    - `404 Not Found` — User not found.
+    - `400 Bad Request` — No active reset challenge / Token expired / Invalid reset token.
+
+---
+
+#### `GET` `/auth/google` | `GET` `/auth/google/login`
+
+- **Purpose:** Redirect the user's browser to Google's OAuth 2.0 consent screen to begin the Google sign-in flow.
+
+- **Request:**
+  - **Headers:** None required.
+  - **Body Payload:** None.
+
+- **Execution Flow:**
+  1. Calls `build_google_login_url()`.
+  2. Constructs a `google_auth_oauthlib.flow.Flow` using `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and `GOOGLE_REDIRECT_URI` from env vars.
+  3. Generates the authorization URL with `access_type="offline"`, `prompt="consent"`, and a random CSRF `state` value.
+  4. Returns a `302 RedirectResponse` to the Google authorization URL.
+  5. Sets a `google_oauth_state` HttpOnly cookie (for CSRF validation on callback).
+
+- **External Dependencies:** Google OAuth 2.0 API (authorization endpoint: `https://accounts.google.com/o/oauth2/auth`).
+
+- **Response:**
+  - **Success (302):** Browser redirect to Google consent screen with `Set-Cookie: google_oauth_state`.
+  - **Errors:**
+    - `503 Service Unavailable` — Google client ID/secret not configured.
+
+---
+
+#### `GET` `/auth/google/callback`
+
+- **Purpose:** Handle Google's OAuth callback — exchange the authorization code for tokens, create or link a local user, and redirect to the frontend with a session.
+
+- **Request:**
+  - **Query Parameters:** `code` (authorization code), `state` (CSRF state).
+  - **Cookie:** `google_oauth_state` (CSRF state for validation).
+
+- **Execution Flow:**
+  1. Validates `code` query parameter — `400` if missing.
+  2. Validates `state` matches the `google_oauth_state` cookie — `400` if mismatched.
+  3. Calls `continue_with_google(db, code)`.
+  4. Constructs a `google_auth_oauthlib.flow.Flow` and calls `flow.fetch_token(code=code)` to exchange the code for credentials.
+  5. Verifies the ID token using `google.oauth2.id_token.verify_oauth2_token()` against the configured client ID.
+  6. Extracts `sub` (Google subject), `email`, `name`, and `email_verified` from the claims.
+  7. Validates that `email_verified` is `True` — `400` if not.
+  8. Queries `users` table by `google_subject` or email:
+     - **New user:** Creates a `User` row with `auth_provider="google"`, `is_verified=True`, username derived from email prefix, random password hash.
+     - **Existing user:** Updates `google_subject`, `auth_provider`, sets `is_verified=True`, and optionally fills in `full_name`.
+  9. Increments `token_version`, updates `last_login_at`.
+  10. Calls `issue_token_pair(db, user)` to generate access + refresh tokens.
+  11. Builds the frontend redirect URL via `build_google_frontend_redirect_url()`: `{FRONTEND_URL}/auth/google/callback?status=success&is_new_user=true|false`.
+  12. Returns a `302 RedirectResponse` with the refresh token cookie and clears the `google_oauth_state` cookie.
+
+- **External Dependencies:** Google OAuth 2.0 API (token endpoint: `https://oauth2.googleapis.com/token`), Google ID token verification, Redis (session limiter).
+
+- **Response:**
+  - **Success (302):** Browser redirect to `{FRONTEND_URL}/auth/google/callback?status=success&is_new_user=...` with `Set-Cookie: refresh_token` and deletion of `google_oauth_state` cookie.
+  - **Errors:**
+    - `400 Bad Request` — Missing code / Invalid OAuth state / Google token issues / Unverified Google email.
+    - `503 Service Unavailable` — Google OAuth not configured.
+
+---
+
+### 4.2 File Ingestion Endpoints
+
+> **Note:** All `/v1/*` endpoints (except `/v1/health`) require authentication. The `_resolve_current_user()` helper extracts the `Authorization: Bearer <access_token>` header and calls `get_current_user()` from `auth_services.py` to decode, verify, and resolve the `User` record.
+
+---
+
+#### `GET` `/v1/health`
+
+- **Purpose:** Lightweight health check endpoint for uptime monitoring. Does not require authentication.
+
+- **Request:**
+  - **Headers:** None.
+  - **Body Payload:** None.
+
+- **Execution Flow:**
+  1. Returns a static JSON payload immediately.
+
+- **External Dependencies:** None.
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    { "status": "Application is running successfully :)" }
+    ```
+
+---
+
+#### `POST` `/v1/upload/init`
+
+- **Purpose:** Initialize a chunked file upload session. Performs server-side deduplication at two levels: exact-mapping short-circuit and physical-file suspected-duplicate linking.
+
+- **Request:**
+  - **Headers:** `Authorization: Bearer <access_token>` (required).
+  - **Body Payload:**
+    ```json
+    {
+      "dataset_id": "uuid",
+      "filename": "report.csv",
+      "filesize": 15728640,
+      "master_hash": "sha256_hex_64_chars",
+      "relative_path": "data/reports/report.csv"  // optional
+    }
+    ```
+    Validated by `UploadInitRequest`.
+
+- **Execution Flow:**
+  1. Authenticates the user via `_resolve_current_user()`.
+  2. Calls `initialize_upload(db, user, payload)` in `file_services.py`.
+  3. `_ensure_storage_dirs()` creates `uploads/.parts/` and `uploads/files/` if missing.
+  4. Validates dataset ownership via `get_dataset_by_id()` — `404/403` if not owned or deleted.
+  5. Resolves the virtual folder tree from `relative_path` using `_get_folder_tree()`:
+     - Strips the filename from the path.
+     - Creates missing `Folder` rows for each path segment, linked by `parent_id`.
+  6. **Deduplication Check #1 — Exact mapping short-circuit:**
+     - Joins `DatasetFolderFilesMapping` with `UploadedFile` and checks if a mapping already exists for this `(user_id, dataset_id, folder_id, master_hash)` combination.
+     - If found: returns `UploadInitResponse` with `status="duplicate_short_circuit"`, `total_chunks=0`, and a throwaway `upload_id`. **No further upload needed.**
+  7. **Deduplication Check #2 — Physical file exists globally:**
+     - Queries `UploadedFile` by `master_hash`.
+     - If found: stores session metadata in Redis with `linked_file_id` pointing to the existing file. Returns `status="duplicate_suspected"`, `total_chunks=0`. Client must still call `/upload/finalize` to create the mapping.
+  8. **New file flow:**
+     - Computes `total_chunks = ceil(filesize / 5MB)`.
+     - Creates the parts directory `uploads/.parts/{upload_id}/`.
+     - Stores upload session metadata in Redis hash `upload:{upload_id}:meta` with TTL.
+     - Sets TTL on bitmap and chunk_hashes keys.
+     - Returns `status="created"` with `total_chunks`.
+
+- **External Dependencies:** Redis (upload session metadata storage).
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    {
+      "upload_id": "uuid",
+      "chunk_size": 5242880,
+      "total_chunks": 3,
+      "status": "created"              // or "duplicate_short_circuit" or "duplicate_suspected"
+    }
+    ```
+  - **Errors:**
+    - `401 Unauthorized` — Missing or invalid access token.
+    - `403 Forbidden` — Dataset does not belong to the user.
+    - `404 Not Found` — Dataset not found.
+    - `400 Bad Request` — Invalid relative path (absolute or traversal segments).
+    - `422 Unprocessable Entity` — Validation failure.
+
+---
+
+#### `POST` `/v1/upload/chunk`
+
+- **Purpose:** Process a single uploaded chunk of a file. Uses a Redis Lua script for lock-free, atomic, idempotent chunk tracking.
+
+- **Request:**
+  - **Headers:** `Authorization: Bearer <access_token>` (required).
+  - **Content-Type:** `multipart/form-data`.
+  - **Form Fields:**
+    - `upload_id` (string) — The session ID from `/upload/init`.
+    - `chunk_index` (integer, >= 0) — The zero-based index of this chunk.
+    - `chunk_hash` (string, 64 chars) — The SHA-256 hex hash of the chunk bytes.
+    - `chunk_file` (file) — The raw chunk binary data.
+
+- **Execution Flow:**
+  1. Authenticates the user via `_resolve_current_user()`.
+  2. Constructs an `UploadChunkRequest` from the form fields.
+  3. Reads the entire `chunk_file` into memory: `chunk_bytes = chunk_file.file.read()`.
+  4. Calls `process_upload_chunk(db, user, payload, chunk_bytes)`.
+  5. Retrieves session metadata from Redis `upload:{upload_id}:meta` — `404` if expired/missing.
+  6. Validates `meta["user_id"] == user.id` — `403` if ownership mismatch.
+  7. Validates `chunk_index` is within `[0, total_chunks)` — `400` if out of range.
+  8. Computes SHA-256 hash of `chunk_bytes` and compares to `payload.chunk_hash` — `400` if mismatch.
+  9. Executes `ATOMIC_CHUNK_STATE_LUA` Lua script with keys `[bitmap, hashes, meta]`:
+     - Checks if the bit at `chunk_index` is already set in the bitmap.
+     - If not set: sets the bit, stores the hash in a Redis hash, refreshes TTLs.
+     - Returns `0` (new) or `1` (already uploaded — idempotent replay).
+  10. If new chunk (`0`): writes `chunk_bytes` to `uploads/.parts/{upload_id}/{chunk_index:06d}.part`.
+  11. Counts received chunks via `BITCOUNT` on the bitmap key.
+  12. Returns `UploadChunkResponse` with progress info and `complete` flag.
+
+- **External Dependencies:** Redis (Lua script for atomic state, bitmap, hash storage), Filesystem (chunk part files).
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    {
+      "status": "In Progress",
+      "upload_id": "uuid",
+      "chunk_index": 0,
+      "bytes_received": 5242880,
+      "received_chunks": 1,
+      "total_chunks": 3,
+      "chunk_size": 5242880,
+      "complete": false
+    }
+    ```
+  - **Errors:**
+    - `401 Unauthorized` — Invalid access token.
+    - `403 Forbidden` — Upload does not belong to the current user.
+    - `404 Not Found` — Upload session not found (expired or invalid).
+    - `400 Bad Request` — Chunk index out of range / Chunk hash mismatch.
+
+---
+
+#### `POST` `/v1/upload/finalize`
+
+- **Purpose:** Finalize a completed upload session — either link a suspected duplicate or assemble chunks into a final file, then create the dataset-folder-file mapping.
+
+- **Request:**
+  - **Headers:** `Authorization: Bearer <access_token>` (required).
+  - **Body Payload:**
+    ```json
+    {
+      "upload_id": "uuid",
+      "master_hash": "sha256_hex_64_chars"
+    }
+    ```
+    Validated by `UploadFinalizeRequest`.
+
+- **Execution Flow:**
+  1. Authenticates the user via `_resolve_current_user()`.
+  2. Calls `finalize_upload(db, user, payload)`.
+  3. Retrieves session metadata from Redis — `404` if missing.
+  4. Validates ownership — `403` if mismatch.
+  5. Validates `master_hash` matches session metadata — `400` if mismatch.
+  6. Resolves `dataset_id` and `folder_id` from metadata.
+  7. **Suspected duplicate path** (if `linked_file_id` in metadata):
+     - Verifies the linked `UploadedFile` exists in the DB — `404` if missing.
+     - Uses the existing file's ID (zero-I/O, no chunk assembly needed).
+  8. **Standard upload path:**
+     - Checks `BITCOUNT(bitmap) == total_chunks` — `409 Conflict` if incomplete.
+     - Performs a final concurrency check: queries `UploadedFile` by `master_hash` in case another request assembled the same file concurrently.
+     - If already assembled: uses the existing file ID and cleans up parts.
+     - If not assembled:
+       a. Iterates chunks `0..total_chunks-1`, reading each `.part` file from disk.
+       b. Writes them sequentially to a `.pending` staging file.
+       c. Renames staging file to `uploads/files/{filename}` — `409` if a file with that name already exists.
+       d. Creates an `UploadedFile` DB row with the file's physical path, size, and master_hash.
+  9. Creates the `DatasetFolderFilesMapping` using PostgreSQL `INSERT ... ON CONFLICT DO NOTHING` (constraint: `uq_dataset_folder_file`).
+  10. Commits the database transaction.
+  11. Cleans up Redis keys (`meta`, `bitmap`, `chunk_hashes`).
+  12. Deletes the parts directory.
+
+- **External Dependencies:** Redis (session metadata, bitmap), Filesystem (chunk assembly), PostgreSQL (file record + mapping).
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    {
+      "status": "completed",
+      "file_id": "uuid",
+      "folder_id": "uuid or null"
+    }
+    ```
+  - **Errors:**
+    - `401 Unauthorized` — Invalid access token.
+    - `403 Forbidden` — Upload/folder does not belong to the user.
+    - `404 Not Found` — Session not found / Linked file not found / Folder not found.
+    - `400 Bad Request` — Master hash mismatch.
+    - `409 Conflict` — Upload incomplete / File name collision.
+
+---
+
+#### `GET` `/v1/uploads`
+
+- **Purpose:** Return the authenticated user's uploaded files as a nested folder/file tree, with optional filtering by dataset and/or folder.
+
+- **Request:**
+  - **Headers:** `Authorization: Bearer <access_token>` (required).
+  - **Query Parameters:**
+    - `dataset_id` (optional) — Filter by dataset.
+    - `folder_id` (optional) — Filter by folder (returns the subtree rooted at this folder).
+
+- **Execution Flow:**
+  1. Authenticates the user via `_resolve_current_user()`.
+  2. Calls `list_user_uploads(db, user, dataset_id, folder_id)`.
+  3. Internally calls `_build_tree()`:
+     - If `dataset_id` provided: validates dataset ownership.
+     - If `folder_id` provided: resolves the folder and collects all descendant folder IDs (BFS traversal).
+     - Queries all `DatasetFolderFilesMapping` rows for the user, filtered by dataset/folder scope.
+     - Collects all referenced folder IDs and their ancestors to reconstruct the full tree hierarchy.
+     - Queries all relevant `Folder` rows and builds a `folder_map` dictionary.
+     - Iterates mappings, queries `UploadedFile` for each, and attaches file nodes to their parent folder nodes.
+     - Returns the root `UploadsTreeResponse` node.
+
+- **External Dependencies:** None (pure DB queries).
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    {
+      "id": "root-uuid",
+      "type": "folder",
+      "name": "root",
+      "size": null,
+      "children": [
+        {
+          "id": "folder-uuid",
+          "type": "folder",
+          "name": "data",
+          "children": [
+            {
+              "id": "file-uuid",
+              "type": "file",
+              "name": "report.csv",
+              "size": 15728640,
+              "children": null
+            }
+          ]
+        }
+      ]
+    }
+    ```
+  - **Errors:**
+    - `401 Unauthorized` — Invalid access token.
+    - `403 Forbidden` — Dataset does not belong to the user.
+    - `404 Not Found` — Dataset or folder not found.
+
+---
+
+#### `POST` `/v1/uploads/delete`
+
+- **Purpose:** Delete a single uploaded file — removes the physical file from disk, all mappings, and the `UploadedFile` database record.
+
+- **Request:**
+  - **Headers:** `Authorization: Bearer <access_token>` (required).
+  - **Body Payload:**
+    ```json
+    {
+      "upload_id": "uuid"    // The file_id from UploadedFile
+    }
+    ```
+    Validated by `UploadDeleteRequest`.
+
+- **Execution Flow:**
+  1. Authenticates the user via `_resolve_current_user()`.
+  2. Calls `delete_user_upload(db, user, payload.upload_id)`.
+  3. Queries `UploadedFile` by `upload_id` — `404` if not found.
+  4. Validates ownership by checking `DatasetFolderFilesMapping` for a mapping owned by the user — `404` if no ownership proof.
+  5. Deletes the physical file from disk (`uploaded_file.physical_path`).
+  6. Deletes **all** `DatasetFolderFilesMapping` rows referencing this `file_id` (not just the user's — cascading).
+  7. Deletes the `UploadedFile` row.
+  8. Commits.
+
+- **External Dependencies:** Filesystem (file deletion).
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    {
+      "status": "deleted",
+      "file_id": "uuid"
+    }
+    ```
+  - **Errors:**
+    - `401 Unauthorized` — Invalid access token.
+    - `404 Not Found` — Upload not found or does not belong to the user.
+
+---
+
+#### `POST` `/v1/datasets`
+
+- **Purpose:** Create a new dataset catalog entry under the authenticated user's account.
+
+- **Request:**
+  - **Headers:** `Authorization: Bearer <access_token>` (required).
+  - **Body Payload:**
+    ```json
+    {
+      "name": "My Dataset",
+      "description": "A description",    // optional
+      "status": "created",               // optional, defaults to "created"
+      "source_type": "file_upload",      // optional
+      "content_type": "text/csv",        // optional
+      "format": "CSV",                   // optional
+      "language": "en"                   // optional
+    }
+    ```
+    Validated by `DatasetCreate`.
+
+- **Execution Flow:**
+  1. Authenticates the user via `_resolve_current_user()`.
+  2. Calls `create_dataset(db, user, payload)`.
+  3. Checks for duplicate dataset name (case-insensitive) among the user's non-deleted datasets — `409` if found.
+  4. Normalizes the status via `_normalize_dataset_status()` (must be one of `created`, `In Progress`, `completed`; defaults to `created`).
+  5. Creates a `Dataset` row with the user's ID and all provided metadata.
+  6. Commits and refreshes.
+
+- **External Dependencies:** None.
+
+- **Response:**
+  - **Success (201 Created):**
+    ```json
+    {
+      "id": "uuid",
+      "user_id": "uuid",
+      "name": "My Dataset",
+      "description": "A description",
+      "status": "created",
+      "source_type": "file_upload",
+      "content_type": "text/csv",
+      "format": "CSV",
+      "language": "en",
+      "created_at": "2026-07-27T00:00:00Z",
+      "updated_at": "2026-07-27T00:00:00Z",
+      "file_count": 0
+    }
+    ```
+  - **Errors:**
+    - `401 Unauthorized` — Invalid access token.
+    - `409 Conflict` — A dataset with this name already exists.
+    - `422 Unprocessable Entity` — Validation failure.
+
+---
+
+#### `GET` `/v1/datasets`
+
+- **Purpose:** List all active (non-deleted) datasets belonging to the authenticated user, with pagination.
+
+- **Request:**
+  - **Headers:** `Authorization: Bearer <access_token>` (required).
+  - **Query Parameters:**
+    - `page` (int, default: 1) — Page number.
+    - `limit` (int, default: 10) — Records per page.
+
+- **Execution Flow:**
+  1. Authenticates the user via `_resolve_current_user()`.
+  2. Calls `get_datasets(db, user, page, limit)`.
+  3. Queries `Dataset` table filtered by `user_id` and `is_deleted=False`, ordered by `created_at DESC`, with `OFFSET` and `LIMIT`.
+
+- **External Dependencies:** None.
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    [
+      {
+        "id": "uuid",
+        "user_id": "uuid",
+        "name": "My Dataset",
+        "description": "...",
+        "status": "created",
+        "source_type": null,
+        "content_type": null,
+        "format": null,
+        "language": null,
+        "created_at": "...",
+        "updated_at": "...",
+        "file_count": 3
+      }
+    ]
+    ```
+  - **Errors:**
+    - `401 Unauthorized` — Invalid access token.
+
+---
+
+#### `GET` `/v1/datasets/{dataset_id}`
+
+- **Purpose:** Retrieve a single dataset's details by its ID.
+
+- **Request:**
+  - **Headers:** `Authorization: Bearer <access_token>` (required).
+  - **Path Parameters:** `dataset_id` (string) — The dataset UUID.
+
+- **Execution Flow:**
+  1. Authenticates the user via `_resolve_current_user()`.
+  2. Calls `get_dataset_by_id(db, user, dataset_id)`.
+  3. Queries `Dataset` by ID where `is_deleted=False` — `404` if not found.
+  4. Validates `dataset.user_id == user.id` — `403` if not owned.
+
+- **External Dependencies:** None.
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    {
+      "id": "uuid",
+      "user_id": "uuid",
+      "name": "My Dataset",
+      "description": "...",
+      "status": "created",
+      "source_type": null,
+      "content_type": null,
+      "format": null,
+      "language": null,
+      "created_at": "...",
+      "updated_at": "...",
+      "file_count": 3
+    }
+    ```
+  - **Errors:**
+    - `401 Unauthorized` — Invalid access token.
+    - `403 Forbidden` — Dataset does not belong to the user.
+    - `404 Not Found` — Dataset not found.
+
+---
+
+#### `PATCH` `/v1/datasets/{dataset_id}`
+
+- **Purpose:** Update metadata of an existing dataset. Supports partial updates and enforces status transition rules.
+
+- **Request:**
+  - **Headers:** `Authorization: Bearer <access_token>` (required).
+  - **Path Parameters:** `dataset_id` (string).
+  - **Body Payload:**
+    ```json
+    {
+      "name": "Updated Name",          // optional
+      "description": "New desc",       // optional
+      "status": "In Progress",         // optional
+      "source_type": "api",            // optional
+      "content_type": "application/json", // optional
+      "format": "JSON",                // optional
+      "language": "fr"                 // optional
+    }
+    ```
+    Validated by `DatasetUpdate`.
+
+- **Execution Flow:**
+  1. Authenticates the user via `_resolve_current_user()`.
+  2. Calls `update_dataset(db, user, dataset_id, payload)`.
+  3. Resolves the dataset via `get_dataset_by_id()` (validates existence + ownership).
+  4. **Name update:** If provided, trims whitespace, checks for empty string (`400`), checks uniqueness against other non-deleted datasets (`409`).
+  5. **Status update:** Normalizes and enforces the allowed state machine transitions:
+     - `created` → `created`, `In Progress`
+     - `In Progress` → `In Progress`, `completed`
+     - `completed` → `completed` (terminal state)
+     - Any invalid transition raises `400`.
+  6. Updates all other provided fields (`description`, `source_type`, `content_type`, `format`, `language`).
+  7. Sets `updated_at` to `datetime.now()`.
+  8. Commits and refreshes.
+
+- **External Dependencies:** None.
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    {
+      "id": "uuid",
+      "user_id": "uuid",
+      "name": "Updated Name",
+      "description": "New desc",
+      "status": "In Progress",
+      ...
+    }
+    ```
+  - **Errors:**
+    - `401 Unauthorized` — Invalid access token.
+    - `403 Forbidden` — Dataset does not belong to the user.
+    - `404 Not Found` — Dataset not found.
+    - `400 Bad Request` — Empty name / Invalid status transition.
+    - `409 Conflict` — Duplicate dataset name.
+
+---
+
+#### `DELETE` `/v1/datasets/{dataset_id}`
+
+- **Purpose:** Soft-delete a dataset by setting `is_deleted=True`. Only allowed if no files are currently attached.
+
+- **Request:**
+  - **Headers:** `Authorization: Bearer <access_token>` (required).
+  - **Path Parameters:** `dataset_id` (string).
+
+- **Execution Flow:**
+  1. Authenticates the user via `_resolve_current_user()`.
+  2. Calls `delete_dataset(db, user, dataset_id)`.
+  3. Resolves the dataset via `get_dataset_by_id()` (validates existence + ownership).
+  4. Counts `DatasetFolderFilesMapping` rows for this dataset — `409 Conflict` if any files are attached.
+  5. Sets `dataset.is_deleted = True`.
+  6. Commits.
+
+- **External Dependencies:** None.
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    {
+      "status": "deleted",
+      "dataset_id": "uuid"
+    }
+    ```
+  - **Errors:**
+    - `401 Unauthorized` — Invalid access token.
+    - `403 Forbidden` — Dataset does not belong to the user.
+    - `404 Not Found` — Dataset not found.
+    - `409 Conflict` — Cannot delete dataset with attached files.
+
+---
+
+#### `POST` `/v1/datasets/{dataset_id}/files`
+
+- **Purpose:** Attach an existing uploaded file to a dataset, optionally placing it within a virtual folder hierarchy. This is a zero-I/O operation (no file copying).
+
+- **Request:**
+  - **Headers:** `Authorization: Bearer <access_token>` (required).
+  - **Path Parameters:** `dataset_id` (string).
+  - **Body Payload:**
+    ```json
+    {
+      "file_id": "uuid",
+      "relative_path": "data/reports"    // optional, folder structure
+    }
+    ```
+    Validated by `DatasetAttachFileRequest`.
+
+- **Execution Flow:**
+  1. Authenticates the user via `_resolve_current_user()`.
+  2. Calls `attach_file_to_dataset(db, user, dataset_id, payload)`.
+  3. Validates dataset ownership via `get_dataset_by_id()`.
+  4. **IDOR ownership check:** Queries `DatasetFolderFilesMapping` for a mapping where `user_id == current_user.id` AND `file_id == payload.file_id`.
+     - If no mapping: checks if the `UploadedFile` exists at all — `404` if not; `403` if it exists but the user doesn't own it.
+  5. Resolves the virtual folder tree from `relative_path` via `_get_folder_tree()` (creates missing folders).
+  6. Checks if the exact `(dataset_id, folder_id, file_id)` mapping already exists — if so, skips creation (idempotent).
+  7. If new: creates a `DatasetFolderFilesMapping` row.
+  8. Auto-transitions dataset status from `"created"` to `"In Progress"` if `file_count > 1` after attaching.
+  9. Commits.
+
+- **External Dependencies:** None.
+
+- **Response:**
+  - **Success (200):**
+    ```json
+    {
+      "status": "attached",
+      "dataset_id": "uuid",
+      "file_id": "uuid",
+      "folder_id": "uuid or null"
+    }
+    ```
+  - **Errors:**
+    - `401 Unauthorized` — Invalid access token.
+    - `403 Forbidden` — Dataset or file does not belong to the user.
+    - `404 Not Found` — Dataset or file not found.
+
+---
+
+## 5. Core Data Models / Database Interactions
+
+### 5.1 Entity Relationship Diagram
+
+```
+┌────────────────────-┐
+│       users         │
+│  (auth_model.py)    │
+├─────────────────-───┤        ┌────────────────────────────────┐
+│ PK id (UUID)        │◄────-──┤ FK user_id (CASCADE)           │
+│    email            │        │                                │
+│    username         │        │        datasets                │
+│    full_name        │        │   (file_model.py)              │
+│    password_hash    │        ├────────────────────────────────┤
+│    role             │        │ PK id (UUID)                   │
+│    is_verified      │        │ FK user_id → users.id          │
+│    auth_provider    │        │    name                        │
+│    google_subject   │        |     description                │
+│    token_version    │        │    status                      │
+│    otp_code_hash    │        │    source_type                 │
+│    otp_code_exp     │        │    content_type                │
+│    otp_attempts     │        │    format                      │
+│    pw_reset_hash    │        │    language                    │
+│    pw_reset_exp     │        │    is_deleted                  │
+│    last_login_at    │        │    created_at, updated_at      │
+│    created_at       │        └────────────────────────────────┘
+│    updated_at       │
+└────────────────────┘
+         │
+         │  1:N
+         ▼
+┌────────────────────┐        ┌────────────────────────────────┐
+│      folders       │        │       uploaded_files            │
+│  (file_model.py)   │        │    (file_model.py)             │
+├────────────────────┤        ├────────────────────────────────┤
+│ PK id (UUID)       │        │ PK id (UUID)                   │
+│ FK user_id → users │        │    filename                    │
+│    name            │        │    file_size_bytes             │
+│ FK parent_id →     │        │    master_hash (SHA-256, UQ)   │
+│    folders.id      │        │    physical_path               │
+│    created_at      │        │    uploaded_at                 │
+│                    │        └────────────────────────────────┘
+│ UQ(user_id,        │                     │
+│    parent_id,name) │                     │
+└────────────────────┘                     │
+         │                                 │
+         │           1:N                   │  1:N
+         ▼                                 ▼
+┌───────────────────────────────────────────────────┐
+│         dataset_folder_files_mapping              │
+│              (file_model.py)                      │
+├───────────────────────────────────────────────────┤
+│ PK id (UUID)                                      │
+│ FK dataset_id → datasets.id      (CASCADE)        │
+│ FK folder_id  → folders.id       (CASCADE, NULL)  │
+│ FK file_id    → uploaded_files.id (CASCADE)       │
+│ FK user_id    → users.id          (CASCADE)       │
+│    created_at                                     │
+│                                                   │
+│ UQ(dataset_id, folder_id, file_id)                │
+└───────────────────────────────────────────────────┘
+```
+
+### 5.2 Model Descriptions
+
+| Model                         | Table Name                     | Purpose                                                                                    |
+|-------------------------------|--------------------------------|--------------------------------------------------------------------------------------------|
+| `User`                        | `users`                        | Application user with local auth (password, OTP, reset token) and Google OAuth linking.    |
+| `Dataset`                     | `datasets`                     | Logical dataset catalog entry owned by a user. Supports soft-delete via `is_deleted` flag. |
+| `Folder`                      | `folders`                      | Virtual folder hierarchy (self-referential tree via `parent_id`). Per-user, per-name unique within parent. |
+| `UploadedFile`                | `uploaded_files`               | Physical file record with disk path, size, and SHA-256 `master_hash` (globally unique).    |
+| `DatasetFolderFilesMapping`   | `dataset_folder_files_mapping` | Junction table linking a dataset, an optional folder, and a file to a user. Enables many-to-many relationships and deduplication. |
+
+### 5.3 Key Relationships
+
+- **User → Dataset**: One-to-Many. A user can own multiple datasets.
+- **User → Folder**: One-to-Many. A user can create multiple folders.
+- **Folder → Folder**: Self-referential One-to-Many (parent-child tree).
+- **Dataset ↔ UploadedFile**: Many-to-Many through `DatasetFolderFilesMapping`. A single physical file can be linked to multiple datasets.
+- **Folder ↔ UploadedFile**: Many-to-Many through `DatasetFolderFilesMapping`. Files are placed in folders via the mapping.
+- **UploadedFile** is globally unique by `master_hash` — this enables deduplication across users and datasets.
+
+### 5.4 Redis Data Structures
+
+| Key Pattern                      | Type         | Purpose                                                        | TTL                          |
+|----------------------------------|--------------|----------------------------------------------------------------|------------------------------|
+| `user:sessions:{user_id}`       | Sorted Set   | Active session tracking (members: `sid`, scores: timestamps)   | `REFRESH_TOKEN_EXPIRE_DAYS`  |
+| `upload:{upload_id}:meta`       | Hash         | Upload session metadata (user_id, filename, filesize, etc.)    | `UPLOAD_SESSION_TTL_SECONDS` |
+| `upload:{upload_id}:bitmap`     | Bitmap       | Bit-per-chunk received tracking                                | `UPLOAD_SESSION_TTL_SECONDS` |
+| `upload:{upload_id}:chunk_hashes`| Hash        | Per-chunk SHA-256 hashes (field: chunk_index, value: hash)     | `UPLOAD_SESSION_TTL_SECONDS` |
+
+### 5.5 Filesystem Layout
+
+```
+uploads/
+├── .parts/                          # Temporary chunk storage
+│   └── {upload_id}/                 # Per-session directory
+│       ├── 000000.part              # Chunk 0
+│       ├── 000001.part              # Chunk 1
+│       └── ...
+└── files/                           # Final assembled files
+    ├── report.csv
+    ├── data.json
+    └── ...
+```
+
+---
+
+## Module 1 Testing Addendum — Authentication Flow Corrections (2026-07-30)
+
+The following corrections to the documented auth flows were discovered and verified during Module 1 testing:
+
+### OTP Verification Flow — `_ensure_utc` Fix
+
+**Affected flow:** `POST /auth/signup/verify` → `verify_otp()` → expiry comparison
+
+**Before fix (buggy):**
+```
+user.otp_code_expires_at <= _now()
+# ↑ offset-naive (from SQLite)  ↑ offset-aware UTC
+# → TypeError on SQLite; may silently mismatch on some PG drivers
+```
+
+**After fix (correct):**
+```
+_ensure_utc(user.otp_code_expires_at) <= _now()
+# ↑ normalised to UTC-aware      ↑ UTC-aware — safe comparison
+```
+
+**Verified:** SQLite in-memory DB (test environment) + confirmed no-op on PostgreSQL-style UTC-aware values.
+
+### Password Reset Flow — Same `_ensure_utc` Fix
+
+**Affected flow:** `POST /auth/password-reset/verify` → `reset_password()` → expiry comparison
+
+Same fix pattern applied to `user.password_reset_expires_at` at `auth_services.py:538`.
+
+### Confirmed Auth Flow Behaviors (Test-Verified)
+
+| Flow Step | Confirmed Behavior |
+|-----------|-------------------|
+| `POST /auth/signup/init` | Returns `RegistrationResponse` with `is_verified=False`. OTP silently generated (dev: always `"123456"`). |
+| `POST /auth/signup/verify` | Valid OTP marks `is_verified=True`, clears `otp_code_hash`/`otp_code_expires_at`, issues token pair. Sets `HttpOnly refresh_token` cookie (path=`/auth`) + `Authorization` header. |
+| `POST /auth/login` | Unverified users → 403. Unknown/wrong creds → 401. Sets same cookie+header as verify. |
+| `POST /auth/refresh` | Cookie must be at path `/auth`. Rotates both access and refresh tokens. New `refresh_token` cookie set. |
+| `POST /auth/logout` | Bumps `token_version` in DB. Removes specific `sid` from Redis ZSET. Clears cookie. |
+| `GET /auth/me` | Returns `PublicUserSchema` (no password hash exposed). Requires `Bearer` prefix on Authorization header. |
+| `POST /auth/password-reset/request` | Returns `reset_token` in plaintext response (design choice for dev/testing). Stores hash in DB. |
+| `POST /auth/password-reset/verify` | Validates token, sets new `password_hash`, bumps `token_version`, clears reset fields. |
+| `/v1/auth/*` | Dual-mounted via `app.include_router(auth_router, prefix="/v1/auth")` — functionally identical to `/auth/*`. |
+
+---
+
+## Module 2 Testing Addendum — Dataset & Virtual Folder Flow Corrections (2026-07-30)
+
+### Confirmed Dataset Lifecycle Flow (Test-Verified)
+
+```
+POST /v1/datasets  →  create_dataset()
+  │  Uniqueness: case-insensitive name check per user (func.lower)
+  │  Initial status: always "Created"
+  └→ DatasetResponse {id, name, status="Created", file_count=0, tree=null}
+
+GET /v1/datasets  →  get_datasets()
+  │  Filters: is_deleted=False, user_id match
+  │  Respects: page, limit, include_completed
+  └→ list[DatasetResponse]
+
+GET /v1/datasets/{id}  →  get_dataset_by_id() + get_dataset_tree_for_dataset()
+  │  Ownership check: 403 if user_id mismatch
+  │  Not found: 404 if is_deleted=True or non-existent
+  └→ DatasetResponse {... tree: UploadsTreeResponse}
+
+PATCH /v1/datasets/{id}  →  update_dataset()
+  │  Status transitions (allowed):
+  │    Created → Draft or Completed
+  │    Draft   → Completed
+  │    Completed → (no transitions, raises 400)
+  │  Name: case-insensitive uniqueness, no-op if same name
+  └→ DatasetResponse
+
+DELETE /v1/datasets/{id}  →  delete_dataset()
+  │  NOTE: HARD DELETE (not soft-delete via is_deleted flag)
+  │  Cascades: deletes all DatasetFolderFilesMapping rows
+  │  Cascades: deletes referenced UploadedFile physical file rows
+  └→ {status: "deleted", dataset_id: "..."}
+
+POST /v1/datasets/{id}/files  →  attach_file_to_dataset()
+  │  IDOR guard: user must own ≥1 mapping to file_id
+  │    → 404 if file does not exist at all
+  │    → 403 if file exists but user has no mapping to it
+  │  Status guard: 400 if dataset.status == "Completed"
+  │  Folder resolution: _get_folder_tree(relative_path) if provided
+  │  Idempotent: existing mapping not duplicated
+  └→ DatasetAttachFileResponse {status="attached", dataset_id, file_id, folder_id}
+```
+
+### Confirmed Virtual Folder Tree Flow (Test-Verified)
+
+```
+_get_folder_tree(db, user, relative_path, filename)
+  │  None / "" path → returns None (file stored at dataset root)
+  │  "a/b/c" path → creates folders a → b → c (parent chain)
+  │  Idempotent: queries by (user_id, parent_id, name) before inserting
+  │  _validate_relative_path():
+  │    "/" prefix → HTTP 400
+  │    ".." segments → HTTP 400
+  │    Empty/None → []
+  │  _resolve_folder_parts():
+  │    Strips trailing segment if it matches filename
+  └→ Folder (leaf node) or None
+```
+
+### Key Architectural Findings
+
+| Finding | Detail |
+|---------|--------|
+| `DELETE /v1/datasets/{id}` is a **hard delete** | Removes the `Dataset` row from the DB entirely. The `is_deleted` flag on the model is for filtering (e.g., `get_datasets` hides `is_deleted=True`), but `delete_dataset()` calls `db.delete(dataset)` — not a soft flag. |
+| IDOR guard is **service-layer enforced** | `attach_file_to_dataset()` queries `DatasetFolderFilesMapping` by `user_id` to verify ownership — not relying on route-level auth alone. |
+| Status sync is **triggered on every file add/remove** | `_sync_dataset_status_from_mappings()` is called after any mapping change. It upgrades `Created`→`Draft` (≥1 file) or downgrades `Draft`→`Created` (0 files). `Completed` is never touched by the sync. |
+| `pg_insert ON CONFLICT DO NOTHING` is PostgreSQL-only | `finalize_upload()` uses `from sqlalchemy.dialects.postgresql import insert as pg_insert` which will raise `CompileError` on SQLite. This is **resolved in test isolation** by patching `file_services.pg_insert` with a SQLite-compatible `sa_insert(table)` wrapper whose `on_conflict_do_nothing()` is a no-op. No production code changes required. |
+
+---
+
+## Module 3 Testing Addendum — Chunked File Upload Engine (2026-07-30)
+
+### initialize_upload — Three-Path Decision Flow (Test-Verified)
+
+```
+POST /v1/upload/init
+    │
+    ├─ Validate dataset ownership + not Completed (else 404/400)
+    │
+    ├─ Query UploadedFile WHERE master_hash = payload.master_hash
+    │       │
+    │       ├── NOT FOUND → new file path
+    │       │       Store Redis meta (user_id, dataset_id, filename, filesize,
+    │       │                         master_hash, folder_id, total_chunks)
+    │       │       Set TTL on all keys
+    │       │       → UploadInitResponse(status="created", total_chunks=N)
+    │       │
+    │       └── FOUND (existing_file) → check DatasetFolderFilesMapping
+    │               │
+    │               ├── mapping (dataset, folder, file, user) EXISTS
+    │               │       Store Redis meta (linked_file_id=existing_file.id)
+    │               │       → status="duplicate_short_circuit", total_chunks=0
+    │               │
+    │               └── mapping DOES NOT EXIST
+    │                       Store Redis meta (linked_file_id=existing_file.id)
+    │                       → status="duplicate_suspected", total_chunks=0
+```
+
+### process_upload_chunk — Atomic State Machine (Test-Verified)
+
+```
+POST /v1/upload/chunk  (multipart: upload_id, chunk_index, chunk_hash + file)
+    │
+    ├─ Redis HGETALL(meta_key) → 404 if empty
+    ├─ user_id check → 403 if mismatch
+    ├─ chunk_index range check → 400 if ≥ total_chunks
+    ├─ Compute SHA-256 of incoming bytes → 400 if != chunk_hash
+    │
+    └─ atomic_chunk_state(bitmap_key, hashes_key, meta_key, chunk_index, chunk_hash, TTL)
+            │  (Lua script: atomic GETBIT + SETBIT)
+            ├── returns 1 (already_uploaded) → skip write, return current state
+            └── returns 0 (new chunk)
+                    Write chunk bytes to .parts/{upload_id}/{chunk_index:06d}.part
+                    → UploadChunkResponse(received_chunks=bitcount, complete=(bitcount==total_chunks))
+```
+
+### finalize_upload — Two Paths (Test-Verified)
+
+```
+POST /v1/upload/finalize
+    │
+    ├─ Redis HGETALL(meta_key) → 404 if empty
+    ├─ user_id check → 403
+    ├─ master_hash match against meta["master_hash"] → 400 if mismatch
+    │
+    ├─ PATH A: meta["linked_file_id"] is set (duplicate_suspected fast-link)
+    │       │
+    │       ├─ DB lookup UploadedFile WHERE id=linked_file_id → 404 if gone
+    │       ├─ final_file_id = linked_file_id  (no file I/O)
+    │       └─ Jump to mapping insert
+    │
+    └─ PATH B: no linked_file_id (new file)
+            │
+            ├─ bitcount(bitmap_key) == total_chunks → else 409
+            ├─ Hash validation per chunk (hashes_key HGETALL)
+            ├─ Assemble chunks → FINAL_ROOT/{uuid} using shutil.copyfileobj
+            ├─ Create UploadedFile row in DB
+            └─ Jump to mapping insert
+
+[Both paths]
+    │
+    ├─ pg_insert(DatasetFolderFilesMapping).values(...).on_conflict_do_nothing(
+    │     constraint="uq_dataset_folder_file")
+    │   → In production (PostgreSQL): atomic dedup insert
+    │   → In tests (SQLite): patched with sa_insert wrapper (no-op DO NOTHING)
+    │
+    ├─ _sync_dataset_status_from_mappings(db, dataset)
+    ├─ db.commit()
+    ├─ Redis DELETE: meta_key, bitmap_key (path B only), chunk_hashes_key (path B only)
+    └─ → UploadFinalizeResponse(status="completed", file_id=..., folder_id=...)
+```
+
+### delete_user_upload — Ownership + Cascade (Test-Verified)
+
+```
+POST /v1/uploads/delete  {upload_id: file_id}
+    │
+    ├─ DB lookup UploadedFile WHERE id=upload_id → 404 if not found
+    ├─ DB lookup DatasetFolderFilesMapping WHERE file_id AND user_id → 404 if none
+    │   (Ownership via mapping, not UploadedFile.user_id — no such column)
+    ├─ Physical file unlink (Path.unlink if exists)
+    ├─ Delete ALL DatasetFolderFilesMapping WHERE file_id (across all datasets)
+    ├─ db.delete(uploaded_file)
+    ├─ _sync_dataset_status_from_mappings for each affected dataset
+    ├─ db.commit()
+    └─ → UploadDeleteResponse(status="deleted", file_id=...)
+```
+
+### _build_tree / list_user_uploads — Tree Assembly (Test-Verified)
+
+```
+GET /v1/uploads?dataset_id=X&folder_id=Y
+    │
+    ├─ Query: DatasetFolderFilesMapping JOIN UploadedFile
+    │   Filters: user_id, optionally dataset_id, optionally folder_id
+    │
+    ├─ Group by folder_id → build folder nodes recursively
+    │   ├── folder_id IS NULL → file goes to root level
+    │   └── folder_id is set → file placed inside that Folder node
+    │
+    ├─ Root node is always UploadsTreeResponse(type="folder", name="root")
+    │   Children = top-level folders and files
+    │
+    └─ Return UploadsTreeResponse tree
+```
+
+### Microsoft / SharePoint ingestion flow (React → server → DB)
+
+```
+1. React initiates Microsoft login:
+    ├─ GET /v1/auth/microsoft or /v1/auth/microsoft/login
+    ├─ server builds OAuth authorize URL with
+    │   MICROSOFT_CLIENT_ID, MICROSOFT_REDIRECT_URI, MICROSOFT_TENANT_ID
+    │   scopes: offline_access User.Read Files.Read.All Sites.Read.All
+    └─ browser redirects to Microsoft consent screen
+
+2. Microsoft OAuth callback:
+    ├─ GET /v1/auth/microsoft/callback
+    ├─ server exchanges code for access_token + refresh_token
+    ├─ server calls Graph /me to get profile
+    └─ server saves/updates user row with microsoft_refresh_token
+
+3. React requests SharePoint/OneDrive tree:
+    ├─ GET /v1/ingest/sharepoint/tree
+    ├─ server calls get_user_microsoft_access_token(user)
+    ├─ server calls Graph API on /me/drive/root/children or /me/drive/items/{folder_id}/children
+    └─ returns SharePoint/OneDrive items to the UI
+
+4. React selects a file or shared link:
+    ├─ POST /v1/ingest/sharepoint with file_id
+    └─ POST /v1/ingest/sharepoint/url with sharepoint_url
+
+5. Server begins ingestion:
+    ├─ initiate_sharepoint_ingestion() validates dataset ownership
+    ├─ confirms microsoft_refresh_token exists
+    ├─ fetches item metadata from Graph
+    │   - file name, size, quickXorHash, download URL
+    ├─ if quickXorHash matches existing mapping:
+    │   • reuse existing UploadedFile and complete instantly
+    └─ otherwise queue a background job
+
+6. Background download job:
+    ├─ acquires Redis lock lock:ingest:sharepoint:{provider_file_id}
+    ├─ process_sharepoint_ingestion_job() refreshes Graph access token
+    ├─ downloads the file from Graph
+    │   - direct @microsoft.graph.downloadUrl or /content endpoint
+    ├─ streams bytes into uploads/files/Sharepoint
+    ├─ computes SHA-256 master_hash while writing
+    └─ writes staging file then renames to final path
+
+7. Final DB commit:
+    ├─ if master_hash already exists, reuse UploadedFile
+    ├─ else create UploadedFile row:
+    │   - filename, file_size_bytes, master_hash, physical_path, source_type=Sharepoint
+    ├─ insert DatasetFolderFilesMapping row
+    ├─ update AsyncIngestionJob to completed
+    └─ sync dataset status from mappings
+```
+
+### Key Test Engineering: pg_insert SQLite Workaround
+
+The production `finalize_upload` call uses:
+```python
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+stmt = pg_insert(DatasetFolderFilesMapping).values(...).on_conflict_do_nothing(constraint="uq_dataset_folder_file")
+db.execute(stmt)
+```
+
+In tests, `file_services.pg_insert` is monkeypatched with:
+```python
+def sqlite_insert(table):
+    class _Proxy:
+        def __init__(self, stmt): self._stmt = stmt
+        def values(self, **kw): self._stmt = self._stmt.values(**kw); return self
+        def on_conflict_do_nothing(self, **kw): return self._stmt  # no-op
+    return _Proxy(sa_insert(table))
+```
+
+This returns a plain `sa_insert` statement with `on_conflict_do_nothing` ignored. On SQLite, duplicate rows will raise `IntegrityError` (unlike PostgreSQL which silently skips). In tests this is safe because dedup scenarios are constructed so no actual duplicates are inserted during the finalize call itself.
+
+---
+
+### External FTP Pull Ingestion Gatekeeper Flow (v3.3 Component 1)
+
+```
+1. Client sends connect request:
+    ├─ POST /v1/ingest/ftp/connect
+    ├─ JSON: { host, port, username, password, duration_seconds, until_i_stop, graceful_expiry, allow_insecure }
+    └─ Headers: Authorization: Bearer <access_token>
+
+2. Gatekeeper validation sequence:
+    ├─ _resolve_current_user() → validates JWT Bearer token
+    ├─ _check_rate_limit(user_id)
+    │   ├─ Redis INCR ext_ftp:rate:{user_id} (Window: 300s, Max: 5 attempts)
+    │   └─ If count > 5 → raises 429 FtpRateLimitError
+    ├─ _probe_ftp_connection(host, port, username, password, allow_insecure)
+    │   ├─ ftplib.FTP_TLS probe (timeout=10s)
+    │   ├─ connect() → auth() → prot_p() → login() → quit()
+    │   ├─ If TLS fails & allow_insecure=True → fallback ftplib.FTP login
+    │   └─ Errors: 400 (TLS rejected), 401 (Auth failed), 504 (Unreachable host)
+    ├─ fernet_encrypt(password) → Fernet (AES-256) token using FERNET_KEY
+    └─ _store_ftp_credentials(user_id, payload)
+        └─ SET ext_ftp:creds:{user_id} (ex=1800s idle TTL)
+
+3. Client sends disconnect request:
+    ├─ POST /v1/ingest/ftp/disconnect?force=false (or force=true)
+    ├─ Body (if force=true): { delete_completed_files: boolean }
+    └─ Headers: Authorization: Bearer <access_token>
+
+4. Stateful disconnect execution:
+    ├─ If force == false (Normal Draining):
+    │   ├─ Check _count_active_ftp_jobs(user_id) in AsyncIngestionJob
+    │   ├─ If 0 active jobs → delete Redis key ext_ftp:creds:{user_id} → 200 OK
+    │   └─ If > 0 active jobs → set state="draining" in Redis → 409 Conflict (FtpSessionDrainingError)
+    │
+    └─ If force == true (Force Nuke):
+        ├─ Cancel pending/in_progress AsyncIngestionJob rows for user
+        ├─ If delete_completed_files == true:
+        │   ├─ Delete DatasetFolderFilesMapping rows for user
+        │   ├─ Check SELECT COUNT(*) on DatasetFolderFilesMapping per file_id
+        │   └─ If ref_count == 0 → delete physical file + delete UploadedFile row
+        └─ Delete Redis key ext_ftp:creds:{user_id} → 200 OK
+```
+
+

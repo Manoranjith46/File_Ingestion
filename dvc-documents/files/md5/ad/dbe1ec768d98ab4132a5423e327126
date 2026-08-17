@@ -1,0 +1,1267 @@
+# File Ingestion Project Explanation
+
+> This document describes the code that is currently in the repository. It intentionally calls out route collisions, test limitations, migration mismatches, and frontend placeholders instead of hiding them.
+
+## 1. Technology Stack
+
+### FastAPI and Uvicorn
+
+FastAPI is the HTTP web framework. It receives requests, validates typed parameters, selects a route, calls the handler, serializes the return value, and creates the HTTP response. Uvicorn is the ASGI server that keeps the application process listening on a TCP port.
+
+The application object is created in [`server/src/main.py`](server/src/main.py):
+
+```python
+app = FastAPI(lifespan=lifespan)
+```
+
+Run the server directly from PowerShell:
+
+```powershell
+cd d:\Zenteiq\Tasks\File_Ingestion\server
+pip install -r requirements.txt
+cd src
+python -m uvicorn main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+The repository also supports:
+
+```powershell
+cd d:\Zenteiq\Tasks\File_Ingestion\server
+uv sync
+cd src
+uv run uvicorn main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Use `http://127.0.0.1:8000/v1/health` as the implemented health URL. FastAPI's interactive documentation is normally available at `http://127.0.0.1:8000/docs`.
+
+### SQLAlchemy
+
+An ORM, or Object Relational Mapper, lets Python code represent database tables as classes and rows as objects. Instead of writing every SQL statement manually, this project defines classes such as `User`, `Dataset`, `Folder`, `UploadedFile`, and `DatasetFolderFilesMapping`.
+
+Important locations:
+
+- [`server/src/models/auth_model.py`](server/src/models/auth_model.py) defines `Base` and `User`.
+- [`server/src/models/file_model.py`](server/src/models/file_model.py) defines the file-ingestion tables.
+- [`server/src/config/database.py`](server/src/config/database.py) creates the engine and request-scoped sessions.
+- Services use queries such as `db.query(User).filter(...)`, `db.add(...)`, `db.commit()`, and `db.refresh(...)`.
+
+`get_engine()` creates one cached engine from the `Connection_String` environment variable. `get_session_local()` creates one cached session factory. `get_db()` yields one session to a request and closes it in `finally`, preventing a connection leak.
+
+The normal database commands are:
+
+```powershell
+cd d:\Zenteiq\Tasks\File_Ingestion\server
+alembic current
+alembic upgrade head
+alembic downgrade -1
+```
+
+The application also calls `Base.metadata.create_all(bind=get_engine())` during startup. In a deployment that uses Alembic, migrations should be the authoritative schema mechanism; `create_all()` is a second schema path and can confuse troubleshooting.
+
+### Alembic
+
+A database migration is a versioned Python description of a schema change. It allows a database to move from one known schema version to another without deleting existing data.
+
+This project stores migrations in [`server/alembic/versions`](server/alembic/versions). The chain is:
+
+1. `f09f8c95b82f_initial`
+2. `c8f2d6a4b9e1_add_file_ingestion_tables`
+3. `053bf9b73239_add_datasets_and_mappings`
+4. `80422981c893_add_is_deleted_to_datasets`
+5. `9ab1c7d4e2f3_add_dataset_metadata_fields`
+
+The Alembic environment is [`server/alembic/env.py`](server/alembic/env.py). It imports `Base.metadata`, loads `.env`, and takes the database URL from `Connection_String`.
+
+Create a migration after changing SQLAlchemy models:
+
+```powershell
+cd d:\Zenteiq\Tasks\File_Ingestion\server
+alembic revision --autogenerate -m "describe the schema change"
+```
+
+Always inspect the generated file before applying it. Apply migrations with:
+
+```powershell
+alembic upgrade head
+```
+
+Create SQL without executing it:
+
+```powershell
+alembic upgrade head --sql
+```
+
+Important current-code warning: the migration history contains an initial migration that drops old upload tables and an old `users.is_active` column. The later migrations also reshape `uploaded_files`. Compare the migration chain with the current models before using it against a real database.
+
+### Docker
+
+A container is an isolated process environment packaged with its runtime, libraries, configuration, and application code. Docker Compose starts several related containers together. In this project, the API, PostgreSQL, and Redis containers share a Compose network and communicate with one another by their service names.
+
+#### 1. Building and Running Locally
+
+To build and run the services on your local machine:
+
+* **Build and start the complete stack:**
+  ```powershell
+  cd d:\Zenteiq\Tasks\File_Ingestion
+  docker compose up -d --build
+  ```
+
+* **Check running container status:**
+  ```powershell
+  docker compose ps
+  ```
+
+* **View application logs:**
+  ```powershell
+  docker compose logs -f api
+  ```
+
+* **Stop containers without deleting persisted database/redis data:**
+  ```powershell
+  docker compose down
+  ```
+
+* **Stop containers and delete all persisted volumes (clears database & redis data):**
+  ```powershell
+  docker compose down -v
+  ```
+
+* **Port Mapping:** The Compose file publishes API port `8000`, PostgreSQL port `5432`, Redis port `6379`, and **(v4.0)** FTP port `21` (plus passive ports `21000-21010`) to the host machine. The API itself connects to Postgres and Redis using the internal hostnames `postgres` and `redis`.
+* **(v4.0) Shared Volume:** The `ftp` service (`delfer/alpine-ftp-server`) and the `api` service share the `uploads-data` Docker volume. Files dropped via FTP land at `/ftp/ftp_dropzone/{username}/` inside the FTP container, which maps to `/app/uploads/ftp_dropzone/{username}/` inside the API container. The background `ftp_watcher.py` daemon thread polls this directory.
+
+---
+
+#### 2. Pushing the API Image to a Container Registry (Docker Hub)
+
+To deploy the application to another system, you must build and push the custom backend API image to Docker Hub (or another container registry). The database (Postgres) and cache (Redis) use official public images, so they do not need to be pushed.
+
+1. **Log in to Docker Hub:**
+   ```bash
+   docker login
+   ```
+
+2. **Build the API image locally:**
+   ```bash
+   docker compose build api
+   ```
+
+3. **Tag the image for your registry:**
+   Replace `<YOUR_DOCKERHUB_USERNAME>` with your actual Docker Hub username:
+   ```bash
+   docker tag file_ingestion-api:latest <YOUR_DOCKERHUB_USERNAME>/file_ingestion-api:latest
+   ```
+
+4. **Push the image to the registry:**
+   ```bash
+   docker push <YOUR_DOCKERHUB_USERNAME>/file_ingestion-api:latest
+   ```
+
+---
+
+#### 3. Deploying on Another Device
+
+To run the application on another system, you do **not** need the application source code or Dockerfiles. You only need the deployment configuration files.
+
+##### Prerequisites
+* Ensure **Docker** and **Docker Compose** are installed on the target device.
+
+##### Required Files to Copy
+Create a folder on the target device (e.g., `~/file-ingestion/` or `C:\file-ingestion\`) and copy/create the following two files in it:
+1. **`docker-compose.yml`**
+2. **`.env`**
+
+##### Steps to Deploy
+1. **Update `docker-compose.yml`:** Edit the `api` service to pull your pushed image instead of building it from local source files:
+   ```yaml
+   services:
+     api:
+       image: <YOUR_DOCKERHUB_USERNAME>/file_ingestion-api:latest
+       container_name: file-ingestion-api
+       env_file:
+         - .env
+       # ... (environment, ports, volumes, etc. remain the same)
+   ```
+2. **Configure `.env`:** Copy your `.env` configuration to the target folder. Make sure to update the **`FRONTEND_URL`** to match the IP address or domain of the frontend client on the new network (e.g., `http://<NEW_DEVICE_IP>:5173`).
+3. **Log in (if using a private registry):** If your Docker Hub repository is private, log in on the new device:
+   ```bash
+   docker login
+   ```
+4. **Start the application:** In the folder containing your files, run:
+   ```bash
+   docker compose up -d
+   ```
+   Docker will automatically download the API image from your registry, pull the official Postgres and Redis images, create the database, run migrations, and start all services in the background.
+
+### Pydantic
+
+Pydantic validates untrusted input against Python type declarations. FastAPI uses Pydantic models for JSON request bodies and response models.
+
+Examples:
+
+- `RegisterRequest` requires a valid email, a password from 8 to 128 characters, and bounded username/name values.
+- `UploadInitRequest` requires a non-empty dataset ID, a positive file size, and a 64-character master hash.
+- `UploadChunkRequest` requires a non-negative chunk index and a 64-character chunk hash.
+- `DatasetUpdate` makes all update fields optional, allowing PATCH-style updates.
+
+Pydantic validators in [`server/src/schemas/auth_schema.py`](server/src/schemas/auth_schema.py) trim email and username values, normalize a login `username` into `identifier`, and perform email validation. FastAPI returns a default HTTP `422` response when validation fails before a route handler runs.
+
+Response models prevent accidental extra data from being sent. For example, `PublicUserSchema` exposes identity fields but not `password_hash`, OTP hashes, or reset-token hashes. `ConfigDict(from_attributes=True)` lets Pydantic read SQLAlchemy model attributes.
+
+### PostgreSQL, Redis, JWT, and the filesystem
+
+PostgreSQL stores durable users, datasets, folders, uploaded-file metadata, and mapping rows. Redis stores short-lived upload state and active-session state. The application creates signed access and refresh tokens in [`server/src/helpers/jwt.py`](server/src/helpers/jwt.py). Uploaded bytes are stored under `UPLOAD_STORAGE_DIR`; partial chunks go in `.parts` and finalized files go in `files`.
+
+## 2. Application Flow and Entry Point
+
+### Exact startup location
+
+The module-level FastAPI application is created in [`server/src/main.py`](server/src/main.py#L38), line 38, at the `app = FastAPI(lifespan=lifespan)` statement. The explicit Python entry point is `main()` at line 71 and its `if __name__ == "__main__"` block at line 78. The container starts `uvicorn main:app` through [`server/start.sh`](server/start.sh).
+
+Startup proceeds as follows:
+
+1. `load_environment_variables()` reads `server/.env` if it exists. Container environment variables are used when it does not.
+2. `lifespan()` pings Redis, checks PostgreSQL, starts the cleanup daemon, and calls `Base.metadata.create_all()`.
+3. CORS middleware is installed. `FRONTEND_URL` may contain comma-separated origins; localhost port 5173 is always added.
+4. The auth router is mounted at `/auth`.
+5. The file router is mounted at `/v1`.
+6. Uvicorn accepts HTTP requests on port 8000.
+
+### Request lifecycle
+
+A typical authenticated request follows this path:
+
+1. The browser or client sends an HTTP request to Uvicorn.
+2. Starlette/FastAPI applies middleware, including CORS processing.
+3. FastAPI matches the HTTP method and path to a router function.
+4. FastAPI parses headers, cookies, query parameters, form fields, and JSON. It validates Pydantic request models and resolves `Depends(get_db)`.
+5. Protected routes call `_resolve_current_user()`, which checks `Authorization: Bearer ...`, verifies the JWT, queries the user, and checks `token_version`.
+6. The route delegates business work to `auth_services.py` or `file_services.py`.
+7. The service reads or writes PostgreSQL through SQLAlchemy, Redis through `redis.Redis`, and, for uploads, the local mounted filesystem.
+8. The route returns a model or dictionary. FastAPI validates/serializes it through its response model.
+9. Response headers and cookies, including `Authorization` and `refresh_token` where relevant, are sent back to the client.
+10. The request dependency closes the database session.
+
+## 3. Redis Integration
+
+Redis is configured in [`server/src/config/redis_server.py`](server/src/config/redis_server.py). A connection pool uses `REDIS_HOST`, `REDIS_PORT`, response decoding, connection timeouts, and a maximum of 50 connections. `redis_server_status()` calls `PING` during application startup.
+
+### Redis structures used
+
+#### Hash maps: `HSET`, `HGETALL`, and expiration
+
+Upload initialization writes one hash at `upload:{upload_id}:meta`.
+
+The fields are:
+
+- `user_id`: owner used for authorization.
+- `dataset_id`: destination dataset.
+- `filename`: original client filename.
+- `filesize`: expected byte count as text.
+- `master_hash`: complete-file hash supplied by the client.
+- `folder_id`: virtual folder ID or an empty string.
+- `total_chunks`: expected number of chunks.
+- `linked_file_id`: present for the duplicate-suspected fast-link path.
+
+`initialize_upload()` calls `redis_server.hset(..., mapping=...)` and sets a TTL with `expire()`. `process_upload_chunk()` calls `hgetall()` to recover and authorize the session. The finalization and cleanup paths delete the metadata hash after success or abandonment.
+
+A second hash at `upload:{upload_id}:chunk_hashes` maps a chunk index, converted to a string, to its SHA-256 hash. The atomic Lua script writes this hash with `HSET`. The current Python service does not later read the individual hash fields; the bitmap and final file checks drive completeness.
+
+#### Bitmaps: `SETBIT`, `GETBIT`, and `BITCOUNT`
+
+The bitmap key is `upload:{upload_id}:bitmap`. Bit position `chunk_index` means “this chunk has been accepted.”
+
+The registered `ATOMIC_CHUNK_STATE_LUA` script does this atomically:
+
+1. `GETBIT` checks whether the bit already equals 1.
+2. If it is already set, the script returns `1` and the caller does not rewrite the chunk file.
+3. Otherwise, `SETBIT` marks the chunk as present.
+4. `HSET` records its hash in the chunk-hash map.
+5. `EXPIRE` refreshes TTLs on bitmap, hash, and metadata keys.
+6. It returns `0` for a new chunk.
+
+After the script, Python calls `BITCOUNT` to calculate `received_chunks`. Finalization refuses to continue unless `BITCOUNT(bitmap) == total_chunks`.
+
+#### Sorted sets: active sessions
+
+Authentication uses a sorted set named `user:sessions:{user_id}`. The score is the current Unix timestamp and the member is a random session ID (`sid`). `ACTIVE_SESSION_LIMITER_LUA` removes expired members, adds the new session with `ZADD`, trims the oldest sessions with `ZREMRANGEBYRANK`, sets a TTL, and enforces `MAX_ACTIVE_SESSIONS` (default 5).
+
+Refresh validation uses `ZSCORE` to ensure the token's `sid` is still present. Logout uses `ZREM` for one refresh session or deletes the whole sorted set when no specific refresh token is supplied.
+
+There are no direct Python calls to `HGET`, `HDEL`, `SETBIT`, or `GETBIT`; `GETBIT`, `SETBIT`, and `HSET` appear inside the Lua script. There are no bitmap operations in the authentication flow. Redis is not the durable source of truth: PostgreSQL remains authoritative for users and file metadata, while Redis state expires.
+
+## 4. Endpoint Tracing
+
+All auth paths receive the `/auth` prefix from [`server/src/main.py`](server/src/main.py). All file paths receive `/v1`. Unless stated otherwise, protected routes require `Authorization: Bearer <access-token>` and a request-scoped SQLAlchemy session.
+
+### `GET /v1/health`
+
+Request -> no body, headers, or database dependency -> `health_check()` -> returns `{"status": "Application is running successfully :)"}` with HTTP 200.
+
+### `POST /auth/signup/init`
+
+Request JSON -> `RegisterRequest` validates email, optional username/name, and password -> `register()` obtains a database session -> `create_user()` checks duplicate email/username, hashes the password, inserts an unverified user, commits, and refreshes -> `request_otp()` stores a hashed OTP and expiration in the user row and prints the development OTP (`123456`) -> `RegistrationResponse` validates the public user shape -> response 200. If OTP creation fails, the newly created user is deleted and committed before the error is re-raised.
+
+### `POST /auth/signup/verify`
+
+Request JSON -> `OtpVerifyRequest` validates email and OTP length -> `verify_signup_endpoint()` -> `verify_otp()` loads the user, checks challenge/expiry/attempt count, verifies the hash, marks the user verified, clears OTP state, increments `token_version`, and commits -> `issue_token_pair()` increments the version again, creates a JWT access token and refresh token, and records a Redis sorted-set session -> response sets an HttpOnly `refresh_token` cookie and an `Authorization` response header, then returns `TokenPairResponse` with HTTP 200.
+
+### `POST /auth/login` and the route collision
+
+The file declares this method/path twice. The first handler accepts `LoginRequest`; it calls `authenticate_user()` to find a user by identifier, verify the PBKDF2 password, require `is_verified`, and update `last_login_at`, then calls `issue_token_pair()` and returns the token pair with cookie/header side effects.
+
+The later handler accepts `OtpVerifyRequest` and repeats the OTP verification/session-creation behavior. Both route objects are registered, but normal first-match routing means the earlier credential handler is the practical match for ordinary requests. This is a defect: OTP verification should have a distinct path, such as the already existing `/auth/signup/verify`, and clients should not depend on the duplicate `/auth/login` definition.
+
+### `POST /auth/logout`
+
+Request -> header and optional refresh cookie are extracted -> the handler requires a Bearer header -> `get_current_user()` decodes and verifies the access JWT and compares `token_version` -> `revoke_session()` increments the database token version and removes one Redis `sid` or the entire user session set -> optional refresh cookie is deleted -> `MessageResponse(message="Logged out successfully")`, HTTP 200.
+
+### `POST /auth/refresh`
+
+Request -> FastAPI reads the `refresh_token` cookie -> missing cookie gives 401 -> `resolve_refresh_user()` verifies the refresh JWT, loads the user, checks token version, and uses Redis `ZSCORE` to check the session ID -> `issue_token_pair()` rotates the token version and creates a new Redis session -> response replaces the cookie, sets the access token in the `Authorization` header, and returns `TokenPairResponse`.
+
+### `GET /auth/me`
+
+Request -> Bearer header is required -> `get_current_user()` verifies signature, type, expiration, user existence, and token version -> `create_public_user()` converts the SQLAlchemy row to `PublicUserSchema` -> HTTP 200 public profile.
+
+### `POST /auth/password-reset/request`
+
+Request JSON -> `PasswordResetRequest` validates email -> `request_password_reset()` finds the user, creates a URL-safe token, stores only its hash and expiration in PostgreSQL, and returns the token internally -> route intentionally returns only email and a message in `PasswordResetChallengeResponse` -> HTTP 200. No email sender is implemented; the raw token is not returned by this route.
+
+### `POST /auth/password-reset/verify`
+
+Request JSON -> `PasswordResetConfirmRequest` validates email, reset-token length, and new-password length -> `reset_password()` finds the user, checks reset challenge and expiry, verifies the hash, replaces the password hash, clears reset fields, increments token version, and commits -> `MessageResponse("Password updated successfully")`.
+
+### `GET /auth/google` and `GET /auth/google/login`
+
+Both paths call `google_login()`. The service builds a Google OAuth consent URL and CSRF state from Google environment settings. The route returns a 302 redirect and stores the state in an HttpOnly `google_oauth_state` cookie scoped to `/auth/google`.
+
+### `GET /auth/google/callback`
+
+Google redirects with `code` and `state` query values -> FastAPI reads the OAuth state cookie -> missing code or mismatched state returns 400 -> `continue_with_google()` exchanges the code, verifies the Google ID token, creates or updates a local user, and commits -> `issue_token_pair()` creates a session -> route redirects with 302 to the frontend callback URL, sets the refresh cookie, and deletes the OAuth state cookie.
+
+### `POST /v1/upload/init`
+
+JSON -> `UploadInitRequest` validates dataset ID, filename, positive size, 64-character master hash, and optional relative path -> bearer token resolves the user -> `initialize_upload()` verifies dataset ownership, creates any folder tree, checks for an existing exact mapping, then checks for a global physical duplicate -> exact mapping returns `duplicate_short_circuit`; global duplicate stores `linked_file_id` in Redis and returns `duplicate_suspected`; a new upload creates `.parts/{upload_id}`, stores metadata and TTLs in Redis, and returns chunk size, total chunks, and `created` -> `UploadInitResponse` is returned.
+
+### `POST /v1/upload/chunk`
+
+Multipart form data -> FastAPI validates `upload_id`, `chunk_index >= 0`, and `chunk_hash` length; `UploadFile` supplies bytes -> bearer token resolves the user -> route constructs `UploadChunkRequest` and reads the file -> `process_upload_chunk()` loads Redis metadata, checks ownership and range, computes SHA-256 and compares it with the supplied hash, runs the atomic Redis bitmap/hash Lua script, and writes a new chunk to `.parts/{upload_id}/{index:06d}.part` -> `BITCOUNT` calculates progress -> `UploadChunkResponse` reports bytes, received count, total count, and completion.
+
+### `POST /v1/upload/finalize`
+
+JSON -> `UploadFinalizeRequest` validates upload ID and master hash -> bearer token resolves the user -> `finalize_upload()` reads Redis metadata, checks ownership and master hash, validates the optional folder, and chooses one path: link an existing duplicate, reject an incomplete bitmap with 409, reuse a concurrently created physical file, or concatenate all part files into a staging file and move it into the final storage directory -> it inserts a dataset/file mapping with PostgreSQL `ON CONFLICT DO NOTHING`, commits, deletes Redis state, and returns `UploadFinalizeResponse`.
+
+The code trusts the client-supplied master hash as the value to compare and does not calculate a new complete-file hash during assembly. That is a security/integrity consideration for future hardening.
+
+### `GET /v1/uploads`
+
+Optional query values `dataset_id` and `folder_id` plus Bearer header -> user is resolved -> `list_user_uploads()` calls `_build_tree()` -> SQLAlchemy loads mappings, folders, and physical file metadata scoped to the user, dataset, and/or folder -> nested `UploadsTreeResponse` is returned. The root is a generated virtual node when no folder filter is supplied.
+
+### `POST /v1/uploads/delete`
+
+JSON -> `UploadDeleteRequest` validates `upload_id` -> user is resolved -> `delete_user_upload()` finds the physical file and one ownership mapping, deletes the mapping, removes the physical file only when no mappings remain, deletes its database row if unreferenced, and commits -> `UploadDeleteResponse` confirms deletion.
+
+### `POST /v1/datasets`
+
+JSON -> `DatasetCreate` validates name and optional metadata -> user is resolved -> `create_dataset()` checks case-insensitive duplicate names among active datasets, strips values, inserts and commits -> `DatasetResponse` serializes the row with HTTP 201.
+
+### `GET /v1/datasets`
+
+Query parameters `page` and `limit` use Python defaults 1 and 10; there are no explicit positive bounds in the route -> user is resolved -> `get_datasets()` computes offset and selects active user-owned datasets in descending creation order -> list of `DatasetResponse` objects.
+
+### `GET /v1/datasets/{dataset_id}`
+
+Path ID plus Bearer header -> user is resolved -> `get_dataset_by_id()` requires an active dataset and checks ownership -> SQLAlchemy object is serialized through `DatasetResponse`.
+
+### `PATCH /v1/datasets/{dataset_id}`
+
+Path ID and JSON -> `DatasetUpdate` validates only supplied fields -> user is resolved -> service loads the active owned dataset, validates a changed name for conflicts, strips supplied strings, updates `updated_at`, commits and refreshes -> `DatasetResponse`.
+
+### `DELETE /v1/datasets/{dataset_id}`
+
+Path ID plus Bearer header -> service loads the active owned dataset, counts mappings, returns 409 if files are attached, otherwise sets `is_deleted=True` and commits -> route returns `{"status": "deleted", "dataset_id": ...}`.
+
+### `POST /v1/datasets/{dataset_id}/files`
+
+JSON -> `DatasetAttachFileRequest` validates file ID and optional relative path -> user is resolved -> service checks dataset ownership, requires that the user already owns a mapping to the file, creates the optional folder tree, avoids duplicate mapping, and commits a new mapping -> `DatasetAttachFileResponse` reports the attachment.
+
+## 5. Testing Breakdown
+
+### Concepts in this project
+
+- **Unit testing:** Tests one service or utility in isolation. These tests use an in-memory SQLite database, fake Redis objects, temporary paths, and monkeypatching so they do not need real PostgreSQL or Redis.
+- **Integration testing:** Sends HTTP requests through the FastAPI ASGI application and checks routing, validation, dependency wiring, and response status. These tests still need careful database/Redis isolation because importing the real app does not magically create a test database.
+- **Stress testing:** Sends repeated concurrent traffic to a running server to observe throughput, failures, latency, and resource behavior. The k6 scripts use virtual users and a duration.
+- **Code coverage:** The percentage of executable lines or branches exercised by tests. This repository contains `.coverage` in the server directory, but no coverage command/configuration is documented. A typical command is `pytest --cov=src --cov-report=term-missing` after installing `pytest-cov`.
+- **Benchmarking:** Measures elapsed time for a small operation. The benchmark file uses Python `timeit`; it is not a correctness test and its current setup has a missing real database session.
+
+### How to run the tests
+
+The project does not list pytest in `requirements.txt` or `pyproject.toml`, so install the test tools first:
+
+```powershell
+cd d:\Zenteiq\Tasks\File_Ingestion\server
+python -m pip install pytest pytest-asyncio pytest-cov
+pytest
+pytest tests/unit_tests
+pytest tests/integration_tests
+pytest --cov=src --cov-report=term-missing
+```
+
+Run the k6 stress scripts against a running API:
+
+```powershell
+k6 run tests/stress_tests/auth_stress.js
+k6 run tests/stress_tests/file_stress.js
+```
+
+Run the benchmark:
+
+```powershell
+python tests/benchmark/benchmark_auth.py
+```
+
+### `unit_tests/test_auth.py`: line-by-line/block explanation
+
+- The module docstring identifies authentication service unit tests.
+- `from __future__ import annotations` delays type evaluation.
+- `sys`, datetime utilities, `Path`, pytest, `HTTPException`, SQLAlchemy's SQLite engine, `Generator`, and `Session` provide paths, time values, assertions, and test database types.
+- `SERVER_ROOT` and `SRC_ROOT` calculate the repository locations from the test file. The `sys.path` guard makes `src` importable.
+- The test imports `Base`, `User`, request schemas, and the module under test, `auth_services`.
+- `FakeRedis` stores sorted-set members in a dictionary keyed by `(key, member)`. `zscore`, `zrem`, and `delete` imitate only the Redis calls these tests need.
+- The `db_session` fixture creates an in-memory SQLite engine, creates all ORM tables, yields a session, then closes the session and drops tables in cleanup.
+- The `fake_redis` fixture creates the stub. Its fake limiter inserts a synthetic `sid-123` member under `user:sessions:1`; monkeypatch replaces both the service Redis client and Lua limiter.
+- `test_create_user_persists_new_user_and_rejects_duplicate_email` builds a valid registration model, calls `create_user`, asserts email and username persistence, calls it again, expects `HTTPException`, and asserts status 409.
+- `test_authenticate_user_rejects_invalid_credentials` creates a user, manually marks it verified, submits a wrong password, expects an exception, and asserts 401.
+- `test_issue_token_pair_creates_access_and_refresh_tokens` inserts a verified user, calls `issue_token_pair`, checks the public email, checks both tokens start with JWT-like `ey`, and checks the fake limiter recorded a session.
+- `test_resolve_refresh_user_rejects_evicted_session` creates a user and a refresh token whose `sid` is absent from fake Redis. It expects refresh resolution to raise 401.
+- `test_verify_otp_rejects_expired_challenge` patches `_now`, stores a hashed OTP with an expiration in the past, calls `verify_otp`, and asserts the expected 400 error.
+
+This file mocks Redis but uses real password hashing, JWT creation, SQLAlchemy ORM operations, and service control flow.
+
+### `unit_tests/test_file.py`: line-by-line/block explanation
+
+- Imports establish path setup, temporary-file helpers, `SimpleNamespace`, pytest, HTTP exceptions, SQLite, and SQLAlchemy sessions.
+- `FakeRedis.hashes` imitates Redis hashes. `hset` merges fields, `hgetall` returns a copy, `expire` does nothing, `bitcount` always returns zero, `delete` removes keys, and `exists` checks metadata presence.
+- `db_session` creates and destroys an isolated SQLite schema for each test.
+- `storage_root` redirects `UPLOAD_ROOT`, `PARTS_ROOT`, and `FINAL_ROOT` to pytest's temporary directory and creates both storage folders.
+- `fake_redis` patches the file service Redis client and replaces the atomic Lua function with a return value of zero, meaning every chunk would be treated as new.
+- `test_create_dataset_rejects_duplicate_name` inserts an owner, creates `Finance`, calls creation again with the same payload, expects HTTP 409, and verifies case-insensitive duplicate protection.
+- `test_initialize_upload_returns_duplicate_short_circuit_for_existing_mapping` inserts a user, dataset, uploaded file, and mapping with a matching hash. It initializes the same upload and asserts zero chunks plus `duplicate_short_circuit`.
+- `test_initialize_upload_creates_new_session_for_new_upload` creates an owner and dataset, initializes a one-chunk upload, asserts `created` and `total_chunks == 1`, and inspects the fake Redis metadata hash for the dataset ID.
+- `test_delete_dataset_conflicts_when_files_are_attached` creates a dataset, file, and mapping, calls deletion, and asserts 409 rather than a soft delete.
+- `test_attach_file_to_dataset_requires_user_ownership` creates two users, gives the owner a dataset and file, tries to attach as the other user, and asserts 403. `SimpleNamespace` stands in for the validated attach request.
+
+The file tests service logic, but it does not exercise actual chunk bytes, real bitmap behavior, final assembly, or real PostgreSQL conflict constraints.
+
+### `unit_tests/test_cleanups.py`
+
+- The imports set up path handling, pytest, and the cleanup module.
+- `FakeRedis` contains a set of existing metadata keys. `exists` reports whether a session exists; `delete` removes requested keys.
+- `test_purge_abandoned_upload_parts_removes_expired_directories` creates a temporary `.parts/expired-upload` directory, patches the cleanup module's path and Redis object, runs the purge, and asserts the ID is returned and the directory is gone. Because the fake Redis has no metadata key, this simulates an expired session.
+- `test_start_cleanup_scheduler_returns_thread` patches the infinite loop to a no-op, resets the module global thread, starts the scheduler, and asserts a thread object exists and is daemonized.
+
+### `unit_tests/test_docker_env.py`
+
+- Imports `os`, `sys`, `Path`, and the environment module.
+- The test calculates `server` and `src` paths and ensures the package can be imported.
+- `test_load_environment_variables_uses_existing_environment_when_dotenv_is_missing` patches `ENV_PATH` to a missing temporary file, removes two environment values, then sets them as if Docker supplied them. It calls `load_environment_variables()` and asserts the values remain available. This protects the container path where `server/.env` is absent.
+
+### `integration_tests/test_auth_api.py`
+
+- Imports path tools, HTTPX, pytest, and `app` from `main`.
+- The `client` fixture builds `httpx.ASGITransport(app=app)` and an async client with `http://testserver` as its base URL.
+- The async marker allows pytest to run the coroutine.
+- `test_register_and_login_flow` generates a unique email/username, posts to `/auth/signup/init`, and expects 200. It then posts the hard-coded OTP `123456` to `/auth/signup/verify` and expects 200.
+
+Current limitation: the real application lifespan, database, and Redis are not replaced here. The test may require configured services, and the fixed OTP only works because `generate_otp_code()` currently returns `123456`.
+
+### `integration_tests/test_file_api.py`
+
+- Imports path setup, HTTPX, pytest, and the FastAPI app.
+- The client fixture creates an ASGI HTTPX client.
+- The async test posts to `/v1/datasets` without an authorization header and asserts 401. It exercises the route's early auth guard without needing a valid JSON payload.
+
+### `stress_tests/auth_stress.js`
+
+- Imports k6's HTTP client and `sleep`.
+- `options` starts 10 virtual users for 10 seconds.
+- Each iteration builds a unique registration payload using k6's virtual-user and iteration numbers.
+- `http.post` sends JSON to `/auth/signup/init` with the content type header.
+- `sleep(0.1)` pauses each virtual user for 100 ms.
+
+This does not verify the response or complete OTP verification, so it measures registration-init traffic rather than the full auth flow.
+
+### `stress_tests/file_stress.js`
+
+- Imports k6 HTTP and sleep helpers.
+- `options` starts 5 virtual users for 10 seconds.
+- Each iteration builds a unique dataset name.
+- It posts to `/v1/datasets` with a placeholder token `Bearer test-token`.
+- It sleeps for 100 ms.
+
+Because the token is not a valid JWT, this mostly measures authentication rejection unless the server is modified or the script is supplied real tokens.
+
+### `benchmark/benchmark_auth.py`
+
+- Imports path tools and `timeit`, adds `server/src` to `sys.path`, and imports `User` and `issue_token_pair`.
+- `benchmark_issue_token_pair` constructs a synthetic verified user, sets `session = None`, and times ten calls to `issue_token_pair`.
+- The module guard runs the benchmark when executed directly.
+
+Important limitation: `issue_token_pair()` calls `db.commit()` and `db.refresh()`, then accesses Redis. Passing `None` as `session` is not a valid working setup, so this benchmark is expected to fail before producing a meaningful measurement unless the function is patched or a real/fake session is supplied.
+
+## 6. Docker Deep-Dive
+
+### File purposes
+
+- [`docker-compose.yml`](docker-compose.yml) defines and connects the API, PostgreSQL, and Redis services.
+- [`server/Dockerfile`](server/Dockerfile) builds the Python API image.
+- [`server/start.sh`](server/start.sh) waits for PostgreSQL, runs Alembic, and starts Uvicorn.
+- [`server/.dockerignore`](server/.dockerignore) excludes local caches, secrets, virtual environments, test artifacts, and local upload/database files from the build context.
+- There is no separate frontend service in Compose. The React/Vite client must be run separately with `npm install` and `npm run dev`.
+
+### `server/Dockerfile`, line by line
+
+1. `FROM python:3.12-slim` selects a small Debian-based Python 3.12 image. Note that `pyproject.toml` says Python `>=3.14`, and the README also says 3.14+, so the declared requirement and Docker base image disagree.
+2. `ENV PYTHONDONTWRITEBYTECODE=1` prevents `.pyc` files.
+3. `PYTHONUNBUFFERED=1` makes logs appear immediately.
+4. `PIP_NO_CACHE_DIR=1` avoids retaining pip's download cache.
+5. `PYTHONPATH=/app/src` lets `main`, `config`, `models`, and other source packages import as top-level modules.
+6. `WORKDIR /app` makes `/app` the current directory for later instructions and the container command.
+7. `RUN apt-get update` refreshes Debian package metadata.
+8. `apt-get install ... build-essential gcc libpq-dev` installs compilers and PostgreSQL client headers needed by Python dependencies.
+9. `rm -rf /var/lib/apt/lists/*` removes package lists to reduce image size.
+10. `COPY requirements.txt ./` copies dependency declarations first so Docker can cache the dependency layer.
+11. `RUN pip install --upgrade pip && pip install -r requirements.txt` installs Python dependencies.
+12. `COPY . .` copies the server build context into `/app`, excluding `.dockerignore` entries.
+13. `EXPOSE 8000` documents the port the process listens on; it does not itself publish a host port.
+14. `CMD ["sh", "-c", "chmod +x start.sh && ./start.sh"]` makes the script executable, runs the wait/migration/start sequence, and uses `exec` inside the script for Uvicorn.
+
+### `docker-compose.yml`, line by line
+
+#### API service
+
+- `services.api` names the application service `api`.
+- `build.context: ./server` means Docker sends only the server directory as build context.
+- `dockerfile: Dockerfile` selects `server/Dockerfile`.
+- `container_name` gives the container a stable human-readable name.
+- `env_file: ./server/.env` loads local secrets/configuration when that file exists.
+- `environment.Connection_String` points SQLAlchemy to PostgreSQL using the Compose service name `postgres`.
+- `REDIS_HOST=redis` points the Redis client to the Compose service named `redis`.
+- `REDIS_PORT=6379` uses Redis's internal port.
+- `FRONTEND_URL=http://localhost:5173` allows the Vite development origin.
+- JWT and expiry variables use shell interpolation with development defaults.
+- `UPLOAD_STORAGE_DIR=/app/uploads` places durable upload bytes in the named upload volume.
+- `ports: "8000:8000"` maps host port 8000 to container port 8000.
+- `depends_on.postgres.condition: service_healthy` waits for PostgreSQL's health check before creating the API container; Redis only needs to be started.
+- `volumes: ./server:/app` bind-mounts source code for development, while `uploads-data:/app/uploads` persists uploaded bytes separately.
+- `restart: unless-stopped` restarts the API after failures unless explicitly stopped.
+
+#### PostgreSQL service
+
+- `image: postgres:16-alpine` uses PostgreSQL 16 on Alpine Linux.
+- `container_name` names the database container.
+- `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB` initialize the database credentials and database name.
+- `ports: "5432:5432"` exposes PostgreSQL to the host as well as the Compose network.
+- `postgres-data:/var/lib/postgresql/data` persists database files.
+- `healthcheck` runs `pg_isready` against the expected database.
+- `interval`, `timeout`, `retries`, and `start_period` define health-check timing.
+- `restart: unless-stopped` keeps the database available across ordinary failures.
+
+#### Redis service
+
+- `image: redis:7-alpine` runs Redis 7 on Alpine Linux.
+- `container_name` names the Redis container.
+- `ports: "6379:6379"` exposes Redis to the host.
+- `redis-data:/data` persists Redis's data directory.
+- `restart: unless-stopped` restarts Redis unless explicitly stopped.
+
+#### Named volumes
+
+`postgres-data`, `redis-data`, and `uploads-data` are Docker-managed persistent volumes. They are separate so database rows, Redis data, and uploaded files have independent lifecycles. `docker compose down` keeps them; `docker compose down -v` removes them.
+
+### `.dockerignore`, line by line
+
+- `__pycache__/`, `*.py[cod]`, `*.pyo`, and `*.pyd` exclude Python bytecode and compiled extension artifacts.
+- `*.pytest_cache/`, `.pytest_cache/`, `.coverage`, `.mypy_cache/`, and `*.log` exclude test, coverage, type-checking, and log output.
+- `.venv/` excludes a host virtual environment because the image installs its own dependencies.
+- `.env` excludes secrets from the image build context; Compose still reads it through `env_file`.
+- `.git/`, `.gitignore`, and `.vscode/` exclude version-control and editor metadata.
+- `*.sqlite3` and `*.db` exclude local database files.
+- `uploads/` excludes local uploaded data; Compose mounts `uploads-data` at runtime instead.
+
+### Compose startup sequence
+
+1. Compose creates the PostgreSQL and Redis containers.
+2. PostgreSQL becomes healthy according to `pg_isready`.
+3. The API container starts and `start.sh` repeatedly opens the configured PostgreSQL connection until it succeeds.
+4. `python -m alembic upgrade head` applies all migrations.
+5. Uvicorn starts `main:app` on `0.0.0.0:8000`.
+6. FastAPI startup pings Redis, checks the database, starts cleanup, and calls `create_all()`.
+
+## Practical run checklist
+
+1. Ensure Docker Desktop is running.
+2. Ensure `server/.env` exists or provide equivalent environment variables. At minimum, the API needs `Connection_String`; Google login additionally needs its OAuth settings.
+3. Start infrastructure and the API with `docker compose up --build`.
+4. Start the frontend separately:
+
+```powershell
+cd d:\Zenteiq\Tasks\File_Ingestion\client
+npm install
+npm run dev
+```
+
+5. Check `http://localhost:8000/v1/health` and `http://localhost:5173`.
+6. For a real end-to-end upload, use the backend upload endpoints directly. The current `client/src/pages/Home.tsx` uses `fakeUpload()` and local storage for progress/history rather than calling `/v1/upload/init`, `/chunk`, or `/finalize`.
+7. Be aware that `client/src/pages/auth/CreateAccount.tsx` calls `/auth/register`, while the implemented backend route is `/auth/signup/init`; this frontend/backend route mismatch must be corrected before the UI registration flow can work.
+
+## 7. Session Handling for File and Folder Uploads
+
+### Core Rule: 1 File = 1 Session
+
+This project uses a **per-file session model**. Every single file that is uploaded gets its own independent upload session. There is **no batch session**, **no folder-level session**, and **no group session** that wraps multiple files together.
+
+An "upload session" is the lifecycle of one file going through three API calls:
+
+1. **`POST /v1/upload/init`** → creates the session (returns a unique `upload_id`)
+2. **`POST /v1/upload/chunk`** (called N times) → sends chunks tied to that `upload_id`
+3. **`POST /v1/upload/finalize`** → assembles chunks, persists the file, and **destroys the session**
+
+Each session is stored in **Redis** under keys namespaced by `upload_id`:
+- `upload:{upload_id}:meta` — hash map with user_id, dataset_id, filename, filesize, master_hash, folder_id, total_chunks
+- `upload:{upload_id}:bitmap` — bitmap tracking which chunks have been received
+- `upload:{upload_id}:chunk_hashes` — hash map of chunk_index → SHA-256 hash
+
+Each session has a **TTL** (`UPLOAD_SESSION_TTL_SECONDS`, default 3600 seconds / 1 hour). If a session is not finalized before the TTL expires, Redis auto-deletes the keys and the background cleanup scheduler removes the orphaned `.parts` directory.
+
+The session **closes** (Redis keys are deleted) in two ways:
+- **Success**: `finalize_upload()` explicitly calls `redis_server.delete()` on the meta, bitmap, and chunk_hashes keys after the file is assembled and the database mapping is committed.
+- **Expiry/Abandonment**: Redis TTL expires, and the cleanup daemon (`cleanup_scheduler.py`) purges the leftover `.parts` directory on the filesystem.
+
+---
+
+### Single File Upload
+
+```
+User selects 1 file
+    │
+    ▼
+POST /v1/upload/init  →  Session A created (upload_id = "aaa")
+    │
+    ▼
+POST /v1/upload/chunk (×N chunks, all for upload_id "aaa")
+    │
+    ▼
+POST /v1/upload/finalize (upload_id "aaa")  →  Session A closed
+```
+
+**Result:** 1 file = 1 session created, 1 session closed.
+
+---
+
+### Multiple Files Upload (e.g., 3 files selected at once)
+
+When the user selects 3 files from the file picker, the client calls `POST /v1/upload/init` **separately for each file**. There is no single "batch init" endpoint.
+
+```
+User selects 3 files (A.pdf, B.csv, C.txt)
+    │
+    ├──► POST /v1/upload/init (A.pdf)  →  Session 1 (upload_id = "aaa")
+    ├──► POST /v1/upload/init (B.csv)  →  Session 2 (upload_id = "bbb")
+    └──► POST /v1/upload/init (C.txt)  →  Session 3 (upload_id = "ccc")
+    │
+    ▼  (chunks are sent independently for each session, can run in parallel)
+    ├──► chunks for "aaa" → finalize "aaa"  →  Session 1 closed
+    ├──► chunks for "bbb" → finalize "bbb"  →  Session 2 closed
+    └──► chunks for "ccc" → finalize "ccc"  →  Session 3 closed
+```
+
+**Result:** 3 files = 3 separate sessions. Each session opens and closes independently. If file B fails mid-upload, sessions for A and C are unaffected.
+
+**Key code evidence** ([`file_services.py`](server/src/services/file_services.py)):
+- `initialize_upload()` (line 286) takes a single `UploadInitRequest` containing one `filename`, one `filesize`, one `master_hash` → creates one `upload_id`
+- `process_upload_chunk()` (line 391) processes one chunk for one `upload_id`
+- `finalize_upload()` (line 449) finalizes one `upload_id` → deletes that one session
+
+There is no request schema or service function that accepts a list of files or returns multiple upload IDs.
+
+**Client-side evidence** ([`Home.tsx`](client/src/pages/Home.tsx)):
+- `handleFilesSelected()` (line 149) iterates over `selectedFiles` with `Array.from(selectedFiles).forEach(...)` and calls `uploadFileChunks(file, id)` individually for each file
+- Each file gets its own unique `id` and its own independent upload progress tracking
+
+---
+
+### Single Folder Upload
+
+When a user uploads a folder (e.g., `reports/` containing `report1.pdf`, `report2.csv`, `report3.txt`), the browser sends all files with their `webkitRelativePath` (e.g., `reports/report1.pdf`). The client iterates over these files and creates one upload session per file.
+
+The folder structure is not handled at the session level — it is handled at the **`/v1/upload/init`** level through the `relative_path` field in `UploadInitRequest`.
+
+```
+User selects folder "reports/" containing 3 files
+    │
+    ├──► init(filename="report1.pdf", relative_path="reports/report1.pdf")  → Session 1
+    ├──► init(filename="report2.csv", relative_path="reports/report2.csv")  → Session 2
+    └──► init(filename="report3.txt", relative_path="reports/report3.txt") → Session 3
+    │
+    ▼  (each file uploads independently)
+    ├──► chunks + finalize → Session 1 closed
+    ├──► chunks + finalize → Session 2 closed
+    └──► chunks + finalize → Session 3 closed
+```
+
+**Result:** 1 folder with 3 files = 3 separate sessions. The folder session does **NOT** close "after all files are uploaded" — each file's session closes independently after its own finalize call.
+
+**How folder creation works** ([`file_services.py`](server/src/services/file_services.py)):
+- `initialize_upload()` calls `_get_folder_tree(db, user, payload.relative_path, payload.filename)` (line 306)
+- `_get_folder_tree()` (line 116) parses the `relative_path`, strips the filename from the end, and creates `Folder` rows in PostgreSQL (not Redis) for each path segment
+- The `folder_id` is stored in the Redis session metadata, so `finalize_upload()` knows which folder to attach the file to
+- Folder creation is a **database operation**, not a session operation — folders persist in PostgreSQL regardless of whether the upload session succeeds
+
+---
+
+### Multiple Folders Upload (e.g., 2 folders selected)
+
+If the user selects multiple folders (e.g., `data/` with 2 files and `logs/` with 1 file), the behavior is identical — every file across all folders gets its own session:
+
+```
+User selects 2 folders:
+  data/file1.csv
+  data/file2.json
+  logs/access.log
+    │
+    ├──► init(filename="file1.csv",  relative_path="data/file1.csv")   → Session 1
+    ├──► init(filename="file2.json", relative_path="data/file2.json")  → Session 2
+    └──► init(filename="access.log", relative_path="logs/access.log")  → Session 3
+    │
+    ▼
+    ├──► chunks + finalize → Session 1 closed (folder "data" created/reused in DB)
+    ├──► chunks + finalize → Session 2 closed (folder "data" reused in DB)
+    └──► chunks + finalize → Session 3 closed (folder "logs" created in DB)
+```
+
+**Result:** 2 folders with 3 total files = 3 separate sessions. There is no "folder session" that groups files from the same folder. Each file is completely independent.
+
+---
+
+### Summary Table
+
+| Scenario | Files | Sessions Created | Session Closes When |
+|---|---|---|---|
+| **1 file** | 1 | 1 | That file's finalize is called |
+| **3 files** (no folder) | 3 | 3 | Each file's finalize is called independently |
+| **1 folder** (3 files inside) | 3 | 3 | Each file's finalize is called independently |
+| **2 folders** (2 + 1 files) | 3 | 3 | Each file's finalize is called independently |
+| **5 folders** (10 files total) | 10 | 10 | Each file's finalize is called independently |
+
+### Key Takeaways
+
+1. **1 file = 1 session, always.** The number of sessions equals the number of files, regardless of folder structure.
+2. **Sessions are independent.** If one file fails, other files' sessions are unaffected.
+3. **Sessions are per-file, not per-folder.** There is no folder-level session. Folders are created as database rows (`Folder` model in PostgreSQL) during `initialize_upload()`, not as Redis sessions.
+4. **Sessions are per-file, not per-batch.** There is no batch/group session. Selecting 10 files at once creates 10 independent sessions.
+5. **Session lifecycle is Redis-based.** The session exists only in Redis (meta + bitmap + chunk_hashes keys). It is created at init, updated during chunk uploads, and destroyed at finalize or TTL expiry.
+6. **Folder structure is PostgreSQL-based.** Folders persist in the `folders` table. They are created during init and linked during finalize via the `dataset_folder_files_mapping` table. They are not part of the ephemeral Redis session.
+
+---
+
+## FTP Bulk Ingestion (v4.0) — Server-to-Server Dropzone Watcher
+
+The third ingestion category, **s2s (server-to-server)**, handles files dropped via FTP (e.g., FileZilla → `alpine-ftp-server` → shared Docker volume → FastAPI backend).
+
+### Ingestion Categories Summary
+
+| Category | Label | Path | Implementation |
+|----------|-------|------|----------------|
+| Local HTTP upload | c2s | Client → Server | `file_services.py` — chunked 3-phase protocol (init → chunk → finalize) |
+| Cloud provider | c2s2s | Client → Google/Microsoft → Server | `gdrive_service.py`, `sharepoint_service.py` — OAuth streaming |
+| **FTP drop** | **s2s** | **Server → Server** | **`ftp_watcher.py` — background daemon thread polling the dropzone** |
+
+### How It Works
+
+The `ftp_watcher.py` service runs as a daemon thread launched during FastAPI lifespan (alongside `cleanup_scheduler.py`). It uses only standard Python libraries: `os`, `time`, `pathlib`, `hashlib`, `threading`, and `shutil`.
+
+**Thread Management:**
+- Singleton daemon thread (`ftp-dropzone-watcher`) managed by `_watcher_thread` + `_watcher_lock` — same pattern as `cleanup_scheduler.py`.
+- `start_ftp_watcher()` is called in the FastAPI lifespan context manager after `start_cleanup_scheduler()`.
+- `_ftp_watch_loop()` runs `while True` with `time.sleep(FTP_POLL_INTERVAL_SECONDS)` between scan cycles.
+
+**Safety Checks:**
+- Files with extensions `.filepart` or `.tmp` are skipped — these indicate an incomplete FTP transfer.
+- Files with `mtime` within the last `FTP_SAFETY_DELAY_SECONDS` (default: 5s) are skipped — this guarantees FileZilla has finished writing the file.
+
+**Database Sessions:**
+- Uses `get_session_local()()` to create standalone SQLAlchemy sessions (not the FastAPI `get_db()` generator). This is necessary because the watcher runs on a background thread, not within a FastAPI request context.
+- Each file ingestion operates in its own DB session and transaction. A failed file does `db.rollback()`, and the next file gets a fresh session.
+
+**Per-File Ingestion Logic (`_ingest_ftp_file`):**
+1. **Resolve User**: Parse `{username}` from the directory path and query the `users` table. Log error and skip if user doesn't exist.
+2. **Compute SHA-256**: Read file bytes using 8 MiB chunked reads for large file support.
+3. **Deduplication Check (Zero I/O)**: Query `uploaded_files` by `master_hash`.
+   - **New file**: `shutil.move()` to `UPLOAD_STORAGE_DIR/files/FTP/{filename}`. Collision handling appends `(1)`, `(2)`, etc. Insert a new `UploadedFile` row with `source_type='FTP'`.
+   - **Duplicate**: Delete the dropzone copy and reuse the existing `file_id`.
+4. **Dataset**: Get or create a `Dataset` named `"FTP Drops"` for this user (case-insensitive lookup with `func.lower()`).
+5. **Mapping**: Insert via `pg_insert(DatasetFolderFilesMapping).on_conflict_do_nothing(constraint="uq_dataset_folder_file")` for idempotency.
+6. **Commit**: `db.commit()` on success; `db.rollback()` on any exception.
+
+**Error Isolation:**
+- Each file is wrapped in its own `try/except` block. A single bad file (corrupted, permission denied, missing user) never crashes the watcher or blocks other files.
+- The outer scan cycle is also wrapped in `try/except`. Scan-level errors (e.g., dropzone directory deleted) are logged and the loop continues.
+
+**Environment Variables:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FTP_STORAGE_DIR` | `FTP` | Subdirectory name under `files/` for FTP storage |
+| `FTP_DROPZONE_PATH` | `ftp_dropzone` | Subdirectory under `UPLOAD_STORAGE_DIR` for incoming drops |
+| `FTP_POLL_INTERVAL_SECONDS` | `10` | Polling interval between scan cycles |
+| `FTP_SAFETY_DELAY_SECONDS` | `5` | Minimum file age before ingestion (to avoid reading mid-write) |
+
+**Final Storage Path:**
+`UPLOAD_STORAGE_DIR / FINAL_ROOT / FTP_STORAGE_DIR / {filename}` → e.g., `uploads/files/FTP/report.pdf`
+
+---
+
+## Module 1 Testing Addendum — Authentication & Security Gateway (2026-07-30)
+
+### Bug Found & Fixed: Timezone-naive Datetime Comparison
+
+**Component:** [`src/services/auth_services.py`](file:///d:/Zenteiq/Tasks/File_Ingestion/server/src/services/auth_services.py)
+
+**Functions affected:** `verify_otp()` and `reset_password()`
+
+**The Problem:**
+
+SQLAlchemy's `DateTime(timezone=True)` column stores UTC datetimes correctly in PostgreSQL. However, SQLite (used in testing) silently strips timezone info from datetime objects when reading them back. This caused the expiry check `user.otp_code_expires_at <= _now()` to raise `TypeError: can't compare offset-naive and offset-aware datetimes` in any environment where the datetime is read back as offset-naive (SQLite, some legacy PG configurations).
+
+**The Fix:**
+
+A new helper `_ensure_utc(dt: datetime) -> datetime` was added to `auth_services.py`. It attaches `UTC` to any naive datetime via `dt.replace(tzinfo=UTC)`, and is a no-op for already-aware datetimes. It is called before all expiry comparisons:
+
+```python
+# verify_otp
+if _ensure_utc(user.otp_code_expires_at) <= _now():
+    raise HTTPException(400, "OTP has expired")
+
+# reset_password
+if _ensure_utc(user.password_reset_expires_at) <= _now():
+    raise HTTPException(400, "Reset token has expired")
+```
+
+**Why this is safe for production:** PostgreSQL with `timezone=True` always returns timezone-aware datetimes. `_ensure_utc()` on an aware datetime returns it unchanged. There is zero regression risk.
+
+### Testing Architecture Choices Explained
+
+**Why in-memory SQLite instead of PostgreSQL for tests:**
+- Zero external infrastructure dependency — tests run in CI without Docker/Postgres
+- SQLAlchemy ORM layer abstracts the backend; all business logic is database-agnostic
+- The only meaningful difference (DateTime timezone stripping) was found, fixed, and documented above
+
+**Why FakeRedis instead of real Redis:**
+- Redis is used in `issue_token_pair` (Lua script `ACTIVE_SESSION_LIMITER_LUA`) and `resolve_refresh_user` (ZSET lookup)
+- `FakeRedis` implements the exact same ZSET operations: `ZADD`, `ZSCORE`, `ZCARD`, `ZREM`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYRANK`, `DELETE`, `EXPIRE`
+- `make_fake_limiter()` mimics the Lua atomic script faithfully in pure Python for test isolation
+```
+
+5. Check `http://localhost:8000/v1/health` and `http://localhost:5173`.
+6. For a real end-to-end upload, use the backend upload endpoints directly. The current `client/src/pages/Home.tsx` uses `fakeUpload()` and local storage for progress/history rather than calling `/v1/upload/init`, `/chunk`, or `/finalize`.
+7. Be aware that `client/src/pages/auth/CreateAccount.tsx` calls `/auth/register`, while the implemented backend route is `/auth/signup/init`; this frontend/backend route mismatch must be corrected before the UI registration flow can work.
+
+## 7. Session Handling for File and Folder Uploads
+
+### Core Rule: 1 File = 1 Session
+
+This project uses a **per-file session model**. Every single file that is uploaded gets its own independent upload session. There is **no batch session**, **no folder-level session**, and **no group session** that wraps multiple files together.
+
+An "upload session" is the lifecycle of one file going through three API calls:
+
+1. **`POST /v1/upload/init`** → creates the session (returns a unique `upload_id`)
+2. **`POST /v1/upload/chunk`** (called N times) → sends chunks tied to that `upload_id`
+3. **`POST /v1/upload/finalize`** → assembles chunks, persists the file, and **destroys the session**
+
+Each session is stored in **Redis** under keys namespaced by `upload_id`:
+- `upload:{upload_id}:meta` — hash map with user_id, dataset_id, filename, filesize, master_hash, folder_id, total_chunks
+- `upload:{upload_id}:bitmap` — bitmap tracking which chunks have been received
+- `upload:{upload_id}:chunk_hashes` — hash map of chunk_index → SHA-256 hash
+
+Each session has a **TTL** (`UPLOAD_SESSION_TTL_SECONDS`, default 3600 seconds / 1 hour). If a session is not finalized before the TTL expires, Redis auto-deletes the keys and the background cleanup scheduler removes the orphaned `.parts` directory.
+
+The session **closes** (Redis keys are deleted) in two ways:
+- **Success**: `finalize_upload()` explicitly calls `redis_server.delete()` on the meta, bitmap, and chunk_hashes keys after the file is assembled and the database mapping is committed.
+- **Expiry/Abandonment**: Redis TTL expires, and the cleanup daemon (`cleanup_scheduler.py`) purges the leftover `.parts` directory on the filesystem.
+
+---
+
+### Single File Upload
+
+```
+User selects 1 file
+    │
+    ▼
+POST /v1/upload/init  →  Session A created (upload_id = "aaa")
+    │
+    ▼
+POST /v1/upload/chunk (×N chunks, all for upload_id "aaa")
+    │
+    ▼
+POST /v1/upload/finalize (upload_id "aaa")  →  Session A closed
+```
+
+**Result:** 1 file = 1 session created, 1 session closed.
+
+---
+
+### Multiple Files Upload (e.g., 3 files selected at once)
+
+When the user selects 3 files from the file picker, the client calls `POST /v1/upload/init` **separately for each file**. There is no single "batch init" endpoint.
+
+```
+User selects 3 files (A.pdf, B.csv, C.txt)
+    │
+    ├──► POST /v1/upload/init (A.pdf)  →  Session 1 (upload_id = "aaa")
+    ├──► POST /v1/upload/init (B.csv)  →  Session 2 (upload_id = "bbb")
+    └──► POST /v1/upload/init (C.txt)  →  Session 3 (upload_id = "ccc")
+    │
+    ▼  (chunks are sent independently for each session, can run in parallel)
+    ├──► chunks for "aaa" → finalize "aaa"  →  Session 1 closed
+    ├──► chunks for "bbb" → finalize "bbb"  →  Session 2 closed
+    └──► chunks for "ccc" → finalize "ccc"  →  Session 3 closed
+```
+
+**Result:** 3 files = 3 separate sessions. Each session opens and closes independently. If file B fails mid-upload, sessions for A and C are unaffected.
+
+**Key code evidence** ([`file_services.py`](server/src/services/file_services.py)):
+- `initialize_upload()` (line 286) takes a single `UploadInitRequest` containing one `filename`, one `filesize`, one `master_hash` → creates one `upload_id`
+- `process_upload_chunk()` (line 391) processes one chunk for one `upload_id`
+- `finalize_upload()` (line 449) finalizes one `upload_id` → deletes that one session
+
+There is no request schema or service function that accepts a list of files or returns multiple upload IDs.
+
+**Client-side evidence** ([`Home.tsx`](client/src/pages/Home.tsx)):
+- `handleFilesSelected()` (line 149) iterates over `selectedFiles` with `Array.from(selectedFiles).forEach(...)` and calls `uploadFileChunks(file, id)` individually for each file
+- Each file gets its own unique `id` and its own independent upload progress tracking
+
+---
+
+### Single Folder Upload
+
+When a user uploads a folder (e.g., `reports/` containing `report1.pdf`, `report2.csv`, `report3.txt`), the browser sends all files with their `webkitRelativePath` (e.g., `reports/report1.pdf`). The client iterates over these files and creates one upload session per file.
+
+The folder structure is not handled at the session level — it is handled at the **`/v1/upload/init`** level through the `relative_path` field in `UploadInitRequest`.
+
+```
+User selects folder "reports/" containing 3 files
+    │
+    ├──► init(filename="report1.pdf", relative_path="reports/report1.pdf")  → Session 1
+    ├──► init(filename="report2.csv", relative_path="reports/report2.csv")  → Session 2
+    └──► init(filename="report3.txt", relative_path="reports/report3.txt") → Session 3
+    │
+    ▼  (each file uploads independently)
+    ├──► chunks + finalize → Session 1 closed
+    ├──► chunks + finalize → Session 2 closed
+    └──► chunks + finalize → Session 3 closed
+```
+
+**Result:** 1 folder with 3 files = 3 separate sessions. The folder session does **NOT** close "after all files are uploaded" — each file's session closes independently after its own finalize call.
+
+**How folder creation works** ([`file_services.py`](server/src/services/file_services.py)):
+- `initialize_upload()` calls `_get_folder_tree(db, user, payload.relative_path, payload.filename)` (line 306)
+- `_get_folder_tree()` (line 116) parses the `relative_path`, strips the filename from the end, and creates `Folder` rows in PostgreSQL (not Redis) for each path segment
+- The `folder_id` is stored in the Redis session metadata, so `finalize_upload()` knows which folder to attach the file to
+- Folder creation is a **database operation**, not a session operation — folders persist in PostgreSQL regardless of whether the upload session succeeds
+
+---
+
+### Multiple Folders Upload (e.g., 2 folders selected)
+
+If the user selects multiple folders (e.g., `data/` with 2 files and `logs/` with 1 file), the behavior is identical — every file across all folders gets its own session:
+
+```
+User selects 2 folders:
+  data/file1.csv
+  data/file2.json
+  logs/access.log
+    │
+    ├──► init(filename="file1.csv",  relative_path="data/file1.csv")   → Session 1
+    ├──► init(filename="file2.json", relative_path="data/file2.json")  → Session 2
+    └──► init(filename="access.log", relative_path="logs/access.log")  → Session 3
+    │
+    ▼
+    ├──► chunks + finalize → Session 1 closed (folder "data" created/reused in DB)
+    ├──► chunks + finalize → Session 2 closed (folder "data" reused in DB)
+    └──► chunks + finalize → Session 3 closed (folder "logs" created in DB)
+```
+
+**Result:** 2 folders with 3 total files = 3 separate sessions. There is no "folder session" that groups files from the same folder. Each file is completely independent.
+
+---
+
+### Summary Table
+
+| Scenario | Files | Sessions Created | Session Closes When |
+|---|---|---|---|
+| **1 file** | 1 | 1 | That file's finalize is called |
+| **3 files** (no folder) | 3 | 3 | Each file's finalize is called independently |
+| **1 folder** (3 files inside) | 3 | 3 | Each file's finalize is called independently |
+| **2 folders** (2 + 1 files) | 3 | 3 | Each file's finalize is called independently |
+| **5 folders** (10 files total) | 10 | 10 | Each file's finalize is called independently |
+
+### Key Takeaways
+
+1. **1 file = 1 session, always.** The number of sessions equals the number of files, regardless of folder structure.
+2. **Sessions are independent.** If one file fails, other files' sessions are unaffected.
+3. **Sessions are per-file, not per-folder.** There is no folder-level session. Folders are created as database rows (`Folder` model in PostgreSQL) during `initialize_upload()`, not as Redis sessions.
+4. **Sessions are per-file, not per-batch.** There is no batch/group session. Selecting 10 files at once creates 10 independent sessions.
+5. **Session lifecycle is Redis-based.** The session exists only in Redis (meta + bitmap + chunk_hashes keys). It is created at init, updated during chunk uploads, and destroyed at finalize or TTL expiry.
+6. **Folder structure is PostgreSQL-based.** Folders persist in the `folders` table. They are created during init and linked during finalize via the `dataset_folder_files_mapping` table. They are not part of the ephemeral Redis session.
+
+---
+
+## Module 1 Testing Addendum — Authentication & Security Gateway (2026-07-30)
+
+### Bug Found & Fixed: Timezone-naive Datetime Comparison
+
+**Component:** [`src/services/auth_services.py`](file:///d:/Zenteiq/Tasks/File_Ingestion/server/src/services/auth_services.py)
+
+**Functions affected:** `verify_otp()` and `reset_password()`
+
+**The Problem:**
+
+SQLAlchemy's `DateTime(timezone=True)` column stores UTC datetimes correctly in PostgreSQL. However, SQLite (used in testing) silently strips timezone info from datetime objects when reading them back. This caused the expiry check `user.otp_code_expires_at <= _now()` to raise `TypeError: can't compare offset-naive and offset-aware datetimes` in any environment where the datetime is read back as offset-naive (SQLite, some legacy PG configurations).
+
+**The Fix:**
+
+A new helper `_ensure_utc(dt: datetime) -> datetime` was added to `auth_services.py`. It attaches `UTC` to any naive datetime via `dt.replace(tzinfo=UTC)`, and is a no-op for already-aware datetimes. It is called before all expiry comparisons:
+
+```python
+# verify_otp
+if _ensure_utc(user.otp_code_expires_at) <= _now():
+    raise HTTPException(400, "OTP has expired")
+
+# reset_password
+if _ensure_utc(user.password_reset_expires_at) <= _now():
+    raise HTTPException(400, "Reset token has expired")
+```
+
+**Why this is safe for production:** PostgreSQL with `timezone=True` always returns timezone-aware datetimes. `_ensure_utc()` on an aware datetime returns it unchanged. There is zero regression risk.
+
+### Testing Architecture Choices Explained
+
+**Why in-memory SQLite instead of PostgreSQL for tests:**
+- Zero external infrastructure dependency — tests run in CI without Docker/Postgres
+- SQLAlchemy ORM layer abstracts the backend; all business logic is database-agnostic
+- The only meaningful difference (DateTime timezone stripping) was found, fixed, and documented above
+
+**Why FakeRedis instead of real Redis:**
+- Redis is used in `issue_token_pair` (Lua script `ACTIVE_SESSION_LIMITER_LUA`) and `resolve_refresh_user` (ZSET lookup)
+- `FakeRedis` implements the exact same ZSET operations: `ZADD`, `ZSCORE`, `ZCARD`, `ZREM`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYRANK`, `DELETE`, `EXPIRE`
+- `make_fake_limiter()` mimics the Lua atomic script faithfully in pure Python for test isolation
+- This means session cap enforcement, sid eviction, and token version mismatch are all fully tested in memory
+
+**Why OTP tests use `"123456"`:**
+- `generate_otp_code()` in `helpers/jwt.py` is intentionally hardcoded to `"123456"` for dev/test mode (line 210)
+- All OTP integration and unit tests depend on this known value
+- If the OTP is changed to `secrets.choice(...)` in production, tests will need to mock `generate_otp_code` — this is documented as a known future action
+
+### Module 1 Test Coverage Summary
+
+| Area | Tested | Key Assertions |
+|------|--------|---------------|
+| User creation | ✅ | Persistence, dedup email, dedup username |
+| Authentication | ✅ | Valid creds, wrong password, unverified, unknown |
+| Token issuance | ✅ | JWT shape, Redis ZSET session entry created |
+| Session limit | ✅ | max_sessions cap enforced by Lua limiter |
+| Refresh resolution | ✅ | Valid sid, evicted sid, stale token_version |
+| Access token | ✅ | Valid, expired, revoked version |
+| OTP flow | ✅ | Correct, expired, wrong code, rate-limit (429) |
+| Password reset | ✅ | Valid, expired token, invalid token |
+| Session revocation | ✅ | Redis ZSET entry removed on logout |
+| JWT crypto | ✅ | PBKDF2 round-trip, tampered sig, wrong type |
+| HTTP endpoints | ✅ | All 13 handlers, 22 scenarios, dual-mount alias |
+
+---
+
+## Module 2 Testing Addendum — Dataset & Virtual Folder Management (2026-07-30)
+
+### Dataset Catalog Architecture (Test-Verified)
+
+The `Dataset` model acts as a catalog container that groups `UploadedFile` records via `DatasetFolderFilesMapping`. Key behaviors confirmed by testing:
+
+**1. Name uniqueness is per-user and case-insensitive.**
+`create_dataset()` uses `func.lower(Dataset.name) == payload.name.strip().lower()` scoped to `user_id`. Two different users may have identically-named datasets.
+
+**2. Dataset status is a lifecycle state machine.**
+The allowed transitions are: `Created → Draft`, `Created → Completed`, `Draft → Completed`. The `Completed` state is terminal — no transitions out. `_normalize_dataset_status()` maps case-variant inputs (`"created"`, `"in progress"`) to canonical values.
+
+**3. `DELETE /v1/datasets/{id}` is a hard delete, not a soft delete.**
+Despite the `is_deleted` boolean column on the `Dataset` model, `delete_dataset()` calls `db.delete(dataset)` — permanently removing the row and cascading to all `DatasetFolderFilesMapping` rows and their referenced `UploadedFile` physical file records.
+
+**4. IDOR protection is enforced at the service layer.**
+`attach_file_to_dataset()` performs an explicit ownership check: it queries `DatasetFolderFilesMapping` filtering by `user_id` + `file_id`. If the user has no existing mapping to the file, the request is rejected with 403 (file exists globally) or 404 (file doesn't exist at all). This prevents cross-user file access even when a file's `id` is known.
+
+### Virtual Folder Tree Architecture (Test-Verified)
+
+**Folder creation is idempotent.** `_get_folder_tree()` walks each path segment and does `one_or_none()` before creating a new `Folder`. The unique constraint `uq_user_parent_name` on `(user_id, parent_id, name)` further prevents duplicates at the DB level.
+
+**Path security is validated on input.** `_validate_relative_path()` rejects:
+- Absolute paths (starting with `/`) → HTTP 400
+- Traversal segments (`..`) → HTTP 400
+- Null/empty strings → returns `[]` (no folder creation)
+
+**Filename stripping:** `_resolve_folder_parts()` strips the last segment if it matches the `filename` argument — this prevents treating the file's own name as a folder segment when the client passes the full path including filename.
+
+### Known SQLite Limitation (Documented for Module 3)
+
+`finalize_upload()` in `file_services.py` uses:
+```python
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+stmt = pg_insert(DatasetFolderFilesMapping).values(...).on_conflict_do_nothing(constraint="uq_dataset_folder_file")
+```
+This PostgreSQL-specific `INSERT ... ON CONFLICT DO NOTHING` statement raises `CompileError` on SQLite. The finalization path (Module 3) requires a dedicated test strategy (e.g., mocking `db.execute(stmt)` or using a Postgres test container).
+
+### Module 2 Test Coverage Summary
+
+| Area | Tested | Key Assertions |
+|------|--------|---------------|
+| Dataset creation | ✅ | Persistence, dedup name (case-insensitive), cross-user isolation |
+| Dataset listing | ✅ | User filter, soft-delete exclusion, pagination, completed exclusion |
+| Dataset fetch by ID | ✅ | Ownership check, not-found, soft-delete as 404 |
+| Dataset update | ✅ | Rename, dedup check, same-name no-op, status transitions, description |
+| Dataset delete | ✅ | Hard delete, cascade to mappings, ownership guard |
+| File attach (zero-I/O) | ✅ | Happy path, IDOR (403/404), completed dataset guard |
+| Folder tree creation | ✅ | Nested hierarchy, idempotency, None path |
+| Path validation | ✅ | Absolute path (400), traversal (400), empty (no-op) |
+| Status normalization | ✅ | 6 parameterized cases |
+| Status sync | ✅ | 0 files→Created, ≥1 file→Draft, Completed never downgraded |
+| User integrations | ✅ | No tokens, both tokens, blank token |
+| HTTP endpoints | ✅ | 25 integration tests covering all 5 endpoint handlers |
+
+---
+
+## Module 3 Testing Addendum — Chunked File Upload Engine (2026-07-30)
+
+### Upload Engine Architecture (Test-Verified)
+
+The upload engine is a three-phase stateful protocol: `init → chunk(s) → finalize`. Session state is stored exclusively in **Redis** (not PostgreSQL) until finalize commits. Below are the key architectural facts verified by testing:
+
+**1. `master_hash` is the global file deduplication key.**
+`UploadedFile.master_hash` has a database-level `UNIQUE` constraint. This is not just a logical constraint — inserting two rows with the same hash will raise `IntegrityError`. The `initialize_upload()` function queries for an existing file by hash before creating any session, implementing three-path dedup logic.
+
+**2. `initialize_upload()` has exactly three outcomes:**
+- `created` — no existing file with this hash → standard upload flow begins
+- `duplicate_suspected` — hash exists globally but this user/dataset/folder combo has no mapping → fast-link path, no chunk uploads needed
+- `duplicate_short_circuit` — exact user/dataset/folder/hash mapping already exists → upload is silently a no-op; client should use existing file_id
+
+**3. Chunk integrity is doubly enforced:**
+- Per-chunk SHA-256 hash validation on receipt (`chunk_hash` header vs computed hash of incoming bytes)
+- Master hash re-validation on finalize (`master_hash` from request vs stored in Redis meta)
+
+**4. Chunk deduplication is atomic (Lua script):**
+`ATOMIC_CHUNK_STATE_LUA` uses `GETBIT/SETBIT` atomically — if a chunk index's bit is already set (chunk already received), the script returns `1` (skip) without re-writing. This is idempotent: re-uploading the same chunk is safe and does not corrupt progress.
+
+**5. File assembly uses `shutil.copyfileobj` over sorted chunk parts:**
+`finalize_upload()` (Path B — new file) sorts `.parts/{upload_id}/` by filename (zero-padded `{chunk_index:06d}.part`), streams them in order into the final destination, then unlinks the parts directory.
+
+**6. `delete_user_upload` does NOT check `UploadedFile.user_id`:**
+`UploadedFile` has no `user_id` column. Ownership is determined by querying `DatasetFolderFilesMapping WHERE file_id AND user_id`. If no mapping exists for the requesting user, the response is 404 (not 403) — this is by design to avoid leaking file existence information.
+
+**7. `list_user_uploads` never raises 404 for unknown datasets:**
+`_build_tree()` filters by `user_id` (and optionally `dataset_id`). If `dataset_id` refers to a non-existent or foreign dataset, the query simply returns 0 rows and the root folder node has no children. No exception is raised.
+
+### pg_insert SQLite Workaround (Test Strategy)
+
+`finalize_upload` calls:
+```python
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+stmt = pg_insert(DatasetFolderFilesMapping).values(...).on_conflict_do_nothing(...)
+db.execute(stmt)
+```
+
+This is PostgreSQL-specific. In the test suite, `file_services.pg_insert` is monkeypatched with a SQLite-compatible wrapper:
+
+```python
+def sqlite_insert(table):
+    class _Proxy:
+        def values(self, **kw): ...          # delegates to sa_insert
+        def on_conflict_do_nothing(self, **kw): return self._stmt  # no-op
+    return _Proxy(sa_insert(table))
+```
+
+The `on_conflict_do_nothing` is silently dropped. This is safe in tests because:
+- The test constructs scenarios where no actual duplicate is inserted during finalize
+- The UNIQUE constraint (`uq_dataset_folder_file`) is not violated in the test scenarios
+- Production PostgreSQL behavior (silently skipping duplicates) is not altered
+
+### Test Defect Found & Fixed
+
+**Test:** `I-C-02 — test_upload_init_duplicate_short_circuit` (integration)  
+**Error:** `IntegrityError: UNIQUE constraint failed: uploaded_files.master_hash`  
+**Cause:** Test inserted a second `UploadedFile` with the same `master_hash` as an already-seeded file — violating the UNIQUE constraint on `master_hash`. The test logic was flawed: the duplicate_short_circuit path only requires an existing **mapping**, not a second file row.  
+**Fix:** Used a unique hash for the seeded file; created only the `DatasetFolderFilesMapping` row pointing to it. No production code was changed.
+
+### Module 3 Test Coverage Summary
+
+| Area | Tested | Key Assertions |
+|------|--------|---------------|
+| `_compute_total_chunks` | ✅ | Exact, remainder, small file |
+| `_hash_bytes` | ✅ | SHA-256 correctness, determinism |
+| Redis key helpers | ✅ | `meta`, `bitmap`, `chunk_hashes` key format |
+| `initialize_upload` | ✅ | All 3 dedup paths, 404 on missing dataset, 400 on Completed |
+| `process_upload_chunk` | ✅ | Happy path, 404/403/400 guards, hash mismatch, duplicate chunk idempotency |
+| `finalize_upload` | ✅ | Fast-link path, 404/403/400/409 guards, master_hash mismatch, linked_file missing |
+| `delete_user_upload` | ✅ | Happy path + filesystem cleanup, 404 for missing/unowned |
+| `list_user_uploads` | ✅ | Empty tree, root file, folder file, dataset filter, non-existent ds |
+| FakeAtomicChunkState | ✅ | Returns 0 first call, 1 on duplicate (dedup verified) |
+| HTTP endpoints | ✅ | 25 integration tests: all 5 endpoints, round-trip, auth/ownership/hash guards |
+
+---
+
+### External FTP Pull Ingestion (v3.3) — Component 1: The Gatekeeper Technical Details
+
+#### Architecture & Data Flow
+
+```
+Client (React)
+    │  POST /v1/ingest/ftp/connect (host, port, username, password, allow_insecure, duration...)
+    ▼
+FastAPI Router (ftp_routes.py)
+    │  _resolve_current_user() → User
+    ▼
+FTP Service (ext_ftp_service.py)
+    ├──► 1. _check_rate_limit(user_id)
+    │       Redis INCR ext_ftp:rate:{user_id} (Window=300s, Max=5)
+    │       Raises 429 FtpRateLimitError if exceeded
+    │
+    ├──► 2. _probe_ftp_connection(host, port, username, password, allow_insecure)
+    │       ftplib.FTP_TLS probe → auth() → prot_p() → login()
+    │       If TLS fails & allow_insecure=True → fallback ftplib.FTP
+    │       Raises 400 FtpTlsRejectedError, 401 FtpAuthError, 504 FtpConnectionError
+    │
+    ├──► 3. Fernet Credential Encryption (fernet_vault.py)
+    │       fernet_encrypt(password) → FERNET_KEY (32-byte url-safe base64)
+    │
+    └──► 4. Redis Credential Vault Storage
+            SET ext_ftp:creds:{user_id} payload JSON (ex=1800s idle TTL)
+            Returns FtpConnectResponse (host, username, protocol, state, idle_ttl, expiry)
+```
+
+#### Stateful Disconnect Flows
+
+```
+POST /v1/ingest/ftp/disconnect?force=false (Normal Disconnect / Graceful Draining)
+    │
+    ├──► Active FTP jobs == 0  ──► Wipe Redis ext_ftp:creds:{user_id} ──► 200 OK
+    └──► Active FTP jobs > 0   ──► Set state="draining" in Redis     ──► 409 Conflict (FtpSessionDrainingError)
+
+POST /v1/ingest/ftp/disconnect?force=true (Force Nuke)
+    │
+    ├──► Cancel all pending/in_progress AsyncIngestionJob (provider="external_ftp")
+    ├──► If delete_completed_files=true:
+    │       Delete DatasetFolderFilesMapping rows for user
+    │       Check SELECT COUNT(*) on DatasetFolderFilesMapping for each file_id
+    │       If ref_count == 0 ──► os.remove(physical_path) + delete UploadedFile row
+    └──► Wipe Redis ext_ftp:creds:{user_id} ──► 200 OK
+```
+

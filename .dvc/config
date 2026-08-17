@@ -1,0 +1,4 @@
+[core]
+    remote = mylocal_dir
+['remote "mylocal_dir"']
+    url = ../dvc-documents

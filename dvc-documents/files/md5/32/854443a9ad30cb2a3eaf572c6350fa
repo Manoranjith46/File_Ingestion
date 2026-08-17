@@ -1,0 +1,493 @@
+PLAN UPDATES
+
+### **PHASE 0 INSTRUCTIONS: Local Ingestion Patch & Enum Standardization**
+
+**Objective:** Standardize all provider origin labels across the database and implement the Challenge-Response Virtual Deduplication logic into the existing Local Upload pipeline before starting the FTP build.
+
+#### **Update 1: Provider / Source Enum Standardization**
+
+Currently, the labels indicating where a file came from are inconsistent. We are enforcing a strict standard across all endpoints and database models.
+
+* **The Allowed Values:** `"FTP"`, `"Local"`, `"GDrive"`, `"SharePoint"`
+* **Database Updates Required:**
+* In the `async_ingestion_jobs` table, update the constraints/Enums for the `provider` column to only accept these exact string values.
+* In the `uploaded_files` table, update the constraints/Enums for the `source_type` column to match.
+
+
+* **Schema Updates:** Ensure any Pydantic request/response models related to jobs or uploads reflect this standardized Enum.
+
+#### **Update 2: Virtual Deduplication for Local Uploads (`POST /v1/upload/init`)**
+
+We are porting the collision detection logic designed for the FTP pipeline into the existing Local Ingestion pipeline to maintain a unified user experience.
+
+* **Target Endpoint:** `POST /v1/upload/init`
+* **Request Payload Modification:** Add an optional boolean flag `auto_rename` (default: `false`) to the Pydantic schema.
+```json
+{
+  "dataset_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "target_folder_id": "8b9a2c1d-...",
+  "auto_rename": false,
+  "items": [
+    {
+      "filename": "report.pdf",
+      "size_bytes": 1048576
+    }
+  ]
+}
+
+```
+
+
+* **Backend Logic:**
+1. Before generating the local upload chunking IDs, query the `dataset_folder_files_mapping` table.
+2. Check if `report.pdf` already exists within that specific `dataset_id` and `target_folder_id`.
+3. **If a collision exists and `auto_rename` is `false`:** Abort the initialization and return a `409 Conflict`.
+4. **If a collision exists and `auto_rename` is `true`:** Dynamically rename the file (e.g., `report (1).pdf`), proceed with initialization, and return the `201/202` success response.
+
+
+* **Response Error (409 Conflict - Name Collision):**
+```json
+{
+  "detail": "Filename collision detected",
+  "conflict_type": "name_exists",
+  "conflicting_files": ["report.pdf"],
+  "suggestion": "report (1).pdf"
+}
+
+```
+
+
+
+**Completion Gate:** Once this Phase 0 code is written, you must write/update the Unit and Integration tests for `/v1/upload/init` to ensure the `409 Conflict` is correctly triggered before asking for permission to proceed to Phase 1.
+
+
+High-Level Design (HLD): External FTP Pull Ingestion
+This architecture relies on a highly resilient, asynchronous Server-to-Server (Pull) model. It separates the volatile live-action state from the permanent database ledger to guarantee UI fluidity under massive loads.
+1. The Client Layer (React Frontend)
+Authentication & Security Input: Collects FTP credentials and timer preferences, submitting them to the Gateway.
+Collision Resolution: Handles 409 Conflict responses from the backend during initialization by prompting users to rename files via an auto_rename flag.
+Batch Progress Polling: Fires a single HTTP request every 2–3 seconds to the GET /v1/ingest/status batch endpoint to update all active progress bars simultaneously without overloading the network.
+Stateful Disconnects: Provides users with UI controls to gracefully drain or forcefully abort ("Nuke") an active session.
+2. The Security Gateway (FastAPI Entry)
+Rate Limiter: Enforces a strict threshold (e.g., 5 attempts / 5 minutes) on the POST /v1/ingest/ftp/connect endpoint to neutralize brute-force attacks against sponsor servers.
+Strict TLS Enforcer: Rejects any external connection that attempts to silently downgrade to plaintext FTP, mandating ftplib.FTP_TLS.
+The Fernet Cryptographer: Encrypts incoming plain-text FTP passwords in RAM using AES-256 (Fernet) before passing them to the Vault.
+3. The Vault & Fast-Cache Layer (Redis)
+This layer operates entirely in-memory (AOF disabled) to ensure security and extreme read/write speeds.
+The Secure Vault (ext_ftp:creds:{user_id}): Stores the AES-encrypted FTP credentials alongside the session TTL timer. If the timer expires (e.g., 1800s idle), the vault self-destructs the credentials.
+The Live Progress Cache (ingest:{job_id}:progress): Acts as a high-speed scratchpad. Background workers blast live bytes_downloaded updates here every second, allowing the batch polling endpoint to fetch real-time data without querying the database.
+4. The Orchestration & Ledger Layer (PostgreSQL)
+This layer acts as the single source of truth for the file's permanent lifecycle and deduplication.
+The Job Ledger (async_ingestion_jobs): Strictly limited to two writes per file transfer (Start = pending, End = completed/failed).
+Virtual Deduplication Checker: During POST /v1/ingest/ftp/init, it queries the dataset_folder_files_mapping table to prevent users from accidentally overwriting files with the same name in the same target dataset folder.
+The Concurrency Manager: Implements a Two-Tier Semaphore lock. It caps concurrent threads per user (Tier 2) to protect the FastAPI thread pool, and caps concurrent connections per external IP (Tier 1) to prevent DDoS bans from the target server.
+5. The Execution Engine (Python ftplib Workers)
+The Streaming Data Pipe: Dedicated background threads decrypt the credentials, open a Passive Data Channel (PASV), and stream the file to the local disk (uploads/.parts/) in 8KB chunks.
+Stall Detector: Monitors the stream. If zero bytes are received for 180 seconds, it aggressively drops the socket, frees the concurrency semaphore, and logs the job as failed in the Ledger.
+6. The Recovery System (The Medic)
+Checkpoint Manifests (.manifest.json): Every 100MB, the worker writes a lightweight JSON file containing the exact byte offset and a cloned, serialized copy of the C-level SHA-256 hash state.
+Zero-Read Resumes: When a user triggers POST /v1/ingest/ftp/resume, the worker verifies the remote file size/timestamp. If unchanged, it instantly reloads the hash state from the manifest, issues the FTP REST command, and resumes downloading exactly where it failed—requiring zero disk reads.
+
+
+
+
+
+
+
+Low-Level Design (LLD): Detailed Execution Flow
+Here is the exact internal logic flow for the background execution, strictly omitting HTTP payloads and focusing on database state, caching, and Python thread orchestration.
+
+1. The Gateway Flow (Connection & Vaulting)
+Ingestion Entry: The FastAPI endpoint receives the target credentials.
+
+Security Barrier: The system checks the Redis rate limiter (max 5 requests per 5 minutes per IP) to block brute-force attempts.
+
+TLS Handshake: The server attempts a test connection enforcing ftplib.FTP_TLS[cite: 2, 6]. Plaintext connections are aggressively dropped unless an insecure flag is explicitly logged in the audit table[cite: 2, 6].
+
+Cryptographic Vaulting: The AES-256 Fernet cipher encrypts the password. The resulting ciphertext, along with the connection parameters, is written to the RAM-only Redis Vault (ext_ftp:creds:{user_id})[cite: 2, 6].
+
+Session Heartbeat: A decoupled asyncio task begins looping every 15 seconds. If active downloads exist, it refreshes the Redis TTL to 1800 seconds[cite: 2, 6]. If the queue is empty, the timer naturally expires, and Redis self-destructs the credentials[cite: 2, 6].
+
+
+2. The Dispatcher Flow (Queueing & Virtual Deduplication)
+Collision Query: Upon receiving an initialization request, FastAPI queries the dataset_folder_files_mapping table. It checks if the requested filename already exists within the isolated boundary of the target dataset_id and folder_id[cite: 1, 5, 6].
+
+Resolution: If a collision is found and auto-rename is false, the execution halts. If auto-rename is true, the system dynamically appends a numeric suffix (e.g., (1)) to the target filename.
+
+Ledger Commitment: The job is officially recorded in the async_ingestion_jobs PostgreSQL table with the status set to pending[cite: 2, 6].
+
+3. The Concurrency Engine (Thread Spawning & Limits)
+Tier 1 Lock (Host Protection): The background orchestrator evaluates a Redis semaphore (HostSemaphore) capped at a maximum of 4 concurrent connections per external target IP[cite: 2, 6].
+
+
+Tier 2 Lock (User Protection): Simultaneously, it evaluates a per-user semaphore (UserSemaphore) capped at 4 to prevent a single account from monopolizing the thread pool[cite: 2, 6].
+
+Thread Allocation: Once both semaphores clear, the job state transitions to in_progress[cite: 2, 6], and the system spawns a dedicated asyncio.to_thread worker for the blocking I/O[cite: 2, 6].
+
+4. The Streaming Engine (Data Pipe & Live Tracking)
+Decryption & Connection: The worker thread extracts and decrypts the Fernet password from Redis, establishing a passive data channel (PASV) via ftplib[cite: 2, 6].
+
+
+The Write Loop: The worker begins the 8KB stream[cite: 2, 6]. During every iteration of the loop, the 8KB block is written to uploads/.parts/{job_id}.part[cite: 2, 6] and simultaneously ingested by the sha256 object.
+
+
+Volatile Cache Updates: Every 1 second, the worker pushes the aggregated bytes_downloaded integer to a temporary Redis key (ingest:{job_id}:progress). This avoids flooding PostgreSQL with chunk-by-chunk update queries.
+
+Stall Detection: A monotonic clock records the timestamp of the last received byte. If 180 seconds elapse with zero bytes traversing the socket, the worker forces a connection abort, marks the database row as failed, and frees the semaphores[cite: 2, 6].
+
+
+5. The Medic Flow (Manifest Checkpoints & Resumes)
+State Snapshotting: At every 100MB milestone, the worker executes sha256_obj.copy() to clone the exact C-level memory state of the hash buffer[cite: 2, 6].
+
+
+Manifest Creation: It writes uploads/.parts/{job_id}.manifest.json to the disk, containing the current byte offset and the serialized hash state[cite: 2, 6].
+
+Zero-Read Restoration (On Retry): If a failed job is restarted, the worker verifies the remote file's modified time (MDTM) and size (SIZE)[cite: 2, 6]. If unchanged, it bypasses disk reads entirely, instantly reloads the hash state from the manifest JSON, issues the FTP REST {byte_offset} command, and resumes the 8KB stream precisely where it severed[cite: 2, 6].
+
+6. The Cleanup Flow (Physical Deduplication & Ref-Counting)
+Finalization: When the stream completes, the worker executes .hexdigest() to lock in the final master hash.
+
+
+Global Deduplication Verification: The system queries the uploaded_files table using the master hash[cite: 2, 6].
+
+
+If a match exists, the newly downloaded .part file is deleted from the disk.
+
+
+If no match exists, the .part file is committed to permanent storage, and a new row is inserted into uploaded_files[cite: 2, 6].
+
+Mapping: A new reference row is created in dataset_folder_files_mapping linking the user's dataset to the physical file[cite: 2, 6].
+
+Force Disconnect Safety: If a session is forcefully terminated mid-stream, the system executes a SELECT COUNT(*) on the mapping table[cite: 2, 6]. The physical disk cleanup (os.remove()) only triggers if the reference count evaluates to exactly 0, preventing accidental deletion of deduplicated assets belonging to other datasets[cite: 2, 6].
+
+
+
+1. The Gatekeeper: Session Management & Security
+This component handles securing the external credentials and managing the session lifecycle.
+
+A. POST /v1/ingest/ftp/connect
+Purpose: Authenticate and establish the encrypted Redis Vault session.
+
+
+Backend Logic:
+
+
+
+Apply Rate Limiting (5 requests / 5 mins per IP).
+
+
+Attempt a test connection using ftplib.FTP_TLS. If the external server rejects TLS, abort with 400 Bad Request.
+
+
+If successful, encrypt the password using AES-256 (Fernet).
+
+
+Store the payload in Redis at ext_ftp:creds:{user_id} with an initial TTL of 1800s.
+
+
+Request Payload (JSON):
+
+
+
+JSON
+{
+  "host": "ftp.sponsor.com",
+  "port": 21,
+  "username": "event_admin",
+  "password": "super_secure_password",
+  "duration_seconds": 7200,
+  "until_i_stop": false,
+  "graceful_expiry": true
+  "allow_insecure": false
+}
+
+
+
+
+Response Payload (200 OK):
+
+
+
+JSON
+{
+  "status": "success",
+  "message": "Connected to external FTP server successfully",
+  "session": {
+    "host": "ftp.sponsor.com",
+    "username": "event_admin",
+    "protocol": "ftps",
+    "state": "active",
+    "idle_ttl_seconds": 1800
+  }
+}
+
+
+
+
+B. POST /v1/ingest/ftp/disconnect
+Purpose: Terminate the session and handle cleanup.
+
+
+Backend Logic:
+
+
+
+Check if force=true.
+
+
+If Graceful (force=false): Set Redis state to draining. Lock new jobs. Wait for active jobs to finish, then delete credentials.
+
+
+If Force (force=true): Abort active sockets. Delete credentials immediately. Run SELECT COUNT(*) on dataset_folder_files_mapping for incomplete/aborted files. If count is 0, run os.remove() on the physical .part files.
+
+
+Request Payload (JSON): (Query Param: ?force=true)
+
+
+
+JSON
+{
+  "delete_completed_files": false
+}
+
+
+
+
+Response Payload (200 OK - Force):
+
+
+
+JSON
+{
+  "status": "success",
+  "message": "FTP session forcefully terminated.",
+  "cancelled_jobs": 2,
+  "deleted_orphan_files": 2
+}
+
+
+
+
+2. The Navigator: Remote Discovery
+GET /v1/ingest/ftp/tree
+Purpose: Fetch the directory structure of the remote server without downloading files.
+
+
+Backend Logic:
+
+
+
+Decrypt Redis credentials.
+
+
+Connect via FTP_TLS.
+
+
+Issue the MLSD {path} command to the remote server.
+
+
+Parse the results into a standardized JSON array and instantly close the control connection.
+
+
+Request: (Query Param: ?path=/2026_Assets)
+
+
+Response Payload (200 OK):
+
+
+
+JSON
+{
+  "current_path": "/2026_Assets",
+  "parent_path": "/",
+  "items": [
+    {
+      "name": "attendee_list.csv",
+      "path": "/2026_Assets/attendee_list.csv",
+      "is_folder": false,
+      "size_bytes": 1048576,
+      "modified_at": "2026-08-01T12:00:00Z"
+    }
+  ]
+}
+
+
+
+
+3. The Dispatcher: Collision Detection & Queuing
+POST /v1/ingest/ftp/init
+Purpose: Queue files for download and handle virtual deduplication (name collisions).
+
+
+Backend Logic:
+
+
+
+Check Redis to ensure the session isn't draining.
+
+
+Query dataset_folder_files_mapping joined with uploaded_files for the target dataset/folder.
+
+
+If attendee_list.csv exists and auto_rename is false, immediately return 409 Conflict.
+
+
+If auto_rename is true, append (1) to the filename.
+
+
+Write a new row to async_ingestion_jobs with status pending.
+
+
+Request Payload (JSON):
+
+
+
+JSON
+{
+  "dataset_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "target_folder_id": "8b9a2c1d-...",
+  "auto_rename": false,
+  "items": [
+    {
+      "path": "/2026_Assets/attendee_list.csv",
+      "is_folder": false,
+      "size_bytes": 1048576
+    }
+  ]
+}
+
+
+
+
+Response Payload (202 Accepted):
+
+
+
+JSON
+{
+  "status": "processing",
+  "message": "1 FTP ingestion job(s) queued successfully",
+  "jobs": [
+    {
+      "job_id": "c9d1e2f3-a4b5-4c6d-8e9f-0a1b2c3d4e5f",
+      "path": "/2026_Assets/attendee_list.csv",
+      "filename": "attendee_list.csv",
+      "filesize": 1048576,
+      "source": "FTP",
+      "dataset_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+      "dataset_name": "Event Data 2026",
+      "status": "pending"
+    }
+  ]
+}
+
+
+
+
+4. The Core Engine: High-Speed UI Polling
+GET /v1/ingest/status
+Purpose: Batch feed real-time progress to the React UI.
+
+
+Backend Logic:
+
+
+
+Query async_ingestion_jobs for all jobs matching the user and status query.
+
+
+For each in_progress job, perform a fast read on the Redis cache key: ingest:{job_id}:progress.
+
+
+Merge the Redis live bytes with the PostgreSQL static row data and return to React.
+
+
+Request: (Query Params: ?status=in_progress,pending,failed)
+
+
+Response Payload (200 OK):
+
+
+
+JSON
+{
+  "total_active_jobs": 1,
+  "jobs": [
+    {
+      "job_id": "c9d1e2f3-a4b5-4c6d-8e9f-0a1b2c3d4e5f",
+      "provider": "FTP",
+      "filename": "attendee_list.csv",
+      "dataset_name": "Event Data 2026",
+      "filesize": "1.0 MB",
+      "status": "in_progress",
+      "progress_percentage": 45,
+      "bytes_downloaded": 471859,
+      "total_bytes": 1048576,
+      "error_message": null
+    }
+  ]
+}
+
+
+
+
+5. The Medic: Crash Recovery
+POST /v1/ingest/ftp/resume
+Purpose: Resume failed jobs using the checkpoint manifests.
+
+
+Backend Logic:
+
+
+
+Verify Redis Vault credentials still exist (ext_ftp:creds:{user_id}). If missing, return 410 Gone.
+
+
+Query async_ingestion_jobs to verify all provided job_ids belong to the user and are failed.
+
+
+Update PostgreSQL status to pending.
+
+
+Worker picks up the job, reads .manifest.json, issues FTP REST command, and resumes.
+
+
+Request Payload (JSON):
+
+
+
+JSON
+{
+  "job_ids": [
+    "c9d1e2f3-a4b5-4c6d-8e9f-0a1b2c3d4e5f"
+  ]
+}
+
+
+
+
+Response Payload (202 Accepted):
+
+JSON
+  "status": "processing",
+  "message": "1 job(s) successfully queued for resume",
+  "resumed_jobs": [
+    "c9d1e2f3-a4b5-4c6d-8e9f-0a1b2c3d4e5f"
+  ]
+}
+
+
+End-to-End System Flow Summary
+Connect: React sends credentials $\rightarrow$ FastAPI encrypts $\rightarrow$ Stores in Redis Vault.
+Browse: React requests path $\rightarrow$ FastAPI fetches remote tree (lazy load) $\rightarrow$ Returns UI data.
+Init: React queues files $\rightarrow$ FastAPI checks PostgreSQL for collisions $\rightarrow$ Writes job as pending.
+Transfer: Concurrency Manager spawns worker $\rightarrow$ Worker streams 8KB chunks $\rightarrow$ Worker updates Redis cache every 1s.
+Monitor: React polls batch status endpoint every 2s $\rightarrow$ FastAPI reads Redis & PostgreSQL $\rightarrow$ UI updates fluidly.
+Finalize/Fail: Worker finishes (or drops) $\rightarrow$ Updates PostgreSQL state to completed or failed $\rightarrow$ React transitions UI $\rightarrow$ Manifest allows instant resume if failed.
+
+
+
+
+
+
+

@@ -1,0 +1,425 @@
+# Database Schema Documentation
+
+This document provides a comprehensive specification of the relational database schema for the **File Ingestion Engine**, constructed using **SQLAlchemy 2.0 ORM** models with **Alembic** versioned migrations.
+
+---
+
+## 1. Architectural Overview & Design Patterns
+
+The database architecture is designed for high-performance file ingestion, deduplication, virtual directory mapping, multi-provider cloud background synchronization, and security auditing.
+
+```
+                      +-------------------+
+                      |       users       |
+                      +---------+---------+
+                                |
+       +------------------------+------------------------+-----------------------+
+       | 1:N                    | 1:N                    | 1:N                   | 1:N
+       v                        v                        v                       v
++--------------+         +--------------+         +--------------+        +----------------------+
+|  audit_logs  |         |   datasets   |         |   folders    |        | async_ingestion_jobs |
++--------------+         +------+-------+         +------+-------+        +----------+-----------+
+                                |                        |                           |
+                                | 1:N                    | 1:N                       | N:1 (SET NULL)
+                                v                        v                           |
+                         +--------------------------------------+                    |
+                         |    dataset_folder_files_mapping      |                    |
+                         +-------------------+------------------+                    |
+                                             |                                       |
+                                             | N:1                                   |
+                                             v                                       v
+                                    +------------------+                    +------------------+
+                                    |  uploaded_files  |<-------------------|  uploaded_files  |
+                                    +--------+---------+  1:N (master_hash) +------------------+
+                                             |
+                                             | 1:N (master_hash)
+                                             v
+                                 +-----------------------+
+                                 | provider_hash_mappings|
+                                 +-----------------------+
+```
+
+### Key Architectural Concepts:
+1. **Global Content Deduplication (`uploaded_files.master_hash`)**: Files uploaded to the system are stored physically only once based on their SHA-256 checksum (`master_hash`). Subsequent uploads of identical content immediately short-circuit without consuming additional disk space.
+2. **Virtual Folder & Dataset Hierarchy (`folders` & `dataset_folder_files_mapping`)**: Physical storage paths (`physical_path`) are completely decoupled from logical user presentation. Users can create virtual nested folder structures (`folders.parent_id`) and map files into multiple datasets via junction records (`dataset_folder_files_mapping`).
+3. **Cloud & Multi-Provider Hash Rosetta Stone (`provider_hash_mappings`)**: Translates provider-native hashes (e.g. Google Drive `md5Checksum`, OneDrive/SharePoint `quickXorHash`) to the server's canonical `master_hash`, allowing instant zero-download deduplication across external cloud platforms.
+4. **Asynchronous Ingestion Ledger (`async_ingestion_jobs`)**: Tracks stateful background ingestion tasks (e.g., FTP pull, Google Drive sync, SharePoint ingestion) with byte-level progress reporting and resumable Range requests.
+5. **Immutable Audit Logging (`audit_logs`)**: Captures HTTP request diagnostics, execution duration, action metrics, client IP, user agent, and unique request identifiers.
+
+---
+
+## 2. Entity-Relationship Diagram (ERD)
+
+```mermaid
+erDiagram
+    users ||--o{ audit_logs : "generates"
+    users ||--o{ datasets : "owns"
+    users ||--o{ folders : "creates"
+    users ||--o{ dataset_folder_files_mapping : "owns_link"
+    users ||--o{ async_ingestion_jobs : "initiates"
+
+    folders ||--o{ folders : "parent_of"
+    folders ||--o{ dataset_folder_files_mapping : "contains_files"
+    folders ||--o{ async_ingestion_jobs : "targets_folder"
+
+    datasets ||--o{ dataset_folder_files_mapping : "contains_mappings"
+    datasets ||--o{ async_ingestion_jobs : "targets_dataset"
+
+    uploaded_files ||--o{ dataset_folder_files_mapping : "referenced_in"
+    uploaded_files ||--o{ provider_hash_mappings : "mapped_by_master_hash"
+    uploaded_files ||--o{ async_ingestion_jobs : "produces_file"
+
+    users {
+        string id PK "UUID(36)"
+        string email UK "VARCHAR(255)"
+        string username UK "VARCHAR(64)"
+        string full_name "VARCHAR(255)"
+        string password_hash "VARCHAR(255)"
+        string role "VARCHAR(50)"
+        boolean is_verified "BOOLEAN"
+        string auth_provider "VARCHAR(50)"
+        string google_subject UK "VARCHAR(255)"
+        text google_refresh_token "TEXT"
+        text microsoft_refresh_token "TEXT"
+        int token_version "INTEGER"
+        text otp_code_hash "TEXT"
+        datetime otp_code_expires_at "DATETIME"
+        int otp_attempts "INTEGER"
+        text password_reset_token_hash "TEXT"
+        datetime password_reset_expires_at "DATETIME"
+        datetime last_login_at "DATETIME"
+        datetime created_at "DATETIME"
+        datetime updated_at "DATETIME"
+    }
+
+    audit_logs {
+        string id PK "UUID(36)"
+        string request_id UK "VARCHAR(128)"
+        string user_id "VARCHAR(36)"
+        string method "VARCHAR(16)"
+        string path "VARCHAR(1024)"
+        int status_code "INTEGER"
+        float duration_ms "FLOAT"
+        string ip_address "VARCHAR(128)"
+        text user_agent "TEXT"
+        string action "VARCHAR(128)"
+        datetime created_at "DATETIME"
+    }
+
+    datasets {
+        string id PK "UUID(36)"
+        string user_id FK "VARCHAR(36)"
+        string name "VARCHAR(255)"
+        string description "VARCHAR(500)"
+        string status "VARCHAR(50)"
+        string language "VARCHAR(255)"
+        boolean is_deleted "BOOLEAN"
+        datetime created_at "DATETIME"
+        datetime updated_at "DATETIME"
+    }
+
+    folders {
+        string id PK "UUID(36)"
+        string user_id FK "VARCHAR(36)"
+        string name "VARCHAR(255)"
+        string parent_id FK "VARCHAR(36)"
+        datetime created_at "DATETIME"
+    }
+
+    uploaded_files {
+        string id PK "UUID(36)"
+        string filename "VARCHAR(255)"
+        bigint file_size_bytes "BIGINT"
+        string master_hash UK "VARCHAR(64)"
+        string physical_path "VARCHAR(500)"
+        enum source_type "uploaded_file_source_type"
+        datetime uploaded_at "DATETIME"
+    }
+
+    dataset_folder_files_mapping {
+        string id PK "UUID(36)"
+        string dataset_id FK "VARCHAR(36)"
+        string folder_id FK "VARCHAR(36)"
+        string file_id FK "VARCHAR(36)"
+        string user_id FK "VARCHAR(36)"
+        datetime created_at "DATETIME"
+    }
+
+    provider_hash_mappings {
+        string id PK "UUID(36)"
+        string provider_name "VARCHAR(50)"
+        string provider_file_id "VARCHAR(255)"
+        string provider_hash "VARCHAR(255)"
+        string master_hash FK "VARCHAR(64)"
+        datetime created_at "DATETIME"
+    }
+
+    async_ingestion_jobs {
+        string id PK "UUID(36)"
+        string user_id FK "VARCHAR(36)"
+        string dataset_id FK "VARCHAR(36)"
+        string folder_id FK "VARCHAR(36)"
+        enum provider "async_ingestion_job_provider_type"
+        string source_url_or_id "VARCHAR(500)"
+        string filename "VARCHAR(255)"
+        string status "VARCHAR(50)"
+        int progress_percentage "INTEGER"
+        bigint bytes_downloaded "BIGINT"
+        bigint total_bytes "BIGINT"
+        text error_message "TEXT"
+        string master_hash "VARCHAR(64)"
+        string file_id FK "VARCHAR(36)"
+        datetime created_at "DATETIME"
+        datetime updated_at "DATETIME"
+    }
+```
+
+---
+
+## 3. Custom Database Enums
+
+### `UploadedFileSourceType`
+Defined in [file_model.py](file:///d:/Zenteiq/Tasks/File_Ingestion/server/src/models/file_model.py#L82-L86). Used by `uploaded_files.source_type` and `async_ingestion_jobs.provider`.
+
+| Value | PostgreSQL Enum Name / String | Description |
+| --- | --- | --- |
+| `FTP` | `"FTP"` | Ingested via local FTP watch directory or external remote FTP pull |
+| `Local` | `"Local"` | Direct chunked browser upload |
+| `GDrive` | `"GDrive"` | Pulled asynchronously from Google Drive API |
+| `Sharepoint` | `"Sharepoint"` | Pulled asynchronously from Microsoft SharePoint / OneDrive Graph API |
+
+---
+
+## 4. Database Table Specifications
+
+### 4.1 `users` Table
+Model source: [auth_model.py](file:///d:/Zenteiq/Tasks/File_Ingestion/server/src/models/auth_model.py#L19-L49)  
+Description: Stores primary account credentials, OAuth identity tokens, security OTP verifications, and user roles.
+
+#### Columns
+| Column Name | Data Type | Nullable | Default | Key / Index Constraints | Description |
+| --- | --- | --- | --- | --- | --- |
+| `id` | `VARCHAR(36)` | No | `uuid4()` | Primary Key | UUID primary key string |
+| `email` | `VARCHAR(255)` | No | None | Unique Index | Primary email address |
+| `username` | `VARCHAR(64)` | Yes | None | Unique Index | Optional display handle |
+| `full_name` | `VARCHAR(255)` | Yes | None | None | Display full name |
+| `password_hash` | `VARCHAR(255)` | No | None | None | Password hash digest |
+| `role` | `VARCHAR(50)` | No | `"user"` | None | System permission role (`user`, `admin`) |
+| `is_verified` | `BOOLEAN` | No | `False` | None | Email verification status flag |
+| `auth_provider` | `VARCHAR(50)` | No | `"local"` | None | Identity origin (`local`, `google`, `microsoft`) |
+| `google_subject` | `VARCHAR(255)` | Yes | None | Unique Index | Google OAuth sub ID claim |
+| `google_refresh_token` | `TEXT` | Yes | None | None | Encrypted Google Drive API refresh token |
+| `microsoft_refresh_token` | `TEXT` | Yes | None | None | Encrypted SharePoint/OneDrive API refresh token |
+| `token_version` | `INTEGER` | No | `0` | None | Counter for invalidating issued JWT tokens |
+| `otp_code_hash` | `TEXT` | Yes | None | None | Hashed OTP code for account verification |
+| `otp_code_expires_at` | `TIMESTAMP(tz)` | Yes | None | None | UTC expiry timestamp for current OTP |
+| `otp_attempts` | `INTEGER` | No | `0` | None | Counter for invalid OTP attempts |
+| `password_reset_token_hash`| `TEXT` | Yes | None | None | Hashed password reset token |
+| `password_reset_expires_at`| `TIMESTAMP(tz)` | Yes | None | None | UTC expiry timestamp for reset token |
+| `last_login_at` | `TIMESTAMP(tz)` | Yes | None | None | Timestamp of latest login event |
+| `created_at` | `TIMESTAMP(tz)` | No | `func.now()`| None | Account registration timestamp |
+| `updated_at` | `TIMESTAMP(tz)` | No | `func.now()`| On Update: `now()` | Last modification timestamp |
+
+---
+
+### 4.2 `audit_logs` Table
+Model source: [audit_model.py](file:///d:/Zenteiq/Tasks/File_Ingestion/server/src/models/audit_model.py#L19-L38)  
+Description: Immutable request log ledger for audit trails, security monitoring, and API performance metrics.
+
+#### Columns
+| Column Name | Data Type | Nullable | Default | Key / Index Constraints | Description |
+| --- | --- | --- | --- | --- | --- |
+| `id` | `VARCHAR(36)` | No | `uuid4()` | Primary Key | UUID log record identifier |
+| `request_id` | `VARCHAR(128)` | No | None | Unique Index (`ix_audit_logs_request_id`) | Unique per-request ID (correlation header) |
+| `user_id` | `VARCHAR(36)` | Yes | None | Index, Composite Index | Requesting user ID (null for public endpoints) |
+| `method` | `VARCHAR(16)` | No | None | None | HTTP verb (`GET`, `POST`, `DELETE`, etc.) |
+| `path` | `VARCHAR(1024)` | No | None | None | Request path URI string |
+| `status_code` | `INTEGER` | No | `0` | None | HTTP response status code |
+| `duration_ms` | `FLOAT` | No | `0.0` | None | Execution latency in milliseconds |
+| `ip_address` | `VARCHAR(128)` | Yes | None | None | Client IP address |
+| `user_agent` | `TEXT` | Yes | None | None | HTTP User-Agent string |
+| `action` | `VARCHAR(128)` | Yes | None | Index | Action classification string |
+| `created_at` | `TIMESTAMP(tz)` | No | `func.now()`| Composite Index (`user_id`, `created_at`) | Timestamp of request completion |
+
+#### Composite Indexes & Table Constraints
+- `ix_audit_logs_request_id`: `UNIQUE INDEX (request_id)`
+- `ix_audit_logs_user_created_at`: `INDEX (user_id, created_at)`
+
+---
+
+### 4.3 `datasets` Table
+Model source: [file_model.py](file:///d:/Zenteiq/Tasks/File_Ingestion/server/src/models/file_model.py#L26-L42)  
+Description: Catalog entries grouping virtual folders and files belonging to a specific user.
+
+#### Columns
+| Column Name | Data Type | Nullable | Default | Key / Index Constraints | Description |
+| --- | --- | --- | --- | --- | --- |
+| `id` | `VARCHAR(36)` | No | `uuid4()` | Primary Key | Dataset UUID identifier |
+| `user_id` | `VARCHAR(36)` | No | None | Foreign Key -> `users.id` (`ON DELETE CASCADE`), Index | Dataset owner user ID |
+| `name` | `VARCHAR(255)` | No | None | None | User-assigned dataset title |
+| `description` | `VARCHAR(500)` | Yes | None | None | Extended dataset description |
+| `status` | `VARCHAR(50)` | No | `"Created"` | None | State lifecycle (`Created`, `Draft`, `Completed`) |
+| `language` | `VARCHAR(255)` | Yes | None | None | Content language classification tag |
+| `is_deleted` | `BOOLEAN` | No | `False` | None | Soft deletion flag |
+| `created_at` | `TIMESTAMP(tz)` | No | `func.now()`| None | Dataset creation timestamp |
+| `updated_at` | `TIMESTAMP(tz)` | No | `func.now()`| On Update: `now()` | Last metadata update timestamp |
+
+---
+
+### 4.4 `folders` Table
+Model source: [file_model.py](file:///d:/Zenteiq/Tasks/File_Ingestion/server/src/models/file_model.py#L63-L80)  
+Description: Self-referential tree structure representing virtual directories created by users.
+
+#### Columns
+| Column Name | Data Type | Nullable | Default | Key / Index Constraints | Description |
+| --- | --- | --- | --- | --- | --- |
+| `id` | `VARCHAR(36)` | No | `uuid4()` | Primary Key | Folder UUID identifier |
+| `user_id` | `VARCHAR(36)` | No | None | Foreign Key -> `users.id` (`ON DELETE CASCADE`), Index | Folder owner user ID |
+| `name` | `VARCHAR(255)` | No | None | Unique Composite (`uq_user_parent_name`) | Folder display name |
+| `parent_id` | `VARCHAR(36)` | Yes | None | Foreign Key -> `folders.id` (`ON DELETE CASCADE`), Index, Unique Composite | Parent folder ID (null for root folders) |
+| `created_at` | `TIMESTAMP(tz)` | No | `func.now()`| None | Virtual folder creation timestamp |
+
+#### Table Constraints
+- `uq_user_parent_name`: `UNIQUE (user_id, parent_id, name)` — Prevents duplicate folder names under the same parent directory for a single user.
+
+---
+
+### 4.5 `uploaded_files` Table
+Model source: [file_model.py](file:///d:/Zenteiq/Tasks/File_Ingestion/server/src/models/file_model.py#L89-L103)  
+Description: Master physical storage registry tracking deduplicated files stored on disk.
+
+#### Columns
+| Column Name | Data Type | Nullable | Default | Key / Index Constraints | Description |
+| --- | --- | --- | --- | --- | --- |
+| `id` | `VARCHAR(36)` | No | `uuid4()` | Primary Key | File UUID primary key |
+| `filename` | `VARCHAR(255)` | No | None | None | Original upload filename |
+| `file_size_bytes` | `BIGINT` | No | None | None | Exact file size in bytes |
+| `master_hash` | `VARCHAR(64)` | No | None | Unique Index | Canonical SHA-256 hash digest |
+| `physical_path` | `VARCHAR(500)` | No | None | None | Server disk storage path |
+| `source_type` | `ENUM` | Yes | None | SQLEnum(`uploaded_file_source_type`) | Source origin (`FTP`, `Local`, `GDrive`, `Sharepoint`) |
+| `uploaded_at` | `TIMESTAMP(tz)` | No | `func.now()`| None | Physical file creation timestamp |
+
+---
+
+### 4.6 `dataset_folder_files_mapping` Table
+Model source: [file_model.py](file:///d:/Zenteiq/Tasks/File_Ingestion/server/src/models/file_model.py#L105-L125)  
+Description: Junction table mapping physical uploaded files into user virtual folder hierarchies and datasets.
+
+#### Columns
+| Column Name | Data Type | Nullable | Default | Key / Index Constraints | Description |
+| --- | --- | --- | --- | --- | --- |
+| `id` | `VARCHAR(36)` | No | `uuid4()` | Primary Key | Mapping UUID identifier |
+| `dataset_id` | `VARCHAR(36)` | No | None | Foreign Key -> `datasets.id` (`ON DELETE CASCADE`), Index | Target dataset ID |
+| `folder_id` | `VARCHAR(36)` | Yes | None | Foreign Key -> `folders.id` (`ON DELETE CASCADE`), Index | Target folder ID (null if at dataset root) |
+| `file_id` | `VARCHAR(36)` | No | None | Foreign Key -> `uploaded_files.id` (`ON DELETE CASCADE`), Index | Referenced physical file ID |
+| `user_id` | `VARCHAR(36)` | No | None | Foreign Key -> `users.id` (`ON DELETE CASCADE`), Index | Owner user ID |
+| `created_at` | `TIMESTAMP(tz)` | No | `func.now()`| None | Mapping creation timestamp |
+
+#### Table Constraints
+- `uq_dataset_folder_file`: `UNIQUE (dataset_id, folder_id, file_id)` — Prevents duplicate mapping of the same physical file into the exact same dataset folder.
+
+---
+
+### 4.7 `provider_hash_mappings` Table
+Model source: [file_model.py](file:///d:/Zenteiq/Tasks/File_Ingestion/server/src/models/file_model.py#L127-L145)  
+Description: Translation table ("Rosetta Stone") linking provider-native file identifiers and hashes to server master SHA-256 hashes for instant deduplication.
+
+#### Columns
+| Column Name | Data Type | Nullable | Default | Key / Index Constraints | Description |
+| --- | --- | --- | --- | --- | --- |
+| `id` | `VARCHAR(36)` | No | `uuid4()` | Primary Key | Mapping UUID identifier |
+| `provider_name` | `VARCHAR(50)` | No | None | Index, Unique Composite (`uq_provider_name_hash`) | Provider type (e.g. `GDrive`, `Sharepoint`) |
+| `provider_file_id` | `VARCHAR(255)` | No | None | Index | Unique remote provider item ID |
+| `provider_hash` | `VARCHAR(255)` | No | None | Index, Unique Composite (`uq_provider_name_hash`) | Remote hash (MD5, QuickXor, etc.) |
+| `master_hash` | `VARCHAR(64)` | No | None | Foreign Key -> `uploaded_files.master_hash` (`ON DELETE CASCADE`), Index | Server canonical SHA-256 hash |
+| `created_at` | `TIMESTAMP(tz)` | No | `func.now()`| None | Translation record creation timestamp |
+
+#### Table Constraints
+- `uq_provider_name_hash`: `UNIQUE (provider_name, provider_hash)` — Enforces unique translation per cloud provider hash.
+
+---
+
+### 4.8 `async_ingestion_jobs` Table
+Model source: [file_model.py](file:///d:/Zenteiq/Tasks/File_Ingestion/server/src/models/file_model.py#L147-L176)  
+Description: State tracking ledger for asynchronous background ingestion workers pulling files from FTP servers or cloud storage providers.
+
+#### Columns
+| Column Name | Data Type | Nullable | Default | Key / Index Constraints | Description |
+| --- | --- | --- | --- | --- | --- |
+| `id` | `VARCHAR(36)` | No | `uuid4()` | Primary Key | Job UUID primary key |
+| `user_id` | `VARCHAR(36)` | No | None | Foreign Key -> `users.id` (`ON DELETE CASCADE`), Index | Job owner user ID |
+| `dataset_id` | `VARCHAR(36)` | No | None | Foreign Key -> `datasets.id` (`ON DELETE CASCADE`), Index | Target dataset ID |
+| `folder_id` | `VARCHAR(36)` | Yes | None | Foreign Key -> `folders.id` (`ON DELETE CASCADE`), Index | Target folder ID |
+| `provider` | `ENUM` | No | None | SQLEnum(`async_ingestion_job_provider_type`) | Source cloud/FTP provider type |
+| `source_url_or_id` | `VARCHAR(500)` | No | None | None | Provider item ID, remote path, or URL |
+| `filename` | `VARCHAR(255)` | No | None | None | Destination target filename |
+| `status` | `VARCHAR(50)` | No | `"pending"` | Index | Status (`pending`, `downloading`, `completed`, `failed`) |
+| `progress_percentage`| `INTEGER` | No | `0` | None | Download progress percentage (0 - 100) |
+| `bytes_downloaded` | `BIGINT` | No | `0` | None | Accumulated bytes transferred |
+| `total_bytes` | `BIGINT` | No | `0` | None | Total file byte length |
+| `error_message` | `TEXT` | Yes | None | None | Error detail traceback if job status is `failed` |
+| `master_hash` | `VARCHAR(64)` | Yes | None | None | Computed SHA-256 hash upon completion |
+| `file_id` | `VARCHAR(36)` | Yes | None | Foreign Key -> `uploaded_files.id` (`ON DELETE SET NULL`) | Linked physical file ID upon success |
+| `created_at` | `TIMESTAMP(tz)` | No | `func.now()`| None | Job creation timestamp |
+| `updated_at` | `TIMESTAMP(tz)` | No | `func.now()`| On Update: `now()` | Job state update timestamp |
+
+---
+
+## 5. Foreign Key & Cascade Rules
+
+| Source Table | Source Column | Target Table | Target Column | On Delete Behavior |
+| --- | --- | --- | --- | --- |
+| `datasets` | `user_id` | `users` | `id` | `CASCADE` |
+| `folders` | `user_id` | `users` | `id` | `CASCADE` |
+| `folders` | `parent_id` | `folders` | `id` | `CASCADE` |
+| `dataset_folder_files_mapping` | `dataset_id` | `datasets` | `id` | `CASCADE` |
+| `dataset_folder_files_mapping` | `folder_id` | `folders` | `id` | `CASCADE` |
+| `dataset_folder_files_mapping` | `file_id` | `uploaded_files` | `id` | `CASCADE` |
+| `dataset_folder_files_mapping` | `user_id` | `users` | `id` | `CASCADE` |
+| `provider_hash_mappings` | `master_hash` | `uploaded_files` | `master_hash` | `CASCADE` |
+| `async_ingestion_jobs` | `user_id` | `users` | `id` | `CASCADE` |
+| `async_ingestion_jobs` | `dataset_id` | `datasets` | `id` | `CASCADE` |
+| `async_ingestion_jobs` | `folder_id` | `folders` | `id` | `CASCADE` |
+| `async_ingestion_jobs` | `file_id` | `uploaded_files` | `id` | `SET NULL` |
+
+---
+
+## 6. Alembic Migration History
+
+All schema alterations are version-controlled via Alembic scripts located in [server/alembic/versions](file:///d:/Zenteiq/Tasks/File_Ingestion/server/alembic/versions).
+
+| Revision Hash | Parent Revision | Description | Key Schema Changes |
+| --- | --- | --- | --- |
+| `f09f8c95b82f` | `None` | Initial migration | Created base `users` table |
+| `c8f2d6a4b9e1` | `f09f8c95b82f` | File ingestion tables | Added `uploaded_files` table |
+| `c9d1e2f3a4b5` | `c8f2d6a4b9e1` | Audit logs table | Created `audit_logs` table |
+| `053bf9b73239` | `c9d1e2f3a4b5` | Datasets & Mappings | Created `datasets`, `folders`, and `dataset_folder_files_mapping` |
+| `a6523bbee66b` | `053bf9b73239` | Audit log action column | Added `action` column and index to `audit_logs` |
+| `74769e1c95ef` | `a6523bbee66b` | File source column | Added `source_type` column to `uploaded_files` |
+| `3f4a86cac509` | `74769e1c95ef` | FTP Enum update | Updated `UploadedFileSourceType` enum values |
+| `a1b2c3d4e5f6` | `3f4a86cac509` | Dataset status | Added `status` column to `datasets` |
+| `b3c4d5e6f7a8` | `a1b2c3d4e5f6` | Cloud ingestion tables | Added `provider_hash_mappings` and `async_ingestion_jobs` |
+| `80422981c893` | `b3c4d5e6f7a8` | Dataset soft delete | Added `is_deleted` flag to `datasets` |
+| `9ab1c7d4e2f3` | `80422981c893` | Dataset metadata | Added `description` and `language` fields to `datasets` |
+| `9272d97dee04` | Multiple | Merge heads | Alembic branch head consolidation |
+| `f979e65675e6` | `9272d97dee04` | Ingestion job progress tracking | Added `bytes_downloaded` and `total_bytes` to `async_ingestion_jobs` |
+
+
+
+### Updated Schema 
+Column Name	Data Type	Nullable	Default	Key / Index Constraints	Description
+id	VARCHAR(36)	No	uuid4()	Primary Key	File/Job UUID primary key.
+user_id	VARCHAR(36)	No	None	FK -> users.id (CASCADE)	Owner user ID.
+dataset_id	VARCHAR(36)	Yes	None	FK -> datasets.id (CASCADE)	Target dataset ID.
+provider	ENUM	No	None	SQLEnum	Source origin (FTP, Local, GDrive, Sharepoint).
+file_path	VARCHAR(1024)	No	None	Index	Virtual directory path string (e.g., /2026_Assets/logo.png).
+filename	VARCHAR(255)	No	None	None	Destination target filename.
+physical_path	VARCHAR(500)	Yes	None	None	Server disk storage path. Nullable until download completes.
+file_size_bytes	BIGINT	Yes	None	None	Exact file size in bytes.
+master_hash	VARCHAR(64)	Yes	None	None	Canonical SHA-256 hash digest.
+provider_hash	VARCHAR(255)	Yes	None	Index	Remote hash (MD5, QuickXorHash) for cloud sync tracking.
+status	VARCHAR(50)	No	"pending"	Index	Status (pending, downloading, completed, failed).
+error_message	TEXT	Yes	None	None	Error detail traceback if job status is failed.
+created_at	TIMESTAMP(tz)	No	func.now()	None	Job creation timestamp.
+updated_at	TIMESTAMP(tz)	No	func.now()	On Update: now()	Job state update timestamp.
+
