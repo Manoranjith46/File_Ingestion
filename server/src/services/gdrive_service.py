@@ -265,13 +265,20 @@ def initiate_gdrive_ingestion(
     filename: str | None = None,
     mime_type: str | None = None,
     stream_chunks_generator = None,
+    organization_id: str | None = None,
 ) -> GDriveIngestResponse:
     """Initiate an asynchronous Google Drive ingestion job."""
     gdrive_file_id = extract_gdrive_file_id(file_id_or_url)
     if not gdrive_file_id:
         raise IntegrationRequestError(message="Invalid Google Drive file ID or URL")
 
-    dataset = db.query(Dataset).filter(Dataset.id == dataset_id, Dataset.user_id == user.id, Dataset.is_deleted.is_(False)).one_or_none()
+    dataset_query = db.query(Dataset).filter(Dataset.id == dataset_id, Dataset.is_deleted.is_(False))
+    if organization_id is not None:
+        dataset_query = dataset_query.filter(Dataset.organization_id == organization_id)
+    else:
+        dataset_query = dataset_query.filter(Dataset.user_id == user.id)
+
+    dataset = dataset_query.one_or_none()
     if dataset is None:
         raise DatasetNotFoundError(message="Dataset not found or access denied")
 
@@ -281,11 +288,10 @@ def initiate_gdrive_ingestion(
     is_native_app = is_google_apps_mime(mime_type)
 
     try:
-        decrypted_refresh = decrypt_str(user.google_refresh_token)
-        file_meta = _get_gdrive_file_metadata(gdrive_file_id, decrypted_refresh)
-        logger.info(f"GDrive file metadata: {file_meta}")
+        google_refresh_token = decrypt_str(user.google_refresh_token)
+        file_meta = _get_gdrive_file_metadata(gdrive_file_id, google_refresh_token)
         if not filename:
-            filename = file_meta.get("name", f"gdrive_{gdrive_file_id}")
+            filename = file_meta.get("name")
         if not mime_type:
             mime_type = file_meta.get("mimeType")
             is_native_app = is_google_apps_mime(mime_type)
@@ -311,6 +317,7 @@ def initiate_gdrive_ingestion(
     job = IngestedFile(
         id=job_id,
         user_id=user.id,
+        organization_id=organization_id,
         dataset_id=dataset_id,
         provider=IngestedFileProviderType.GDrive,
         file_path=gdrive_file_id,

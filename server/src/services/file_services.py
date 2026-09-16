@@ -180,12 +180,13 @@ def _build_tree(
     user: User,
     dataset_id: str | None = None,
     folder_id: str | None = None,
+    organization_id: str | None = None,
 ) -> UploadsTreeResponse:
-    """Construct the nested upload tree for a user."""
+    """Construct the nested upload tree for a user or organization."""
     dataset = None
     if dataset_id:
         try:
-            dataset = get_dataset_by_id(db, user, dataset_id)
+            dataset = get_dataset_by_id(db, user, dataset_id, organization_id=organization_id)
         except DatasetNotFoundError:
             return UploadsTreeResponse(id=str(uuid4()), type="folder", name="root", children=[])
 
@@ -198,7 +199,12 @@ def _build_tree(
         children=[],
     )
 
-    query = db.query(IngestedFile).filter(IngestedFile.user_id == user.id)
+    query = db.query(IngestedFile)
+    if organization_id is not None:
+        query = query.filter(IngestedFile.organization_id == organization_id)
+    else:
+        query = query.filter(IngestedFile.user_id == user.id)
+
     if dataset_id:
         query = query.filter(IngestedFile.dataset_id == dataset_id)
     files = query.all()
@@ -266,24 +272,30 @@ def _merge_chunk_files(chunk_paths: list[Path], destination_path: Path) -> None:
                 shutil.copyfileobj(source, destination)
 
 
-def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> UploadInitResponse:
+def initialize_upload(
+    db: Session,
+    user: User,
+    payload: UploadInitRequest,
+    organization_id: str | None = None,
+) -> UploadInitResponse:
     """Create an upload session and short-circuit when the file already exists."""
     _ensure_storage_dirs()
 
-    dataset = get_dataset_by_id(db, user, payload.dataset_id)
+    dataset = get_dataset_by_id(db, user, payload.dataset_id, organization_id=organization_id)
     if dataset.status == "Completed":
         raise InvalidDatasetStateError(message="Completed datasets cannot receive new uploads")
 
-    # 1. Check if exact mapping already exists (duplicate_short_circuit)
-    exists_file = (
-        db.query(IngestedFile)
-        .filter(
-            IngestedFile.user_id == user.id,
-            IngestedFile.dataset_id == payload.dataset_id,
-            IngestedFile.master_hash == payload.master_hash,
-        )
-        .first()
+    # 1. Check if exact mapping already exists (duplicate_short_circuit) within tenant
+    query = db.query(IngestedFile).filter(
+        IngestedFile.dataset_id == payload.dataset_id,
+        IngestedFile.master_hash == payload.master_hash,
     )
+    if organization_id is not None:
+        query = query.filter(IngestedFile.organization_id == organization_id)
+    else:
+        query = query.filter(IngestedFile.user_id == user.id)
+
+    exists_file = query.first()
     if exists_file is not None:
         return UploadInitResponse(
             upload_id=str(uuid4()),
@@ -292,7 +304,7 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
             status="duplicate_short_circuit",
         )
 
-    # 2. Virtual Deduplication — filename collision check
+    # 2. Virtual Deduplication — filename collision check within dataset
     existing_files = (
         db.query(IngestedFile)
         .filter(
@@ -328,21 +340,22 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
     upload_id = str(uuid4())
     provider_str = payload.source_type or "Local"
 
+    mapping_data = {
+        "user_id": user.id,
+        "dataset_id": payload.dataset_id,
+        "filename": effective_filename,
+        "filesize": str(payload.filesize),
+        "master_hash": payload.master_hash,
+        "relative_path": payload.relative_path or "",
+        "source_type": provider_str,
+    }
+    if organization_id is not None:
+        mapping_data["organization_id"] = organization_id
+
     if global_file is not None:
-        redis_server.hset(
-            _meta_key(upload_id),
-            mapping={
-                "user_id": user.id,
-                "dataset_id": payload.dataset_id,
-                "filename": effective_filename,
-                "filesize": str(payload.filesize),
-                "master_hash": payload.master_hash,
-                "relative_path": payload.relative_path or "",
-                "total_chunks": "0",
-                "linked_file_id": global_file.id,
-                "source_type": provider_str,
-            },
-        )
+        mapping_data["total_chunks"] = "0"
+        mapping_data["linked_file_id"] = global_file.id
+        redis_server.hset(_meta_key(upload_id), mapping=mapping_data)
         redis_server.expire(_meta_key(upload_id), SESSION_TTL_SECONDS)
 
         return UploadInitResponse(
@@ -356,19 +369,8 @@ def initialize_upload(db: Session, user: User, payload: UploadInitRequest) -> Up
     total_chunks = _compute_total_chunks(payload.filesize)
     _parts_dir(upload_id).mkdir(parents=True, exist_ok=True)
 
-    redis_server.hset(
-        _meta_key(upload_id),
-        mapping={
-            "user_id": user.id,
-            "dataset_id": payload.dataset_id,
-            "filename": effective_filename,
-            "filesize": str(payload.filesize),
-            "master_hash": payload.master_hash,
-            "relative_path": payload.relative_path or "",
-            "total_chunks": str(total_chunks),
-            "source_type": provider_str,
-        },
-    )
+    mapping_data["total_chunks"] = str(total_chunks)
+    redis_server.hset(_meta_key(upload_id), mapping=mapping_data)
     redis_server.expire(_meta_key(upload_id), SESSION_TTL_SECONDS)
     redis_server.expire(_bitmap_key(upload_id), SESSION_TTL_SECONDS)
     redis_server.expire(_chunk_hashes_key(upload_id), SESSION_TTL_SECONDS)
@@ -434,6 +436,7 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
         raise ChunkValidationError(message="master_hash mismatch")
 
     dataset_id = meta["dataset_id"]
+    organization_id = meta.get("organization_id")
     source_type_value = meta.get("source_type") or "Local"
     relative_path = meta.get("relative_path") or meta["filename"]
 
@@ -454,6 +457,7 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
         new_file = IngestedFile(
             id=final_file_id,
             user_id=user.id,
+            organization_id=organization_id,
             dataset_id=dataset_id,
             provider=provider_enum,
             file_path=relative_path if relative_path else meta["filename"],
@@ -484,6 +488,7 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
             new_file = IngestedFile(
                 id=final_file_id,
                 user_id=user.id,
+                organization_id=organization_id,
                 dataset_id=dataset_id,
                 provider=provider_enum,
                 file_path=relative_path if relative_path else meta["filename"],
@@ -512,6 +517,7 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
                 new_file = IngestedFile(
                     id=final_file_id,
                     user_id=user.id,
+                    organization_id=organization_id,
                     dataset_id=dataset_id,
                     provider=provider_enum,
                     file_path=relative_path if relative_path else meta["filename"],
@@ -542,13 +548,26 @@ def finalize_upload(db: Session, user: User, payload: UploadFinalizeRequest) -> 
     return UploadFinalizeResponse(status="completed", file_id=final_file_id, folder_id=None)
 
 
-def delete_user_upload(db: Session, user: User, upload_id: str) -> UploadDeleteResponse:
-    """Delete an uploaded file and its physical storage for the authenticated user."""
-    ingested_file = db.query(IngestedFile).filter(IngestedFile.id == upload_id).one_or_none()
+def delete_user_upload(
+    db: Session,
+    user: User,
+    upload_id: str,
+    organization_id: str | None = None,
+) -> UploadDeleteResponse:
+    """Delete an uploaded file and its physical storage within the tenant."""
+    query = db.query(IngestedFile).filter(IngestedFile.id == upload_id)
+    if organization_id is not None:
+        query = query.filter(IngestedFile.organization_id == organization_id)
+    else:
+        query = query.filter(IngestedFile.user_id == user.id)
+
+    ingested_file = query.one_or_none()
     if ingested_file is None:
+        # Check if file exists under another tenant / user to raise ownership vs not found
+        other_file = db.query(IngestedFile).filter(IngestedFile.id == upload_id).one_or_none()
+        if other_file is not None:
+            raise UploadOwnershipError()
         raise UploadNotFoundError()
-    if ingested_file.user_id != user.id:
-        raise UploadOwnershipError()
 
     dataset_id = ingested_file.dataset_id
 
@@ -579,9 +598,10 @@ def list_user_uploads(
     user: User,
     dataset_id: str | None = None,
     folder_id: str | None = None,
+    organization_id: str | None = None,
 ) -> UploadsTreeResponse:
     """Return the authenticated user's uploaded files as a nested tree."""
-    return _build_tree(db, user, dataset_id=dataset_id, folder_id=folder_id)
+    return _build_tree(db, user, dataset_id=dataset_id, folder_id=folder_id, organization_id=organization_id)
 
 
 def _normalize_dataset_status(value: str | None) -> str:
@@ -612,22 +632,29 @@ def _sync_dataset_status_from_mappings(db: Session, dataset: Dataset) -> None:
     dataset.status = "Draft" if file_count > 0 else "Created"
 
 
-def create_dataset(db: Session, user: User, payload: DatasetCreate) -> Dataset:
-    """Create a new dataset catalog entry."""
-    existing = (
-        db.query(Dataset)
-        .filter(
-            Dataset.user_id == user.id,
-            func.lower(Dataset.name) == payload.name.strip().lower(),
-            Dataset.is_deleted == False,
-        )
-        .first()
+def create_dataset(
+    db: Session,
+    user: User,
+    payload: DatasetCreate,
+    organization_id: str | None = None,
+) -> Dataset:
+    """Create a new dataset catalog entry scoped to an organization."""
+    query = db.query(Dataset).filter(
+        func.lower(Dataset.name) == payload.name.strip().lower(),
+        Dataset.is_deleted == False,
     )
+    if organization_id is not None:
+        query = query.filter(Dataset.organization_id == organization_id)
+    else:
+        query = query.filter(Dataset.user_id == user.id, Dataset.organization_id.is_(None))
+
+    existing = query.first()
     if existing:
         raise DuplicateDatasetError()
 
     dataset = Dataset(
         user_id=user.id,
+        organization_id=organization_id,
         name=payload.name.strip(),
         description=payload.description.strip() if payload.description else None,
         status="Created",
@@ -645,10 +672,16 @@ def get_datasets(
     page: int = 1,
     limit: int = 10,
     include_completed: bool = True,
+    organization_id: str | None = None,
 ) -> list[Dataset]:
-    """Return all active datasets belonging to the user."""
+    """Return all active datasets belonging to the organization (or user if un-scoped)."""
     offset = (page - 1) * limit
-    query = db.query(Dataset).filter(Dataset.user_id == user.id, Dataset.is_deleted == False)
+    query = db.query(Dataset).filter(Dataset.is_deleted == False)
+    if organization_id is not None:
+        query = query.filter(Dataset.organization_id == organization_id)
+    else:
+        query = query.filter(Dataset.user_id == user.id, Dataset.organization_id.is_(None))
+
     if not include_completed:
         query = query.filter(Dataset.status != "Completed")
     return (
@@ -659,13 +692,23 @@ def get_datasets(
     )
 
 
-def get_dataset_tree_for_dataset(db: Session, user: User, dataset_id: str) -> UploadsTreeResponse:
+def get_dataset_tree_for_dataset(
+    db: Session,
+    user: User,
+    dataset_id: str,
+    organization_id: str | None = None,
+) -> UploadsTreeResponse:
     """Return the nested tree for all files and folders linked to a dataset."""
-    return _build_tree(db, user, dataset_id=dataset_id, folder_id=None)
+    return _build_tree(db, user, dataset_id=dataset_id, folder_id=None, organization_id=organization_id)
 
 
-def get_dataset_by_id(db: Session, user: User, dataset_id: str) -> Dataset:
-    """Retrieve an active dataset by its ID and check ownership."""
+def get_dataset_by_id(
+    db: Session,
+    user: User,
+    dataset_id: str,
+    organization_id: str | None = None,
+) -> Dataset:
+    """Retrieve an active dataset by its ID and check tenant ownership."""
     dataset = (
         db.query(Dataset)
         .filter(Dataset.id == dataset_id, Dataset.is_deleted == False)
@@ -673,29 +716,44 @@ def get_dataset_by_id(db: Session, user: User, dataset_id: str) -> Dataset:
     )
     if dataset is None:
         raise DatasetNotFoundError()
-    if dataset.user_id != user.id:
-        raise DatasetAccessError()
+
+    # Enforce multi-tenant access control:
+    if organization_id is not None:
+        if dataset.organization_id != organization_id:
+            raise DatasetAccessError(message="Dataset does not belong to the active organization.")
+    else:
+        # Legacy/un-scoped context: must match user_id
+        if dataset.user_id != user.id:
+            raise DatasetAccessError()
+
     return dataset
 
 
-def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpdate) -> Dataset:
-    """Update details of an active dataset."""
-    dataset = get_dataset_by_id(db, user, dataset_id)
+def update_dataset(
+    db: Session,
+    user: User,
+    dataset_id: str,
+    payload: DatasetUpdate,
+    organization_id: str | None = None,
+) -> Dataset:
+    """Update details of an active dataset scoped to tenant."""
+    dataset = get_dataset_by_id(db, user, dataset_id, organization_id=organization_id)
 
     if payload.name is not None:
         name_clean = payload.name.strip()
         if not name_clean:
             raise InvalidDatasetStateError(message="Dataset name cannot be empty.")
         if name_clean.lower() != dataset.name.lower():
-            existing = (
-                db.query(Dataset)
-                .filter(
-                    Dataset.user_id == user.id,
-                    func.lower(Dataset.name) == name_clean.lower(),
-                    Dataset.is_deleted == False,
-                )
-                .first()
+            query = db.query(Dataset).filter(
+                func.lower(Dataset.name) == name_clean.lower(),
+                Dataset.is_deleted == False,
             )
+            if organization_id is not None:
+                query = query.filter(Dataset.organization_id == organization_id)
+            else:
+                query = query.filter(Dataset.user_id == user.id, Dataset.organization_id.is_(None))
+
+            existing = query.first()
             if existing:
                 raise DuplicateDatasetError()
         dataset.name = name_clean
@@ -713,14 +771,18 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
         if dataset.status not in {"Created", "Draft"}:
             raise InvalidDatasetStateError(message="Source dataset must be in created or Draft status.")
 
-        target_dataset = get_dataset_by_id(db, user, payload.target_dataset_id)
+        target_dataset = get_dataset_by_id(db, user, payload.target_dataset_id, organization_id=organization_id)
         if target_dataset.status not in {"Created", "Draft"}:
             raise InvalidDatasetStateError(message="Target dataset must be in created or Draft status.")
 
         query = db.query(IngestedFile).filter(
             IngestedFile.dataset_id == dataset.id,
-            IngestedFile.user_id == user.id,
         )
+        if organization_id is not None:
+            query = query.filter(IngestedFile.organization_id == organization_id)
+        else:
+            query = query.filter(IngestedFile.user_id == user.id)
+
         if payload.file_id is not None and payload.file_id.strip() != "":
             query = query.filter(IngestedFile.id == payload.file_id)
 
@@ -753,9 +815,14 @@ def update_dataset(db: Session, user: User, dataset_id: str, payload: DatasetUpd
     return dataset
 
 
-def delete_dataset(db: Session, user: User, dataset_id: str) -> None:
-    """Remove a dataset and all of its linked files."""
-    dataset = get_dataset_by_id(db, user, dataset_id)
+def delete_dataset(
+    db: Session,
+    user: User,
+    dataset_id: str,
+    organization_id: str | None = None,
+) -> None:
+    """Remove a dataset and all of its linked files within the tenant."""
+    dataset = get_dataset_by_id(db, user, dataset_id, organization_id=organization_id)
 
     files = (
         db.query(IngestedFile)
@@ -785,9 +852,10 @@ def attach_file_to_dataset(
     user: User,
     dataset_id: str,
     payload: DatasetAttachFileRequest,
+    organization_id: str | None = None,
 ) -> DatasetAttachFileResponse:
-    """Attach an existing uploaded file to a dataset."""
-    dataset = get_dataset_by_id(db, user, dataset_id)
+    """Attach an existing uploaded file to a dataset within the tenant."""
+    dataset = get_dataset_by_id(db, user, dataset_id, organization_id=organization_id)
     if dataset.status == "Completed":
         raise InvalidDatasetStateError(message="Completed datasets cannot be modified.")
 
@@ -798,25 +866,33 @@ def attach_file_to_dataset(
     )
     if user_file is None:
         raise FileNotFoundError()
-    if user_file.user_id != user.id:
-        raise FileOwnershipError()
+
+    # Verify file ownership / organization scoping
+    if organization_id is not None:
+        if user_file.organization_id != organization_id:
+            raise FileOwnershipError(message="File does not belong to the active organization.")
+    else:
+        if user_file.user_id != user.id:
+            raise FileOwnershipError()
 
     relative_path = payload.relative_path or user_file.file_path
 
-    existing_attach = (
-        db.query(IngestedFile)
-        .filter(
-            IngestedFile.dataset_id == dataset.id,
-            IngestedFile.user_id == user.id,
-            IngestedFile.master_hash == user_file.master_hash,
-            IngestedFile.file_path == relative_path,
-        )
-        .first()
+    query = db.query(IngestedFile).filter(
+        IngestedFile.dataset_id == dataset.id,
+        IngestedFile.master_hash == user_file.master_hash,
+        IngestedFile.file_path == relative_path,
     )
+    if organization_id is not None:
+        query = query.filter(IngestedFile.organization_id == organization_id)
+    else:
+        query = query.filter(IngestedFile.user_id == user.id)
+
+    existing_attach = query.first()
 
     if existing_attach is None:
         new_attach = IngestedFile(
             user_id=user.id,
+            organization_id=organization_id,
             dataset_id=dataset.id,
             provider=user_file.provider,
             file_path=relative_path,

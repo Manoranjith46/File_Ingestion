@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import secrets
 from datetime import UTC, datetime, timedelta
@@ -11,6 +13,7 @@ from urllib.parse import urlencode
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
+from fastapi import HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 import logging
@@ -33,6 +36,8 @@ from helpers.jwt import (
     verify_secret,
 )
 from helpers.crypto import encrypt_str, decrypt_str
+from helpers.auth0_validator import verify_auth0_token
+from config.auth0_config import auth0_settings
 from models.auth_model import User
 from config.redis_server import server as redis_server, active_session_limiter
 from schemas.auth_schema import (
@@ -395,7 +400,7 @@ def resolve_refresh_user(db: Session, refresh_token: str) -> User:
 
 
 def get_current_user(db: Session, access_token: str) -> User:
-    """Resolve the current user from an access token.
+    """Resolve the current user from an access token (Auth0 RS256 or local HMAC-SHA256).
 
     Args:
         db: The active database session.
@@ -405,12 +410,74 @@ def get_current_user(db: Session, access_token: str) -> User:
         User: The user represented by the token.
 
     Raises:
-        HTTPException: If the token is invalid, revoked, or the user is missing.
+        HTTPException: If the token is invalid, revoked, or the user is inactive/missing.
     """
+    # Detect token type by inspecting header without verifying yet
+    is_rs256 = False
+    try:
+        header_part = access_token.split(".")[0]
+        # Add padding if needed
+        padding_needed = "=" * (-len(header_part) % 4)
+        header_bytes = base64.urlsafe_b64decode(header_part + padding_needed)
+        header_obj = json.loads(header_bytes)
+        if header_obj.get("alg") == "RS256":
+            is_rs256 = True
+    except Exception:
+        pass
+
+    if is_rs256 or auth0_settings.is_configured:
+        try:
+            auth0_payload = verify_auth0_token(access_token)
+            auth0_sub = auth0_payload.get("sub")
+            email = auth0_payload.get("email") or auth0_payload.get(f"{auth0_settings.audience}/email")
+
+            user = None
+            if auth0_sub:
+                user = db.query(User).filter(User.auth0_sub == auth0_sub).one_or_none()
+
+            if user is None and email:
+                user = db.query(User).filter(func.lower(User.email) == email.lower()).one_or_none()
+                if user is not None:
+                    user.auth0_sub = auth0_sub
+                    db.commit()
+
+            if user is None and auth0_sub:
+                # Provision local user for the authenticated Auth0 identity
+                user_email = email or f"{auth0_sub.replace('|', '_')}@auth0.local"
+                username = user_email.split("@")[0]
+                user = User(
+                    email=user_email,
+                    username=username,
+                    full_name=auth0_payload.get("name"),
+                    password_hash=hash_password(secrets.token_urlsafe(32)),
+                    auth_provider="auth0",
+                    auth0_sub=auth0_sub,
+                    is_verified=True,
+                    is_active=True,
+                    token_version=1,
+                )
+                db.add(user)
+                db.commit()
+                db.refresh(user)
+
+            if user is None:
+                raise UnauthorizedAccessError(message="User not found")
+            if not user.is_active:
+                raise UnauthorizedAccessError(message="User account is inactive")
+
+            return user
+        except HTTPException:
+            # If explicit RS256 or Auth0 verification failed, do not fall back silently
+            if is_rs256:
+                raise
+
+    # Fallback to local HMAC-SHA256 JWT for existing sessions and tests
     payload = decode_access_token(access_token)
     user = db.query(User).filter(User.id == payload["sub"]).one_or_none()
     if user is None:
         raise UnauthorizedAccessError(message="User not found")
+    if not user.is_active:
+        raise UnauthorizedAccessError(message="User account is inactive")
     if user.token_version != payload.get("token_version"):
         raise UnauthorizedAccessError(message="Token has been revoked")
     return user

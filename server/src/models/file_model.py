@@ -23,12 +23,15 @@ def generate_uuid() -> str:
 
 
 class Dataset(Base):
-    """Represent a dataset catalog entry owned by a user."""
+    """Represent a dataset catalog entry owned by a user within an organization."""
 
     __tablename__ = "datasets"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    organization_id: Mapped[str | None] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(String(500), nullable=True)
     status: Mapped[str] = mapped_column(String(50), default="Created", nullable=False)
@@ -38,6 +41,7 @@ class Dataset(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now(), nullable=False)
 
     user = relationship("User")
+    organization = relationship("Organization")
     files = relationship("IngestedFile", back_populates="dataset", cascade="all, delete-orphan")
 
     @property
@@ -73,6 +77,9 @@ class IngestedFile(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=generate_uuid)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    organization_id: Mapped[str | None] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     dataset_id: Mapped[str | None] = mapped_column(ForeignKey("datasets.id", ondelete="CASCADE"), nullable=True, index=True)
     provider: Mapped[IngestedFileProviderType] = mapped_column(
         SQLEnum(IngestedFileProviderType, name="ingested_file_provider_type"), nullable=False
@@ -91,4 +98,5 @@ class IngestedFile(Base):
     )
 
     user = relationship("User")
+    organization = relationship("Organization")
     dataset = relationship("Dataset", back_populates="files")

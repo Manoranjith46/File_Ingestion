@@ -9,6 +9,7 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 
 # revision identifiers, used by Alembic.
@@ -25,7 +26,7 @@ def upgrade() -> None:
     sa.Column('id', sa.String(length=36), nullable=False),
     sa.Column('user_id', sa.String(length=36), nullable=False),
     sa.Column('dataset_id', sa.String(length=36), nullable=True),
-    sa.Column('provider', sa.Enum('FTP', 'Local', 'GDrive', 'Sharepoint', name='ingested_file_provider_type'), nullable=False),
+    sa.Column('provider', postgresql.ENUM('FTP', 'Local', 'GDrive', 'Sharepoint', name='ingested_file_provider_type', create_type=False), nullable=False),
     sa.Column('file_path', sa.String(length=1024), nullable=False),
     sa.Column('filename', sa.String(length=255), nullable=False),
     sa.Column('physical_path', sa.String(length=500), nullable=True),

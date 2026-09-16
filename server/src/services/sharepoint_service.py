@@ -200,9 +200,16 @@ def initiate_sharepoint_ingestion(
     folder_id: str | None = None,
     filename: str | None = None,
     stream_chunks_generator = None,
+    organization_id: str | None = None,
 ) -> SharepointIngestResponse:
     """Initiate an asynchronous SharePoint ingestion job."""
-    dataset = db.query(Dataset).filter(Dataset.id == dataset_id, Dataset.user_id == user.id, Dataset.is_deleted.is_(False)).one_or_none()
+    dataset_query = db.query(Dataset).filter(Dataset.id == dataset_id, Dataset.is_deleted.is_(False))
+    if organization_id is not None:
+        dataset_query = dataset_query.filter(Dataset.organization_id == organization_id)
+    else:
+        dataset_query = dataset_query.filter(Dataset.user_id == user.id)
+
+    dataset = dataset_query.one_or_none()
     if dataset is None:
         raise DatasetNotFoundError(message="Dataset not found or access denied")
 
@@ -249,6 +256,7 @@ def initiate_sharepoint_ingestion(
             job = IngestedFile(
                 id=job_id,
                 user_id=user.id,
+                organization_id=organization_id,
                 dataset_id=dataset_id,
                 provider=IngestedFileProviderType.Sharepoint,
                 file_path=provider_file_id,
@@ -283,6 +291,7 @@ def initiate_sharepoint_ingestion(
     job = IngestedFile(
         id=job_id,
         user_id=user.id,
+        organization_id=organization_id,
         dataset_id=dataset_id,
         provider=IngestedFileProviderType.Sharepoint,
         file_path=provider_file_id,

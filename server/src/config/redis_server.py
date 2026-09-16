@@ -30,9 +30,9 @@ def redis_server_status() -> None:
     """
     try:
         server.ping()
-        print(f"✅ Redis Server Running On {redis_host}:{redis_port}")
+        print(f"[OK] Redis Server Running On {redis_host}:{redis_port}")
     except redis.RedisError as e:
-        print(f"❌ Failed to connect to Redis Server on {redis_host}:{redis_port}: {e}")
+        print(f"[WARN] Failed to connect to Redis Server on {redis_host}:{redis_port}: {e}")
 
 
 # --- Lua Scripts ---

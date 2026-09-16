@@ -63,25 +63,50 @@ The API will be available at:
 ## 4. Main API endpoints
 
 ### Auth
-
-- POST `/auth/register`
-- POST `/auth/login`
-- POST `/auth/logout`
-- POST `/auth/refresh`
-- GET `/auth/me`
-
-### File upload
-
-- POST `/v1/upload/init`
-- POST `/v1/upload/chunk`
-- POST `/v1/upload/finalize`
-- GET `/v1/uploads`
-
-## 5. Frontend usage notes
-
-For frontend integration:
-
-- Send the access token in the `Authorization` header as `Bearer <token>`.
+ 
+ - POST `/auth/register`
+ - POST `/auth/login`
+ - POST `/auth/logout`
+ - POST `/auth/refresh`
+ - GET `/auth/me`
+ 
+ ### Organizations & Multi-Tenancy (Auth0 Aligned)
+ 
+ - POST `/v1/organizations` *(Super Admin)*: Create a new organization tenant.
+ - GET `/v1/organizations` *(Super Admin)*: List platform organizations.
+ - GET `/v1/organizations/{id}` *(Super Admin)*: Get organization details.
+ - PATCH `/v1/organizations/{id}` *(Super Admin)*: Suspend/reactivate organization or update Auth0 ID.
+ - GET `/v1/organizations/me/profile` *(Org Admin / Member)*: View active organization profile.
+ - PATCH `/v1/organizations/me/settings` *(Org Admin)*: Toggle Google SSO and update display name.
+ - GET `/v1/organizations/me/members` *(Org Admin)*: List members in active organization.
+ - POST `/v1/organizations/me/members` *(Org Admin)*: Add user to active organization (`org_admin` | `member`).
+ - PATCH `/v1/organizations/me/members/{id}` *(Org Admin)*: Change member role.
+ - DELETE `/v1/organizations/me/members/{id}` *(Org Admin)*: Remove member from active organization.
+ 
+ ### File upload & Datasets (Tenant Scoped)
+ 
+ - POST `/v1/datasets`: Create dataset scoped to active organization.
+ - GET `/v1/datasets`: List datasets for active organization.
+ - GET `/v1/datasets/{id}`: Get dataset and file tree (isolated to organization).
+ - PATCH `/v1/datasets/{id}`: Update dataset metadata within active organization.
+ - DELETE `/v1/datasets/{id}`: Remove dataset and associated files.
+ - POST `/v1/datasets/{id}/files`: Attach uploaded file to dataset (enforces tenant ownership).
+ - POST `/v1/upload/init`: Initialize chunked upload session (records tenant scope).
+ - POST `/v1/upload/chunk`: Upload chunk with hash validation.
+ - POST `/v1/upload/finalize`: Finalize and persist file scoped to organization.
+ - GET `/v1/uploads`: List uploaded files tree for active organization.
+ - POST `/v1/uploads/delete`: Delete uploaded file within active organization.
+ 
+ ## 5. Authentication & Frontend usage notes
+ 
+ For frontend integration:
+ 
+ - **Auth0 Tokens**: Send standard Auth0 RS256 Bearer access token in `Authorization: Bearer <token>`.
+ - **Organization Context**:
+   - Clients specify the active organization context using the `X-Organization-ID` header (passing either internal UUID or Auth0 Org ID `org_xxx`).
+   - If omitted, the backend defaults to the user's active organization membership.
+ - **Cross-Tenant IDOR/BOLA Protection**: The backend verifies database membership for the authenticated user in the requested organization. Attempts to access other organizations' datasets or files return `403 Forbidden` or `404 Not Found`.
+ - **Super Admin Safeguard**: Platform Super Admins manage organizations and configuration, but cannot query or mutate customer tenant datasets without explicit organization membership.
 - The backend already allows `http://localhost:5173` by default.
 - If your frontend runs on another port, update `FRONTEND_URL` in `.env`.
 
