@@ -228,3 +228,144 @@ def test_update_member_role_and_remove(db_session: Session, org_user: User):
     remove_organization_member(db_session, org.id, m.membership_id)
     remaining = list_organization_members(db_session, org.id)
     assert len(remaining) == 0
+
+
+def test_auth0_user_merges_with_organization_member_and_migrates_datasets(db_session: Session):
+    """Auth0 user creates datasets first; when org admin adds user with email, records merge and datasets migrate."""
+    from models.file_model import Dataset
+    from services.file_services import get_dataset_by_id, get_datasets
+
+    # 1. User logs in via Auth0 first
+    auth0_user = User(
+        email="user_123@auth0.local",
+        username="user_123",
+        full_name="Auth0 User",
+        password_hash="fake",
+        auth_provider="auth0",
+        auth0_sub="google-oauth2|999999",
+        is_verified=True,
+        is_active=True,
+    )
+    db_session.add(auth0_user)
+    db_session.commit()
+    db_session.refresh(auth0_user)
+    orphan_id = auth0_user.id
+
+    # 2. User creates an un-scoped dataset
+    ds = Dataset(
+        user_id=auth0_user.id,
+        organization_id=None,
+        name="Personal Research Dataset",
+        language="English",
+    )
+    db_session.add(ds)
+    db_session.commit()
+    db_session.refresh(ds)
+
+    # 3. Org Admin creates an organization
+    org = create_organization(db_session, OrganizationCreateRequest(name="AI Lab"))
+
+    # 4. Org Admin adds the user by their real email with temporary password
+    member_resp = add_organization_member(
+        db_session,
+        org.id,
+        AddMemberRequest(
+            email="researcher@ailab.com",
+            temporary_password="Password123!",
+            role="member",
+        ),
+    )
+
+    # 5. Verify auto-merge into the real user with Auth0 sub
+    real_user = db_session.query(User).filter(User.email == "researcher@ailab.com").first()
+    assert real_user is not None
+    assert real_user.auth0_sub == "google-oauth2|999999"
+
+    # Verify dataset was re-assigned to real_user and adopted into org.id
+    db_session.refresh(ds)
+    assert ds.user_id == real_user.id
+    assert ds.organization_id == org.id
+
+    # Verify user can access dataset by ID in organization context without 403
+    fetched = get_dataset_by_id(db_session, user=real_user, dataset_id=ds.id, organization_id=org.id)
+    assert fetched.id == ds.id
+    assert fetched.name == "Personal Research Dataset"
+
+    # Verify get_datasets returns the dataset
+    datasets = get_datasets(db_session, user=real_user, organization_id=org.id)
+    assert len(datasets) == 1
+    assert datasets[0].id == ds.id
+
+    # Verify orphan record was removed
+    assert db_session.query(User).filter(User.id == orphan_id).first() is None
+
+
+def test_verify_otp_merges_orphan_auth0_user_and_adopts_datasets(db_session: Session):
+    """When a member verifies OTP, any existing orphan Auth0 account merges into the verified user."""
+    from models.file_model import Dataset
+    from services.auth_services import request_otp, verify_otp
+    from schemas.auth_schema import OtpRequest, OtpVerifyRequest
+
+    # 1. Existing orphan Auth0 user with dummy email
+    orphan_auth0 = User(
+        email="google-oauth2_8888@auth0.local",
+        username="google-oauth2_8888",
+        full_name="Orphan Google User",
+        password_hash="fake",
+        auth_provider="auth0",
+        auth0_sub="google-oauth2|8888",
+        is_verified=True,
+        is_active=True,
+    )
+    db_session.add(orphan_auth0)
+    db_session.commit()
+    db_session.refresh(orphan_auth0)
+    orphan_id = orphan_auth0.id
+
+    # Orphan dataset
+    ds = Dataset(
+        user_id=orphan_auth0.id,
+        organization_id=None,
+        name="Pre-existing Dataset",
+        language="English",
+    )
+    db_session.add(ds)
+    db_session.commit()
+    db_session.refresh(ds)
+
+    # 2. Org Admin adds local member
+    org = create_organization(db_session, OrganizationCreateRequest(name="FinTech Corp"))
+    local_user = User(
+        email="intern@fintech.com",
+        username="intern",
+        full_name="Intern",
+        password_hash="fake",
+        auth_provider="local",
+        is_verified=False,
+        is_active=True,
+    )
+    db_session.add(local_user)
+    db_session.commit()
+    db_session.refresh(local_user)
+
+    membership = OrganizationMembership(organization_id=org.id, user_id=local_user.id, role="member", is_active=True)
+    db_session.add(membership)
+    db_session.commit()
+
+    # 3. Issue OTP for local member
+    _, otp_code, _ = request_otp(db_session, OtpRequest(email="intern@fintech.com"))
+
+    # 4. Member verifies OTP
+    verified_user = verify_otp(db_session, OtpVerifyRequest(email="intern@fintech.com", otp_code=otp_code))
+    assert verified_user.is_verified is True
+    assert verified_user.auth0_sub == "google-oauth2|8888"
+
+    # 5. Check dataset adoption
+    db_session.refresh(ds)
+    assert ds.user_id == verified_user.id
+    assert ds.organization_id == org.id
+
+    # 6. Orphan record removed
+    assert db_session.query(User).filter(User.id == orphan_id).first() is None
+
+

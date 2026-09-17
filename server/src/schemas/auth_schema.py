@@ -22,6 +22,8 @@ class PublicUserSchema(BaseModel):
     role: str
     is_verified: bool
     auth_provider: str
+    organization_id: str | None = None
+    memberships: list[dict] = Field(default_factory=list)
 
 
 class RegisterRequest(BaseModel):

@@ -99,6 +99,8 @@ class FakeRedis:
 
 def make_fake_limiter(redis_stub: FakeRedis):
     class FakeLimiter:
+        def __call__(self, *args, **kwargs):
+            return 1
         def enforce_active_session_limit(self, user_id: str, current_token_jti: str) -> None:
             pass
         def register_active_session(self, user_id: str, token_jti: str) -> None:
@@ -106,6 +108,7 @@ def make_fake_limiter(redis_stub: FakeRedis):
         def remove_session(self, user_id: str, token_jti: str) -> None:
             pass
     return FakeLimiter()
+
 
 
 def make_fake_chunk_state(redis_stub: FakeRedis):

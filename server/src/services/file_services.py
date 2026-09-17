@@ -675,6 +675,19 @@ def get_datasets(
     organization_id: str | None = None,
 ) -> list[Dataset]:
     """Return all active datasets belonging to the organization (or user if un-scoped)."""
+    if organization_id is not None:
+        # Adopt any unassigned datasets/files created by this user prior to joining the organization
+        db.query(Dataset).filter(
+            Dataset.user_id == user.id,
+            Dataset.organization_id.is_(None),
+            Dataset.is_deleted == False,
+        ).update({Dataset.organization_id: organization_id}, synchronize_session=False)
+        db.query(IngestedFile).filter(
+            IngestedFile.user_id == user.id,
+            IngestedFile.organization_id.is_(None),
+        ).update({IngestedFile.organization_id: organization_id}, synchronize_session=False)
+        db.commit()
+
     offset = (page - 1) * limit
     query = db.query(Dataset).filter(Dataset.is_deleted == False)
     if organization_id is not None:
@@ -720,13 +733,24 @@ def get_dataset_by_id(
     # Enforce multi-tenant access control:
     if organization_id is not None:
         if dataset.organization_id != organization_id:
-            raise DatasetAccessError(message="Dataset does not belong to the active organization.")
+            # If dataset was created by this user before joining the active org, adopt it now
+            if dataset.organization_id is None and dataset.user_id == user.id:
+                dataset.organization_id = organization_id
+                db.query(IngestedFile).filter(
+                    IngestedFile.dataset_id == dataset.id,
+                    IngestedFile.organization_id.is_(None),
+                ).update({IngestedFile.organization_id: organization_id}, synchronize_session=False)
+                db.commit()
+                db.refresh(dataset)
+            else:
+                raise DatasetAccessError(message="Dataset does not belong to the active organization.")
     else:
         # Legacy/un-scoped context: must match user_id
         if dataset.user_id != user.id:
             raise DatasetAccessError()
 
     return dataset
+
 
 
 def update_dataset(

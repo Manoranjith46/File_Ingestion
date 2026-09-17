@@ -368,6 +368,35 @@ def add_organization_member(db: Session, org_id: str, payload: AddMemberRequest)
         )
         .one_or_none()
     )
+    # Check if there are orphan Auth0 accounts matching this user to merge
+    from services.auth_services import merge_users
+    orphan_auth0_users = (
+        db.query(User)
+        .filter(
+            User.id != user.id,
+            User.auth0_sub.isnot(None),
+            (
+                (func.lower(User.email) == user.email.lower())
+                | (User.email.endswith("@auth0.local"))
+            ),
+        )
+        .all()
+    )
+    for orphan in orphan_auth0_users:
+        user = merge_users(db, target_user=user, source_user=orphan)
+
+    # Migrate any un-scoped datasets/files owned by this user to the new organization
+    from models.file_model import Dataset, IngestedFile
+    db.query(Dataset).filter(
+        Dataset.user_id == user.id,
+        Dataset.organization_id.is_(None),
+    ).update({Dataset.organization_id: org_id}, synchronize_session=False)
+    db.query(IngestedFile).filter(
+        IngestedFile.user_id == user.id,
+        IngestedFile.organization_id.is_(None),
+    ).update({IngestedFile.organization_id: org_id}, synchronize_session=False)
+    db.commit()
+
     if existing_membership:
         if not existing_membership.is_active:
             existing_membership.is_active = True
@@ -409,6 +438,7 @@ def add_organization_member(db: Session, org_id: str, payload: AddMemberRequest)
         is_active=membership.is_active,
         created_at=membership.created_at,
     )
+
 
 
 def update_member_role(

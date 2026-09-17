@@ -13,6 +13,7 @@ from urllib.parse import urlencode
 os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
 os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
+import httpx
 from fastapi import HTTPException
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -50,6 +51,7 @@ from schemas.auth_schema import (
     RegisterRequest,
     TokenPairResponse,
 )
+
 from utils.errors import (
     AccountNotVerifiedError,
     ConfigurationError,
@@ -69,6 +71,7 @@ from utils.errors import (
     UnauthorizedAccessError,
     UserNotFoundError,
 )
+
 
 
 def _now() -> datetime:
@@ -258,7 +261,33 @@ def create_public_user(user: User) -> PublicUserSchema:
     Returns:
         PublicUserSchema: The public representation of the user.
     """
-    return PublicUserSchema.model_validate(user)
+    memberships_data = []
+    primary_org_id = None
+    if hasattr(user, "memberships") and user.memberships:
+        for m in user.memberships:
+            if m.is_active:
+                m_info = {
+                    "organization_id": m.organization_id,
+                    "organization_name": m.organization.name if m.organization else None,
+                    "role": m.role,
+                    "is_active": m.is_active,
+                }
+                memberships_data.append(m_info)
+                if primary_org_id is None:
+                    primary_org_id = m.organization_id
+
+    data = {
+        "id": user.id,
+        "email": user.email,
+        "username": user.username,
+        "full_name": user.full_name,
+        "role": user.role,
+        "is_verified": user.is_verified,
+        "auth_provider": user.auth_provider,
+        "organization_id": primary_org_id,
+        "memberships": memberships_data,
+    }
+    return PublicUserSchema.model_validate(data)
 
 
 def _find_user_by_identifier(db: Session, identifier: str) -> User | None:
@@ -399,6 +428,114 @@ def resolve_refresh_user(db: Session, refresh_token: str) -> User:
     return user
 
 
+def merge_users(db: Session, target_user: User, source_user: User) -> User:
+    """Consolidate source_user into target_user, migrating memberships, datasets, files, and credentials.
+
+    Args:
+        db: The active database session.
+        target_user: The primary persistent user (typically verified or organization member).
+        source_user: The secondary user to absorb and remove.
+
+    Returns:
+        User: The merged target user.
+    """
+    if target_user.id == source_user.id:
+        return target_user
+
+    from models.file_model import Dataset, IngestedFile
+    from models.auth_model import OrganizationMembership
+    from models.audit_model import AuditLog
+
+    logger.info(
+        f"Merging source user {source_user.id} ({source_user.email}) into target user {target_user.id} ({target_user.email})"
+    )
+
+    # 1. Transfer identity fields if missing on target (clearing unique constraint fields on source first)
+    auth0_sub_transfer = source_user.auth0_sub
+    google_subject_transfer = source_user.google_subject
+    source_user.auth0_sub = None
+    source_user.google_subject = None
+    db.flush()
+
+    if auth0_sub_transfer and not target_user.auth0_sub:
+        target_user.auth0_sub = auth0_sub_transfer
+    if google_subject_transfer and not target_user.google_subject:
+        target_user.google_subject = google_subject_transfer
+    if source_user.google_refresh_token and not target_user.google_refresh_token:
+        target_user.google_refresh_token = source_user.google_refresh_token
+    if source_user.microsoft_refresh_token and not target_user.microsoft_refresh_token:
+        target_user.microsoft_refresh_token = source_user.microsoft_refresh_token
+    if source_user.full_name and (not target_user.full_name or target_user.full_name == target_user.username):
+        target_user.full_name = source_user.full_name
+    if source_user.is_verified:
+        target_user.is_verified = True
+
+
+    # 2. Determine target's primary organization (if any)
+    target_memberships = (
+        db.query(OrganizationMembership)
+        .filter(OrganizationMembership.user_id == target_user.id, OrganizationMembership.is_active == True)
+        .all()
+    )
+    primary_org_id = target_memberships[0].organization_id if target_memberships else None
+
+    # 3. Migrate source's organization memberships
+    source_memberships = (
+        db.query(OrganizationMembership)
+        .filter(OrganizationMembership.user_id == source_user.id)
+        .all()
+    )
+    target_org_ids = {m.organization_id for m in target_memberships}
+    for sm in source_memberships:
+        if sm.organization_id in target_org_ids:
+            # Duplicate membership: remove the source duplicate
+            db.delete(sm)
+        else:
+            # Transfer membership to target
+            sm.user_id = target_user.id
+            if primary_org_id is None:
+                primary_org_id = sm.organization_id
+
+    # 4. Migrate Datasets owned by source
+    datasets = db.query(Dataset).filter(Dataset.user_id == source_user.id).all()
+    for ds in datasets:
+        ds.user_id = target_user.id
+        if ds.organization_id is None and primary_org_id is not None:
+            ds.organization_id = primary_org_id
+
+    # 5. Migrate IngestedFiles owned by source
+    files = db.query(IngestedFile).filter(IngestedFile.user_id == source_user.id).all()
+    for f in files:
+        f.user_id = target_user.id
+        if f.organization_id is None and primary_org_id is not None:
+            f.organization_id = primary_org_id
+
+    # 6. Migrate un-scoped datasets/files belonging to target_user if primary_org_id is known
+    if primary_org_id is not None:
+        db.query(Dataset).filter(
+            Dataset.user_id == target_user.id,
+            Dataset.organization_id.is_(None),
+        ).update({Dataset.organization_id: primary_org_id}, synchronize_session=False)
+        db.query(IngestedFile).filter(
+            IngestedFile.user_id == target_user.id,
+            IngestedFile.organization_id.is_(None),
+        ).update({IngestedFile.organization_id: primary_org_id}, synchronize_session=False)
+
+    # 7. Migrate AuditLogs
+    db.query(AuditLog).filter(AuditLog.user_id == source_user.id).update(
+        {AuditLog.user_id: target_user.id}, synchronize_session=False
+    )
+
+    # 8. Delete source_user cleanly
+    source_user_id = source_user.id
+    db.query(User).filter(User.id == source_user_id).delete(synchronize_session=False)
+    db.commit()
+    db.refresh(target_user)
+    logger.info(f"Successfully merged user {source_user_id} into {target_user.id}")
+    return target_user
+
+
+
 def get_current_user(db: Session, access_token: str) -> User:
     """Resolve the current user from an access token (Auth0 RS256 or local HMAC-SHA256).
 
@@ -431,18 +568,52 @@ def get_current_user(db: Session, access_token: str) -> User:
             auth0_sub = auth0_payload.get("sub")
             email = auth0_payload.get("email") or auth0_payload.get(f"{auth0_settings.audience}/email")
 
+            # If email claim is not directly embedded in token, fetch from Auth0 /userinfo
+            if not email and auth0_settings.domain:
+                try:
+                    userinfo_url = f"https://{auth0_settings.domain}/userinfo"
+                    resp = httpx.get(
+                        userinfo_url,
+                        headers={"Authorization": f"Bearer {access_token}"},
+                        timeout=5.0,
+                    )
+                    if resp.status_code == 200:
+                        uinfo = resp.json()
+                        email = uinfo.get("email")
+                        if not auth0_payload.get("name") and uinfo.get("name"):
+                            auth0_payload["name"] = uinfo.get("name")
+                        logger.info(f"Retrieved email '{email}' for sub '{auth0_sub}' via Auth0 /userinfo")
+                except Exception as e:
+                    logger.warning(f"Could not fetch Auth0 userinfo: {e}")
+
+            user_by_sub = db.query(User).filter(User.auth0_sub == auth0_sub).one_or_none() if auth0_sub else None
+            user_by_email = db.query(User).filter(func.lower(User.email) == email.lower()).one_or_none() if email else None
+
             user = None
-            if auth0_sub:
-                user = db.query(User).filter(User.auth0_sub == auth0_sub).one_or_none()
-
-            if user is None and email:
-                user = db.query(User).filter(func.lower(User.email) == email.lower()).one_or_none()
-                if user is not None:
+            # Case 1: Both exist but are separate records -> MERGE!
+            if user_by_sub and user_by_email and user_by_sub.id != user_by_email.id:
+                user = merge_users(db, target_user=user_by_email, source_user=user_by_sub)
+            # Case 2: Found by sub
+            elif user_by_sub:
+                user = user_by_sub
+                # If sub user had a placeholder email and we now know real email:
+                if email and user.email.endswith("@auth0.local"):
+                    other = db.query(User).filter(func.lower(User.email) == email.lower(), User.id != user.id).one_or_none()
+                    if other:
+                        user = merge_users(db, target_user=other, source_user=user)
+                    else:
+                        user.email = email.lower()
+                        user.username = email.split("@")[0]
+                        db.commit()
+            # Case 3: Found by email
+            elif user_by_email:
+                user = user_by_email
+                if auth0_sub and not user.auth0_sub:
                     user.auth0_sub = auth0_sub
-                    db.commit()
-
-            if user is None and auth0_sub:
-                # Provision local user for the authenticated Auth0 identity
+                user.is_verified = True
+                db.commit()
+            # Case 4: Neither exists -> provision new user
+            elif auth0_sub:
                 user_email = email or f"{auth0_sub.replace('|', '_')}@auth0.local"
                 username = user_email.split("@")[0]
                 user = User(
@@ -465,11 +636,32 @@ def get_current_user(db: Session, access_token: str) -> User:
             if not user.is_active:
                 raise UnauthorizedAccessError(message="User account is inactive")
 
+            # Adopt any unassigned datasets into active organization if user has one
+            from models.auth_model import OrganizationMembership
+            from models.file_model import Dataset, IngestedFile
+            memberships = (
+                db.query(OrganizationMembership)
+                .filter(OrganizationMembership.user_id == user.id, OrganizationMembership.is_active == True)
+                .all()
+            )
+            if memberships:
+                active_org_id = memberships[0].organization_id
+                db.query(Dataset).filter(
+                    Dataset.user_id == user.id,
+                    Dataset.organization_id.is_(None),
+                ).update({Dataset.organization_id: active_org_id}, synchronize_session=False)
+                db.query(IngestedFile).filter(
+                    IngestedFile.user_id == user.id,
+                    IngestedFile.organization_id.is_(None),
+                ).update({IngestedFile.organization_id: active_org_id}, synchronize_session=False)
+                db.commit()
+
             return user
         except HTTPException:
             # If explicit RS256 or Auth0 verification failed, do not fall back silently
             if is_rs256:
                 raise
+
 
     # Fallback to local HMAC-SHA256 JWT for existing sessions and tests
     payload = decode_access_token(access_token)
@@ -592,7 +784,46 @@ def verify_otp(db: Session, payload: OtpVerifyRequest) -> User:
     user.token_version += 1
     db.commit()
     db.refresh(user)
+
+    # Check for orphan Auth0 account to merge
+    orphan_auth0_users = (
+        db.query(User)
+        .filter(
+            User.id != user.id,
+            User.auth0_sub.isnot(None),
+            (
+                (func.lower(User.email) == email.lower())
+                | (User.email.endswith("@auth0.local"))
+            ),
+        )
+        .all()
+    )
+    for orphan in orphan_auth0_users:
+        logger.info(f"Merging orphan Auth0 user {orphan.id} into verified user {user.id}")
+        user = merge_users(db, target_user=user, source_user=orphan)
+
+    # Adopt any unassigned datasets into user's active organization
+    from models.auth_model import OrganizationMembership
+    from models.file_model import Dataset, IngestedFile
+    memberships = (
+        db.query(OrganizationMembership)
+        .filter(OrganizationMembership.user_id == user.id, OrganizationMembership.is_active == True)
+        .all()
+    )
+    if memberships:
+        active_org_id = memberships[0].organization_id
+        db.query(Dataset).filter(
+            Dataset.user_id == user.id,
+            Dataset.organization_id.is_(None),
+        ).update({Dataset.organization_id: active_org_id}, synchronize_session=False)
+        db.query(IngestedFile).filter(
+            IngestedFile.user_id == user.id,
+            IngestedFile.organization_id.is_(None),
+        ).update({IngestedFile.organization_id: active_org_id}, synchronize_session=False)
+        db.commit()
+
     return user
+
 
 
 def request_password_reset(db: Session, payload: PasswordResetRequest) -> tuple[User, str, datetime]:
